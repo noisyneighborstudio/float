@@ -4,29 +4,51 @@ import WebKit
 let defaults = UserDefaults.standard
 let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
+// pins the main video's player (video + site controls) to the window; works on any site
 func fillScript(_ on: Bool) -> String { """
 (() => {
-  const ON = \(on);
-  const ID = '__fp_fill_style';
+  const ON = \(on), ATTR = 'data-fp-pin', ID = '__fp_pin_style';
   const CSS = `
-    html, body { overflow: hidden !important; background: #000 !important; }
-    video[data-fp-fill] {
-      position: fixed !important; inset: 0 !important;
-      width: 100vw !important; height: 100vh !important;
-      max-width: none !important; max-height: none !important;
-      object-fit: contain !important; background: #000 !important;
-      z-index: 2147483647 !important; transform: none !important;
-    }`;
+    html:has([${ATTR}]), html:has([${ATTR}]) body { overflow: hidden !important; }
+    [${ATTR}] { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important;
+      max-width: none !important; max-height: none !important; margin: 0 !important; transform: none !important;
+      z-index: 2147483647 !important; background: #000 !important; }
+    [${ATTR}] [data-fp-path] { width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important; }
+    [${ATTR}] video[data-fp-path] { position: absolute !important; inset: 0 !important; }
+    [${ATTR}] video, video[${ATTR}] { object-fit: contain !important; }`;
+  // main video: largest one actually playing (layout has settled by then), ignoring small previews
+  const main = () => [...document.querySelectorAll('video')]
+    .filter(v => v.currentSrc && v.currentTime > 0 && v.offsetWidth * v.offsetHeight > innerWidth * innerHeight * 0.15)
+    .sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight)[0];
+  // outermost ancestor still hugging the video: matches one axis, fits the viewport on the other (letterboxing)
+  function player(v) {
+    const r = v.getBoundingClientRect();
+    let p = v;
+    for (let e = v.parentElement; e && e !== document.body; e = e.parentElement) {
+      const b = e.getBoundingClientRect();
+      if (!b.width || !b.height) continue; // collapsed wrappers
+      const w = Math.abs(b.width - r.width) < 4, h = Math.abs(b.height - r.height) < 4;
+      if (!(w || h) || b.width > innerWidth + 4 || b.height > innerHeight + 4) break;
+      p = e;
+    }
+    return p;
+  }
   function apply() {
+    const cur = document.querySelector(`[${ATTR}]`);
+    const curVid = cur && (cur.matches('video') ? cur : cur.querySelector('video'));
+    if (ON && curVid && curVid.currentSrc) return;
+    cur && cur.removeAttribute(ATTR);
+    document.querySelectorAll('[data-fp-path]').forEach(e => e.removeAttribute('data-fp-path'));
     let s = document.getElementById(ID);
-    const vids = [...document.querySelectorAll('video')];
-    vids.forEach(v => v.removeAttribute('data-fp-fill'));
-    if (!ON) { s && s.remove(); return; }
-    if (!s) { s = document.createElement('style'); s.id = ID; (document.head || document.documentElement).appendChild(s); }
-    s.textContent = CSS;
-    const best = vids.filter(v => v.readyState > 0 || v.src || v.currentSrc)
-      .sort((a, b) => (b.videoWidth * b.videoHeight) - (a.videoWidth * a.videoHeight))[0] || vids[0];
-    if (best) best.setAttribute('data-fp-fill', '');
+    if (!ON) { s && s.remove(); cur && dispatchEvent(new Event('resize')); return; }
+    if (!s) { s = document.createElement('style'); s.id = ID; s.textContent = CSS; (document.head || document.documentElement).appendChild(s); }
+    const v = main();
+    if (!v) return;
+    const p = player(v);
+    p.setAttribute(ATTR, '');
+    // stretch wrappers between player and video; resize lets site players re-layout controls
+    for (let e = v; e && e !== p; e = e.parentElement) e.setAttribute('data-fp-path', '');
+    dispatchEvent(new Event('resize'));
   }
   apply();
   clearInterval(window.__fpTimer);
@@ -236,7 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     var window: PlayerWindow!
     var web: WKWebView!
     var urlField: NSTextField!
-    var fill = defaults.bool(forKey: "fill")
+    var fill = defaults.object(forKey: "fill") as? Bool ?? true
     var onTop = true
     var aspectLocked = false
     var pendingSeek: Double?

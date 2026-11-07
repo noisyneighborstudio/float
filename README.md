@@ -13,7 +13,7 @@ Signs with `Developer ID Application` (override with `SIGN=`) so keychain grants
 ## Features
 - Home mosaic of video sites you've played; Resume card for last video (title + position)
 - Drag via top edge strip; double-click strip toggles video-aspect lock
-- Video fill mode, opacity, click-through, 6 docking positions
+- Video fill (default on): pins any site's main player + controls to the window, hiding page chrome; opacity, click-through, 6 docking positions
 
 ## Shortcuts
 | Key | Action |
