@@ -12,7 +12,7 @@ Signs with `Developer ID Application` (override with `SIGN=`) so keychain grants
 
 ## Features
 - Home mosaic of video sites you've played; Resume card for last video (title + position)
-- Drag via top edge strip; double-click strip snaps to video aspect
+- Drag via top edge strip; double-click strip toggles video-aspect lock
 - Video fill mode, opacity, click-through, 6 docking positions
 
 ## Shortcuts
@@ -21,7 +21,7 @@ Signs with `Developer ID Application` (override with `SIGN=`) so keychain grants
 | ⇧⌘H / ⇧⌘R | Home / Resume last |
 | ⌘L / ⇧⌘V | Open URL (or YouTube search) / open clipboard URL |
 | ⌘R, ⌘[ ⌘] | Reload, back/forward |
-| ⇧⌘F / ⇧⌘A | Video fill / snap to video aspect |
+| ⇧⌘F / ⇧⌘A | Video fill / toggle video-aspect lock |
 | ⌘T / ⇧⌘K | Always on top / click-through |
 | ⌘- ⌘= | Opacity |
 | ⌃⌘1–6 | Dock: top L/C/R, bottom L/C/R |

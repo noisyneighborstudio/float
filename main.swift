@@ -51,7 +51,7 @@ final class DragStrip: NSView {
     override func mouseEntered(with e: NSEvent) { animator().alphaValue = 1 }
     override func mouseExited(with e: NSEvent) { animator().alphaValue = 0 }
     override func mouseDown(with e: NSEvent) {
-        if e.clickCount == 2 { (NSApp.delegate as? AppDelegate)?.snapToVideo(); return }
+        if e.clickCount == 2 { (NSApp.delegate as? AppDelegate)?.toggleAspectLock(); return }
         window?.performDrag(with: e)
     }
     override var mouseDownCanMoveWindow: Bool { true }
@@ -232,12 +232,13 @@ func homeHTML(_ sites: [Site], resume: Resume?) -> String {
 """
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, NSMenuItemValidation {
     var window: PlayerWindow!
     var web: WKWebView!
     var urlField: NSTextField!
     var fill = defaults.bool(forKey: "fill")
     var onTop = true
+    var aspectLocked = false
     var pendingSeek: Double?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -359,7 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
             ("Forward", "]", .command, #selector(forward)),
             ("-", "", [], nil),
             ("Toggle Video Fill", "f", [.command, .shift], #selector(toggleFill)),
-            ("Snap Window to Video Aspect", "a", [.command, .shift], #selector(snapToVideo)),
+            ("Lock to Video Aspect", "a", [.command, .shift], #selector(toggleAspectLock)),
             ("Toggle Always on Top", "t", .command, #selector(toggleTop)),
             ("Toggle Click-Through", "k", [.command, .shift], #selector(toggleClickThrough)),
             ("More Transparent", "-", .command, #selector(fadeOut)),
@@ -429,7 +430,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         web.evaluateJavaScript(fillScript(fill))
     }
 
-    @objc func snapToVideo() {
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(toggleAspectLock) { item.state = aspectLocked ? .on : .off }
+        return true
+    }
+
+    // locked: snap + hold video aspect; unlocked: free resize (setting increments clears aspect)
+    @objc func toggleAspectLock() {
+        if aspectLocked {
+            aspectLocked = false
+            window.contentResizeIncrements = NSSize(width: 1, height: 1)
+            return
+        }
         let js = "(() => { const v=[...document.querySelectorAll('video')].sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0]; return v && v.videoWidth ? [v.videoWidth, v.videoHeight] : null })()"
         web.evaluateJavaScript(js) { [weak self] r, _ in
             guard let self, let d = r as? [Double], d.count == 2, d[1] > 0 else { return }
@@ -439,6 +451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
             f.size.height = h
             self.window.setFrame(f, display: true, animate: true)
             self.window.contentAspectRatio = NSSize(width: d[0], height: d[1])
+            self.aspectLocked = true
         }
     }
 
