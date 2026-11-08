@@ -1,9 +1,47 @@
 import Cocoa
 import WebKit
 import Sparkle
+import Carbon.HIToolbox
 
 let defaults = UserDefaults.standard
 let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+
+// global show/hide hotkey (Carbon: no Accessibility permission needed)
+struct HotKey: Codable, Equatable {
+    var code: UInt32, mods: UInt32 // Carbon keyCode + cmdKey/shiftKey/optionKey/controlKey
+    static let fallback = HotKey(code: UInt32(kVK_ANSI_F), mods: UInt32(controlKey | optionKey | cmdKey))
+    static var saved: HotKey? {
+        get { defaults.data(forKey: "hotkey").map { try? JSONDecoder().decode(HotKey.self, from: $0) } ?? fallback }
+        set { defaults.set(newValue.flatMap { try? JSONEncoder().encode($0) } ?? Data(), forKey: "hotkey") }
+    }
+    init(code: UInt32, mods: UInt32) { self.code = code; self.mods = mods }
+    // nil unless ⌘, ⌃ or ⌥ is held: a bare key would swallow typing everywhere
+    init?(_ e: NSEvent) {
+        let f = e.modifierFlags
+        guard !f.intersection([.command, .control, .option]).isEmpty else { return nil }
+        code = UInt32(e.keyCode)
+        mods = (f.contains(.command) ? UInt32(cmdKey) : 0) | (f.contains(.shift) ? UInt32(shiftKey) : 0)
+             | (f.contains(.option) ? UInt32(optionKey) : 0) | (f.contains(.control) ? UInt32(controlKey) : 0)
+    }
+    var label: String {
+        let names: [Int: String] = [kVK_Space: "Space", kVK_Return: "↩", kVK_Tab: "⇥", kVK_LeftArrow: "←", kVK_RightArrow: "→",
+            kVK_UpArrow: "↑", kVK_DownArrow: "↓", kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4", kVK_F5: "F5",
+            kVK_F6: "F6", kVK_F7: "F7", kVK_F8: "F8", kVK_F9: "F9", kVK_F10: "F10", kVK_F11: "F11", kVK_F12: "F12"]
+        var key = names[Int(code)]
+        if key == nil, let src = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+           let raw = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData) {
+            let layout = unsafeBitCast(raw, to: CFData.self)
+            var dead: UInt32 = 0, len = 0, chars = [UniChar](repeating: 0, count: 4)
+            CFDataGetBytePtr(layout).withMemoryRebound(to: UCKeyboardLayout.self, capacity: 1) {
+                _ = UCKeyTranslate($0, UInt16(code), UInt16(kUCKeyActionDisplay), 0, UInt32(LMGetKbdType()),
+                                   OptionBits(kUCKeyTranslateNoDeadKeysBit), &dead, 4, &len, &chars)
+            }
+            key = String(utf16CodeUnits: chars, count: len).uppercased()
+        }
+        return (mods & UInt32(controlKey) != 0 ? "⌃" : "") + (mods & UInt32(optionKey) != 0 ? "⌥" : "")
+             + (mods & UInt32(shiftKey) != 0 ? "⇧" : "") + (mods & UInt32(cmdKey) != 0 ? "⌘" : "") + (key ?? "key \(code)")
+    }
+}
 
 // pins the main video's player (video + site controls) to the window; works on any site
 func fillScript(_ on: Bool) -> String { """
@@ -277,9 +315,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         : SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
     // tracking script + fpPlay bridge live here; page JS can't reach them to forge messages
     let trackWorld = WKContentWorld.world(name: "float-track")
+    var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         buildMenu()
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in delegate.toggleShown(); return noErr }, 1, &spec, nil, nil)
+        registerHotKey()
 
         window = PlayerWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 360),
                               styleMask: [.titled, .resizable, .closable, .miniaturizable, .fullSizeContentView],
@@ -379,6 +421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         sub("Float", [
             ("Check for Updates…", "", [], #selector(checkForUpdates)),
             ("-", "", [], nil),
+            ("Show/Hide Hotkey…", "", [], #selector(recordHotKey)),
             ("Hide Float", "h", .command, #selector(NSApplication.hide(_:))),
             ("Quit Float", "q", .command, #selector(NSApplication.terminate(_:))),
         ])
@@ -471,6 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(toggleAspectLock) { item.state = aspectLocked ? .on : .off }
+        if item.action == #selector(recordHotKey) { item.title = "Show/Hide Hotkey: \(HotKey.saved?.label ?? "None")…" }
         if item.action == #selector(checkForUpdates) { return updater?.updater.canCheckForUpdates ?? false }
         return true
     }
@@ -502,6 +546,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         let x = [vis.minX + m, vis.midX - f.width / 2, vis.maxX - f.width - m][sender.tag % 3]
         let y = sender.tag < 3 ? vis.maxY - f.height - m : vis.minY + m
         window.setFrame(NSRect(x: x, y: y, width: f.width, height: f.height), display: true, animate: true)
+    }
+
+    @objc func toggleShown() {
+        if NSApp.isHidden || !window.isVisible { NSApp.unhide(nil); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+        else { NSApp.hide(nil) }
+    }
+
+    func unregisterHotKey() { if let r = hotKeyRef { UnregisterEventHotKey(r) }; hotKeyRef = nil }
+    func registerHotKey() {
+        unregisterHotKey()
+        guard let k = HotKey.saved else { return }
+        let st = RegisterEventHotKey(k.code, k.mods, EventHotKeyID(signature: OSType(0x464C5454), id: 1), GetApplicationEventTarget(), 0, &hotKeyRef)
+        if st != noErr {
+            let a = NSAlert(); a.messageText = "\(k.label) is taken by another app"; a.informativeText = "Pick another in Float › Show/Hide Hotkey…"; a.runModal()
+        }
+    }
+
+    // next ⌘/⌃/⌥ combo becomes the hotkey; ⌫ clears it, Esc cancels
+    @objc func recordHotKey() {
+        unregisterHotKey() // so pressing the current one records it
+        let a = NSAlert()
+        a.messageText = "Press the new show/hide shortcut"
+        a.informativeText = "Current: \(HotKey.saved?.label ?? "None"). Use ⌘, ⌃ or ⌥. ⌫ clears, Esc cancels."
+        a.addButton(withTitle: "Cancel")
+        let mon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+            switch Int(e.keyCode) {
+            case kVK_Escape: NSApp.stopModal()
+            case kVK_Delete where e.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: HotKey.saved = nil; NSApp.stopModal()
+            default: guard let k = HotKey(e) else { NSSound.beep(); return nil }; HotKey.saved = k; NSApp.stopModal()
+            }
+            return nil
+        }
+        a.runModal()
+        mon.map(NSEvent.removeMonitor)
+        registerHotKey()
     }
 
     @objc func checkForUpdates() { updater?.checkForUpdates(nil) }

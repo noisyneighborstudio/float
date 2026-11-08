@@ -32,3 +32,4 @@ Hosting/keys: `updates.env`. Sparkle EdDSA key: login keychain account `float`. 
 | ⌘- ⌘= | Opacity |
 | ⌃⌘1–6 | Dock: top L/C/R, bottom L/C/R |
 | ⌃Space | Play/pause |
+| ⌃⌥⌘F (global) | Hide / restore Float from any app; change it in Float › Show/Hide Hotkey… |
