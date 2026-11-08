@@ -1,5 +1,6 @@
 import Cocoa
 import WebKit
+import Sparkle
 
 let defaults = UserDefaults.standard
 let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -271,6 +272,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     var aspectLocked = false
     var pendingSeek: Double?
     var homeToken = ""
+    // release builds only (build.sh bakes SUFeedURL in when BUILD is set); dev builds never self-update
+    let updater = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") == nil ? nil
+        : SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
     // tracking script + fpPlay bridge live here; page JS can't reach them to forge messages
     let trackWorld = WKContentWorld.world(name: "float-track")
 
@@ -373,6 +377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
             let host = NSMenuItem(); host.submenu = m; main.addItem(host)
         }
         sub("Float", [
+            ("Check for Updates…", "", [], #selector(checkForUpdates)),
+            ("-", "", [], nil),
             ("Hide Float", "h", .command, #selector(NSApplication.hide(_:))),
             ("Quit Float", "q", .command, #selector(NSApplication.terminate(_:))),
         ])
@@ -465,6 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(toggleAspectLock) { item.state = aspectLocked ? .on : .off }
+        if item.action == #selector(checkForUpdates) { return updater?.updater.canCheckForUpdates ?? false }
         return true
     }
 
@@ -497,6 +504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         window.setFrame(NSRect(x: x, y: y, width: f.width, height: f.height), display: true, animate: true)
     }
 
+    @objc func checkForUpdates() { updater?.checkForUpdates(nil) }
     @objc func toggleTop() { onTop.toggle(); window.level = onTop ? .floating : .normal }
     @objc func toggleClickThrough() {
         window.ignoresMouseEvents.toggle()

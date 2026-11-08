@@ -1,0 +1,72 @@
+name: Build and publish updates
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sparkle-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # semantic-release and publish-appcast.sh authenticate explicitly.
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      # GitHub release downloads 504 for minutes at a time; build.sh only fetches Sparkle on a miss.
+      - uses: actions/cache@v4
+        with:
+          path: vendor
+          key: sparkle-${{ hashFiles('updates.env') }}
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          for name in CERTIFICATE CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD NOTARY_KEY; do
+            [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
+          done
+          cert="$RUNNER_TEMP/developer-id.p12"; keychain="$RUNNER_TEMP/float.keychain-db"
+          umask 077; printf '%s' "$CERTIFICATE" | base64 -D > "$cert"
+          printf '%s' "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$cert" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Only increases. Renaming this file resets it, so don't.
+          FLOAT_BUILD_NUMBER: ${{ github.run_number }}
+          SIGN: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          NOTARY_KEY_PATH: ${{ runner.temp }}/notary.p8
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_KEY_ISSUER: ${{ secrets.NOTARY_KEY_ISSUER }}
+        run: |
+          set -euo pipefail
+          for name in SIGN SPARKLE_PRIVATE_KEY NOTARY_KEY_ID NOTARY_KEY_ISSUER; do
+            [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
+          done
+          npm ci --no-audit --no-fund
+          npx semantic-release
+      - name: Remove temporary credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary.p8"
+          security delete-keychain "$RUNNER_TEMP/float.keychain-db" 2>/dev/null || true
