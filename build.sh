@@ -27,5 +27,5 @@ cat > $APP/Contents/Info.plist <<PLIST
 </dict></plist>
 PLIST
 # stable identity → keychain "Always Allow" (Netflix DRM keys) survives rebuilds
-codesign --force --timestamp=none -s "${SIGN:-Developer ID Application}" $APP
+codesign --force --options runtime --timestamp=none -s "${SIGN:-Developer ID Application}" $APP
 echo "built $APP"

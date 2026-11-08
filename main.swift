@@ -165,24 +165,32 @@ let iconScript = """
 })()
 """
 
+func isWeb(_ u: URL) -> Bool { ["http", "https"].contains(u.scheme?.lowercased() ?? "") }
+
 func siteName(_ host: String) -> String {
     let parts = host.split(separator: ".").filter { !["www", "m", "watch", "play", "app"].contains($0) }
     let core = parts.count > 1 ? parts[parts.count - 2] : (parts.first ?? Substring(host))
     return core.prefix(1).uppercased() + core.dropFirst()
 }
 
-func homeHTML(_ sites: [Site], resume: Resume?) -> String {
+// JSON safe to inline in <script>: escape '<' so titles can't alter HTML tokenizing ('/' already escaped)
+func scriptJSON(_ o: Any) -> String {
+    String(data: try! JSONSerialization.data(withJSONObject: o), encoding: .utf8)!.replacingOccurrences(of: "<", with: "\\u003C")
+}
+
+// token: per-load secret so only this page can issue float-* commands
+func homeHTML(_ sites: [Site], resume: Resume?, token: String) -> String {
     let icon = { (s: Site) in s.icon ?? "\(s.url)/favicon.ico" }
     let tiles = sites.sorted { $0.last > $1.last }.map {
         ["host": $0.host, "url": $0.url, "icon": icon($0), "name": siteName($0.host)]
     }
-    let json = String(data: try! JSONSerialization.data(withJSONObject: tiles), encoding: .utf8)!
+    let json = scriptJSON(tiles)
     var resumeObj: [String: Any] = [:]
     if let r = resume, let host = URL(string: r.url)?.host {
         resumeObj = ["title": r.title.isEmpty ? siteName(host) : r.title, "host": host, "t": r.time, "d": r.duration,
                      "icon": sites.first { $0.host == host }.map(icon) ?? "https://\(host)/favicon.ico"]
     }
-    let resumeJSON = String(data: try! JSONSerialization.data(withJSONObject: resumeObj), encoding: .utf8)!
+    let resumeJSON = scriptJSON(resumeObj)
     return """
 <!doctype html><html><head><meta charset="utf-8"><style>
   :root { color-scheme: dark; }
@@ -224,7 +232,7 @@ func homeHTML(_ sites: [Site], resume: Resume?) -> String {
   const fmt = s => { s = Math.floor(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, '0');
     return h ? `${h}:${String(m).padStart(2, '0')}:${x}` : `${m}:${x}`; };
   if (resume.host) {
-    const a = document.createElement('a'); a.className = 'resume'; a.href = 'float-resume:';
+    const a = document.createElement('a'); a.className = 'resume'; a.href = 'float-resume:\(token)';
     const img = document.createElement('img'); img.className = 'icon'; img.src = resume.icon;
     img.onerror = () => img.remove();
     const meta = document.createElement('div'); meta.className = 'meta';
@@ -247,7 +255,7 @@ func homeHTML(_ sites: [Site], resume: Resume?) -> String {
     img.onerror = () => { const d = document.createElement('div'); d.className = 'letter'; d.textContent = s.name[0]; img.replaceWith(d); };
     const n = document.createElement('div'); n.className = 'name'; n.textContent = s.name;
     const x = document.createElement('a'); x.className = 'x'; x.textContent = '×'; x.title = 'Remove';
-    x.href = 'float-remove:' + encodeURIComponent(s.host);
+    x.href = 'float-remove:\(token)/' + encodeURIComponent(s.host);
     a.append(img, n, x); g.append(a);
   }
 </script></body></html>
@@ -262,6 +270,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     var onTop = true
     var aspectLocked = false
     var pendingSeek: Double?
+    var homeToken = ""
+    // tracking script + fpPlay bridge live here; page JS can't reach them to forge messages
+    let trackWorld = WKContentWorld.world(name: "float-track")
 
     func applicationDidFinishLaunching(_ n: Notification) {
         buildMenu()
@@ -294,7 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         web.allowsMagnification = true
         web.setValue(false, forKey: "drawsBackground")
         installFillScript()
-        cfg.userContentController.add(self, name: "fpPlay")
+        cfg.userContentController.add(self, contentWorld: trackWorld, name: "fpPlay")
 
         let root = NSView()
         root.wantsLayer = true
@@ -414,7 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
             c.queryItems = [URLQueryItem(name: "search_query", value: s)]
             url = c.url
         }
-        if let url { web.load(URLRequest(url: url)) }
+        if let url, isWeb(url) { web.load(URLRequest(url: url)) }
     }
 
     @objc func showURL() {
@@ -443,7 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         let ucc = web.configuration.userContentController
         ucc.removeAllUserScripts()
         ucc.addUserScript(WKUserScript(source: fillScript(fill), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
-        ucc.addUserScript(WKUserScript(source: trackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        ucc.addUserScript(WKUserScript(source: trackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: trackWorld))
     }
     @objc func toggleFill() {
         fill.toggle()
@@ -501,13 +512,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         web.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v){ v.paused ? v.play() : v.pause(); } })()")
     }
 
-    @objc func showHome() { web.loadHTMLString(homeHTML(SiteStore.all(), resume: ResumeStore.load()), baseURL: nil) }
+    @objc func showHome() {
+        homeToken = UUID().uuidString
+        web.loadHTMLString(homeHTML(SiteStore.all(), resume: ResumeStore.load(), token: homeToken), baseURL: nil)
+    }
 
     // MARK: web delegates
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
         guard let url = web.url, url.scheme?.hasPrefix("http") == true, let host = url.host,
               let b = m.body as? [String: Any] else { return }
         let t = b["t"] as? Double ?? 0, d = b["d"] as? Double ?? 0
+        guard t.isFinite, d.isFinite, t >= 0, d >= 0 else { return }
         if b["event"] as? String == "play" {
             web.evaluateJavaScript(iconScript) { icon, _ in SiteStore.record(url, icon: icon as? String) }
             if let seek = pendingSeek, t < seek - 10 {
@@ -516,7 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
             pendingSeek = nil
         }
         // skip trailers/previews/ads
-        guard d.isFinite && d > 180 else { return }
+        guard d > 180, t <= d else { return }
         web.evaluateJavaScript(titleScript) { r, _ in
             var title = cleanTitle(r as? String ?? "", host: host)
             // player titles are often hidden with the controls; keep the last good one for this page
@@ -530,9 +545,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     func webView(_ w: WKWebView, decidePolicyFor a: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let u = a.request.url, u.scheme?.hasPrefix("float-") == true else { return decisionHandler(.allow) }
         decisionHandler(.cancel)
-        if u.scheme == "float-resume" { resumeLast(); return }
-        SiteStore.remove(u.absoluteString.dropFirst("float-remove:".count).removingPercentEncoding ?? "")
-        showHome()
+        // only the current home page knows the token; anything else is a forged command
+        let arg = u.absoluteString.drop { $0 != ":" }.dropFirst()
+        guard a.sourceFrame.isMainFrame, !homeToken.isEmpty, arg.hasPrefix(homeToken) else { return }
+        let rest = arg.dropFirst(homeToken.count)
+        switch u.scheme {
+        case "float-resume" where rest.isEmpty: resumeLast()
+        case "float-remove" where rest.hasPrefix("/"):
+            SiteStore.remove(rest.dropFirst().removingPercentEncoding ?? "")
+            showHome()
+        default: break
+        }
     }
 
 
@@ -542,7 +565,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         load(r.url)
     }
     func webView(_ w: WKWebView, createWebViewWith c: WKWebViewConfiguration, for a: WKNavigationAction, windowFeatures f: WKWindowFeatures) -> WKWebView? {
-        if a.targetFrame == nil, let u = a.request.url { w.load(URLRequest(url: u)) }
+        // top-level page popups only: iframe popups would escape their sandbox
+        if a.targetFrame == nil, a.sourceFrame.isMainFrame, let u = a.request.url, isWeb(u) { w.load(URLRequest(url: u)) }
         return nil
     }
 }
