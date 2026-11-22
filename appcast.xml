@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
 <channel><title>Float Updates</title><item>
-<title>Float 1.5.0</title><pubDate>Sun, 22 Nov 2026 18:18:32 +0000</pubDate>
+<title>Float 1.5.1</title><pubDate>Sun, 22 Nov 2026 18:35:25 +0000</pubDate>
 <link>https://github.com/noisyneighborstudio/float/releases/latest</link>
 <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-<enclosure url="https://github.com/noisyneighborstudio/float/releases/download/v1.5.0/Float-1.5.0.zip" sparkle:version="14" sparkle:shortVersionString="1.5.0" length="17303952" type="application/octet-stream" sparkle:edSignature="taqTNNKiJEYdUOGy/pOQgQaQdo1UxEFC7qtidElg4K4Wy71ayyGCLwWFYAQkziaGwLJzM6Ao3a5VP9BJPKKNBQ=="/>
+<enclosure url="https://github.com/noisyneighborstudio/float/releases/download/v1.5.1/Float-1.5.1.zip" sparkle:version="15" sparkle:shortVersionString="1.5.1" length="17303702" type="application/octet-stream" sparkle:edSignature="UgxuhmD/lXBVohbUEfxZ+f10a5vzoVRBSTrfLvbvJHmfYsyGtYhAc0N+5r8K3qT2O9BP5a8dsuR4Gzh+0j2RAw=="/>
 </item></channel></rss>
