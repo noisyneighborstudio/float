@@ -6,16 +6,23 @@ import { homedir } from 'node:os';
 import { basename, resolve } from 'node:path';
 
 const home = homedir();
+const cargoBin = resolve(home, '.cargo/bin');
+if (existsSync(cargoBin) && !(process.env.PATH ?? '').startsWith(`${cargoBin}:`)) {
+  process.env.PATH = `${cargoBin}:${process.env.PATH ?? ''}`;
+}
 if (!process.env.CARGO_HOME && !existsSync(resolve(home, '.cargo/hermes-lean-sys')) && existsSync(resolve(home, '.asdf/installs/rust/stable/hermes-lean-sys'))) {
   process.env.CARGO_HOME = resolve(home, '.asdf/installs/rust/stable');
 }
 const candidates = [
+  process.env.EXACT,
   process.env.EXACT2,
+  resolve(home, 'Development/exact'),
+  resolve(home, 'Development/expo/exact'),
   resolve(home, 'Development/exact2-main'),
   resolve(home, 'Development/expo/exact2'),
   resolve(home, 'Development/exact2'),
 ].filter(Boolean);
-const EXACT2 = candidates.find((p) => existsSync(resolve(p, 'scripts/app-cli.mjs'))) ?? resolve(home, 'Development/expo/exact2');
+const EXACT2 = candidates.find((p) => existsSync(resolve(p, 'scripts/app-cli.mjs'))) ?? resolve(home, 'Development/exact');
 const cli = resolve(EXACT2, 'scripts/app-cli.mjs');
 if (!existsSync(cli)) {
   console.error(`no exact2 at ${EXACT2} (no scripts/app-cli.mjs): EXACT2 names the checkout`);

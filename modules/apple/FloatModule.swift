@@ -2394,6 +2394,8 @@ final class FloatModule: ExactModule {
             "shortcutsOpen": shortcutsOpen,
             "peekPermissionGranted": peekPermissionGranted,
             "canCheckUpdates": sparkle.canCheckForUpdates,
+            "nativeBackdrop": true,
+            "browserFrame": "",
             "hasResume": hasResume,
             "resumeUrl": resumeUrl,
             "resumeTitle": resumeTitle,
