@@ -566,6 +566,13 @@ private final class FloatDragStripView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let win = window {
+            module?.prepareOpeningAnimation(for: win)
+        }
+    }
+
     override func mouseEntered(with e: NSEvent) {
         animator().alphaValue = 1
     }
@@ -1450,6 +1457,505 @@ private final class FloatHomeVisualEffectView: NSVisualEffectView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+/// Borderless, screen-unconstrained overlay panel used solely during the opening glassy-logo morph.
+private final class FloatOpeningMorphPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
+/// Opening animation: materializes a floating, 3D-tilted Liquid Glass version of the Float logo
+/// (teal refracting glass pane, luminous cyan bevel rim, specular sheen, and rounded play mark)
+/// and smoothly morphs its glass geometry, tint, and perspective into the exact Float window shape.
+private final class FloatOpeningMorphController: NSObject {
+    private weak var hostWindow: NSWindow?
+    private let targetAlphaProvider: () -> CGFloat
+    private let isHomeProvider: () -> Bool
+    private let onComplete: () -> Void
+
+    private let panel: FloatOpeningMorphPanel
+    private let rootView: NSView
+    private let shadowLayer = CAGradientLayer()
+    private let stageView: NSView
+    private let glassView: NSView
+    private let interiorView: NSView
+
+    private let tealDepthLayer = CAGradientLayer()
+    private let sheenLayer = CAGradientLayer()
+    private let rimGradientLayer = CAGradientLayer()
+    private let rimMaskLayer = CAShapeLayer()
+    private let innerHighlightLayer = CAShapeLayer()
+    private let playLayer = CAShapeLayer()
+
+    private let pad: CGFloat = 88
+    private let targetRect: NSRect
+    private let logoRect: NSRect
+    private let startCornerRadius: CGFloat
+    private let endCornerRadius: CGFloat = 16
+
+    private var displayLink: CADisplayLink?
+    private var startTimestamp: CFTimeInterval?
+    private var finished = false
+    private var hostShadowRestored = false
+
+    private let totalDuration: CFTimeInterval = 0.84
+
+    init(
+        hostWindow: NSWindow,
+        targetAlphaProvider: @escaping () -> CGFloat,
+        isHomeProvider: @escaping () -> Bool,
+        onComplete: @escaping () -> Void
+    ) {
+        self.hostWindow = hostWindow
+        self.targetAlphaProvider = targetAlphaProvider
+        self.isHomeProvider = isHomeProvider
+        self.onComplete = onComplete
+
+        let hostFrame = hostWindow.frame
+        let overlayFrame = hostFrame.insetBy(dx: -pad, dy: -pad)
+        self.targetRect = NSRect(x: pad, y: pad, width: hostFrame.width, height: hostFrame.height)
+
+        // Proportion the glassy Float logo pane (~1.58:1 aspect like Float.icon) cleanly for any window size
+        let maxLogoW = min(232, hostFrame.width * 0.72)
+        let maxLogoH = min(146, hostFrame.height * 0.72)
+        var logoW = min(max(hostFrame.width * 0.36, 136), maxLogoW)
+        var logoH = logoW / 1.58
+        if logoH > maxLogoH {
+            logoH = maxLogoH
+            logoW = min(maxLogoW, logoH * 1.58)
+        }
+        logoW = max(72, logoW)
+        logoH = max(46, logoH)
+        self.logoRect = NSRect(
+            x: targetRect.midX - logoW / 2,
+            y: targetRect.midY - logoH / 2,
+            width: logoW,
+            height: logoH
+        )
+        self.startCornerRadius = min(max(logoH * 0.21, 14), 28)
+
+        panel = FloatOpeningMorphPanel(
+            contentRect: overlayFrame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.animationBehavior = .none
+        panel.level = hostWindow.level
+        panel.collectionBehavior = hostWindow.collectionBehavior
+
+        let overlayBounds = NSRect(origin: .zero, size: overlayFrame.size)
+        rootView = NSView(frame: overlayBounds)
+        rootView.wantsLayer = true
+        rootView.layer?.backgroundColor = NSColor.clear.cgColor
+
+        stageView = NSView(frame: overlayBounds)
+        stageView.wantsLayer = true
+        stageView.layer?.backgroundColor = NSColor.clear.cgColor
+
+        interiorView = NSView(frame: NSRect(origin: .zero, size: logoRect.size))
+        interiorView.wantsLayer = true
+        interiorView.layer?.masksToBounds = true
+
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: logoRect)
+            glass.style = .regular
+            glass.cornerRadius = startCornerRadius
+            glass.tintColor = NSColor(calibratedRed: 0.00, green: 0.44, blue: 0.48, alpha: 0.74)
+            glass.contentView = interiorView
+            glassView = glass
+        } else {
+            let fx = NSVisualEffectView(frame: logoRect)
+            fx.material = .hudWindow
+            fx.blendingMode = .behindWindow
+            fx.state = .active
+            fx.wantsLayer = true
+            fx.layer?.cornerRadius = startCornerRadius
+            fx.layer?.masksToBounds = true
+            interiorView.autoresizingMask = [.width, .height]
+            fx.addSubview(interiorView)
+            glassView = fx
+        }
+
+        super.init()
+        setupLayers()
+        rootView.layer?.addSublayer(shadowLayer)
+        stageView.addSubview(glassView)
+        rootView.addSubview(stageView)
+        panel.contentView = rootView
+    }
+
+    private func setupLayers() {
+        // Feather-soft radial floating shadow hovering below the tilted logo (never blocks behind translucent glass)
+        shadowLayer.type = .radial
+        shadowLayer.colors = [
+            NSColor(calibratedRed: 0.00, green: 0.14, blue: 0.16, alpha: 0.34).cgColor,
+            NSColor(calibratedRed: 0.00, green: 0.14, blue: 0.16, alpha: 0.16).cgColor,
+            NSColor(calibratedRed: 0.00, green: 0.14, blue: 0.16, alpha: 0.0).cgColor,
+        ]
+        shadowLayer.locations = [0.0, 0.48, 1.0]
+        shadowLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
+        shadowLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
+
+        guard let interiorLayer = interiorView.layer else { return }
+
+        // 1. Rich emerald-teal glass depth gradient matching Float.icon
+        tealDepthLayer.colors = [
+            NSColor(calibratedRed: 0.18, green: 0.90, blue: 0.92, alpha: 0.46).cgColor,
+            NSColor(calibratedRed: 0.00, green: 0.42, blue: 0.47, alpha: 0.42).cgColor,
+            NSColor(calibratedRed: 0.00, green: 0.28, blue: 0.33, alpha: 0.48).cgColor,
+            NSColor(calibratedRed: 0.10, green: 0.84, blue: 0.86, alpha: 0.40).cgColor,
+        ]
+        tealDepthLayer.locations = [0.0, 0.34, 0.70, 1.0]
+        tealDepthLayer.startPoint = CGPoint(x: 0.05, y: 0.95)
+        tealDepthLayer.endPoint = CGPoint(x: 0.95, y: 0.05)
+        interiorLayer.addSublayer(tealDepthLayer)
+
+        // 2. Diagonal glossy glass light sheen sweep
+        sheenLayer.colors = [
+            NSColor.white.withAlphaComponent(0.0).cgColor,
+            NSColor(calibratedRed: 0.78, green: 1.00, blue: 0.99, alpha: 0.34).cgColor,
+            NSColor.white.withAlphaComponent(0.46).cgColor,
+            NSColor(calibratedRed: 0.58, green: 0.98, blue: 0.98, alpha: 0.16).cgColor,
+            NSColor.white.withAlphaComponent(0.0).cgColor,
+        ]
+        sheenLayer.locations = [0.0, 0.34, 0.50, 0.66, 1.0]
+        sheenLayer.startPoint = CGPoint(x: 0.0, y: 1.0)
+        sheenLayer.endPoint = CGPoint(x: 1.0, y: 0.0)
+        interiorLayer.addSublayer(sheenLayer)
+
+        // 3. Luminous cyan-turquoise specular bevel rim (gradient masked by morphing rounded-rect stroke)
+        rimGradientLayer.colors = [
+            NSColor(calibratedRed: 0.80, green: 1.00, blue: 0.99, alpha: 0.98).cgColor,
+            NSColor(calibratedRed: 0.16, green: 0.90, blue: 0.90, alpha: 0.95).cgColor,
+            NSColor(calibratedRed: 0.04, green: 0.50, blue: 0.56, alpha: 0.78).cgColor,
+            NSColor(calibratedRed: 0.42, green: 0.98, blue: 0.97, alpha: 0.98).cgColor,
+            NSColor(calibratedRed: 0.08, green: 0.68, blue: 0.72, alpha: 0.86).cgColor,
+        ]
+        rimGradientLayer.locations = [0.0, 0.25, 0.52, 0.78, 1.0]
+        rimGradientLayer.startPoint = CGPoint(x: 0.0, y: 1.0)
+        rimGradientLayer.endPoint = CGPoint(x: 1.0, y: 0.0)
+        rimMaskLayer.fillColor = nil
+        rimMaskLayer.strokeColor = NSColor.white.cgColor
+        rimMaskLayer.lineWidth = 3.0
+        rimGradientLayer.mask = rimMaskLayer
+        interiorLayer.addSublayer(rimGradientLayer)
+
+        // Subtle inner white-cyan highlight edge
+        innerHighlightLayer.fillColor = nil
+        innerHighlightLayer.strokeColor = NSColor(calibratedRed: 0.86, green: 1.00, blue: 1.00, alpha: 0.38).cgColor
+        innerHighlightLayer.lineWidth = 1.0
+        interiorLayer.addSublayer(innerHighlightLayer)
+
+        // 4. Sculpted warm-ivory rounded play triangle hovering over the teal glass
+        playLayer.fillColor = NSColor(calibratedRed: 0.975, green: 0.97, blue: 0.95, alpha: 0.98).cgColor
+        playLayer.shadowColor = NSColor(calibratedRed: 0.00, green: 0.16, blue: 0.20, alpha: 1.0).cgColor
+        playLayer.shadowOpacity = 0.48
+        playLayer.shadowRadius = 8
+        playLayer.shadowOffset = CGSize(width: 0, height: -4)
+        interiorLayer.addSublayer(playLayer)
+    }
+
+    func start() {
+        guard !finished, let host = hostWindow else { return }
+        applyFrame(elapsed: 0)
+        panel.order(.above, relativeTo: host.windowNumber)
+        let link = rootView.displayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    func cancel(restoreHost: Bool) {
+        guard !finished else { return }
+        finished = true
+        displayLink?.invalidate()
+        displayLink = nil
+        panel.orderOut(nil)
+        if restoreHost, let host = hostWindow {
+            host.hasShadow = true
+            host.alphaValue = targetAlphaProvider()
+            host.invalidateShadow()
+        }
+        onComplete()
+    }
+
+    @objc private func step(_ link: CADisplayLink) {
+        guard !finished else { return }
+        let now = link.timestamp
+        if startTimestamp == nil { startTimestamp = now }
+        let elapsed = max(0, now - (startTimestamp ?? now))
+        applyFrame(elapsed: elapsed)
+        if elapsed >= totalDuration {
+            finish()
+        }
+    }
+
+    private func finish() {
+        guard !finished else { return }
+        finished = true
+        displayLink?.invalidate()
+        displayLink = nil
+        if let host = hostWindow {
+            host.hasShadow = true
+            host.alphaValue = targetAlphaProvider()
+            host.invalidateShadow()
+        }
+        panel.orderOut(nil)
+        onComplete()
+    }
+
+    private func applyFrame(elapsed t: CFTimeInterval) {
+        let targetAlpha = targetAlphaProvider()
+        let isHome = isHomeProvider()
+
+        // Phase A (0.00 -> 0.18s): Glassy logo blooms into existence
+        let appear = Self.easeOutCubic(Self.clamp01(t / 0.15))
+        let entryScale = Self.lerp(0.76, 1.0, Self.springOut(Self.clamp01(t / 0.20)))
+        let entryLiftY = Self.lerp(-14.0, 0.0, Self.easeOutCubic(Self.clamp01(t / 0.18)))
+
+        // Phase B (0.20 -> 0.72s): Fluid Liquid Glass morph from tilted logo into exact window shape
+        let morphU = Self.clamp01((t - 0.20) / 0.50)
+        let morphSpring = Self.dampedSpring(morphU)
+        let morphSmooth = Self.smootherStep(morphU)
+
+        // 3D logo perspective pose unwinds smoothly to flat plane
+        let pose = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.19) / 0.44))
+        let rotZ = pose * (9.5 * .pi / 180.0)
+        let rotY = pose * (-20.0 * .pi / 180.0)
+        let rotX = pose * (4.5 * .pi / 180.0)
+
+        // Morphing rectangle & corner radius
+        let curW = Self.lerp(logoRect.width, targetRect.width, morphSpring)
+        let curH = Self.lerp(logoRect.height, targetRect.height, morphSpring)
+        let curCenterX = Self.lerp(logoRect.midX, targetRect.midX, morphSpring)
+        let curCenterY = Self.lerp(logoRect.midY, targetRect.midY, morphSpring) + entryLiftY
+        let curRect = NSRect(
+            x: curCenterX - curW / 2,
+            y: curCenterY - curH / 2,
+            width: curW,
+            height: curH
+        )
+        let clampedRadius = min(
+            Self.lerp(startCornerRadius, endCornerRadius, morphSmooth),
+            min(curW, curH) * 0.48
+        )
+
+        // Phase C (0.58 -> 0.84s): Seamless cross-fade handoff into real hostWindow
+        let hostReveal = Self.easeOutCubic(Self.clamp01((t - 0.58) / 0.15))
+        let overlayFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.66) / 0.17))
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        // Update real Liquid Glass geometry, corner radius, and tint
+        glassView.frame = curRect
+        let localBounds = NSRect(origin: .zero, size: curRect.size)
+        interiorView.frame = localBounds
+        interiorView.layer?.cornerRadius = clampedRadius
+        if #available(macOS 26.0, *), let glass = glassView as? NSGlassEffectView {
+            glass.cornerRadius = clampedRadius
+            let tealBlend = 1.0 - morphSmooth
+            if isHome {
+                let tintAlpha = 0.74 * tealBlend
+                glass.tintColor = tintAlpha > 0.005
+                    ? NSColor(calibratedRed: 0.00, green: 0.44, blue: 0.48, alpha: tintAlpha)
+                    : nil
+            } else {
+                glass.tintColor = NSColor(
+                    calibratedRed: Self.lerp(0.00, 0.02, morphSmooth),
+                    green: Self.lerp(0.44, 0.02, morphSmooth),
+                    blue: Self.lerp(0.48, 0.03, morphSmooth),
+                    alpha: Self.lerp(0.74, 0.94, morphSmooth)
+                )
+            }
+        } else {
+            glassView.layer?.cornerRadius = clampedRadius
+            glassView.layer?.backgroundColor = isHome
+                ? NSColor(calibratedRed: 0.00, green: 0.36, blue: 0.40, alpha: 0.56 * (1.0 - morphSmooth)).cgColor
+                : NSColor(
+                    calibratedRed: 0.0,
+                    green: 0.36 * (1.0 - morphSmooth),
+                    blue: 0.40 * (1.0 - morphSmooth),
+                    alpha: Self.lerp(0.56, 0.95, morphSmooth)
+                ).cgColor
+        }
+
+        // Apply centered 3D perspective + tilt + entrance scale around the morphing glass center
+        stageView.layer?.transform = Self.centeredTransform(
+            around: CGPoint(x: curRect.midX, y: curRect.midY),
+            scale: entryScale,
+            rotX: rotX,
+            rotY: rotY,
+            rotZ: rotZ
+        )
+
+        // Update interior optical layers
+        tealDepthLayer.frame = localBounds
+        tealDepthLayer.cornerRadius = clampedRadius
+        tealDepthLayer.opacity = Float(1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.22) / 0.44)))
+
+        // Diagonal sheen sweeps smoothly across the unfolding glass
+        let sheenT = Self.easeInOutCubic(Self.clamp01((t - 0.06) / 0.58))
+        let sheenShift = Self.lerp(-0.55, 0.75, sheenT)
+        sheenLayer.frame = localBounds
+        sheenLayer.cornerRadius = clampedRadius
+        sheenLayer.startPoint = CGPoint(x: max(-0.5, sheenShift - 0.35), y: 1.0)
+        sheenLayer.endPoint = CGPoint(x: min(1.5, sheenShift + 0.55), y: 0.0)
+        let sheenVis = (1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.42) / 0.28))) * appear
+        sheenLayer.opacity = Float(0.85 * sheenVis)
+
+        // Luminous cyan-turquoise bevel rim stretches to trace the window, then dissolves into native rim
+        rimGradientLayer.frame = localBounds
+        rimMaskLayer.frame = localBounds
+        let rimWidth = Self.lerp(3.0, 1.35, morphSmooth)
+        rimMaskLayer.lineWidth = rimWidth
+        let rimRect = localBounds.insetBy(dx: rimWidth * 0.5, dy: rimWidth * 0.5)
+        let rimRadius = max(0, clampedRadius - rimWidth * 0.5)
+        rimMaskLayer.path = CGPath(roundedRect: rimRect, cornerWidth: rimRadius, cornerHeight: rimRadius, transform: nil)
+        let rimFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.54) / 0.22))
+        rimGradientLayer.opacity = Float(0.96 * rimFade)
+
+        innerHighlightLayer.frame = localBounds
+        let innerRect = localBounds.insetBy(dx: rimWidth + 1.0, dy: rimWidth + 1.0)
+        let innerRadius = max(0, clampedRadius - rimWidth - 1.0)
+        innerHighlightLayer.path = CGPath(roundedRect: innerRect, cornerWidth: innerRadius, cornerHeight: innerRadius, transform: nil)
+        innerHighlightLayer.opacity = Float(0.70 * (1.0 - morphSmooth))
+
+        // Rounded play triangle: pops in slightly staggered, then blooms & dissolves as window opens
+        let playPop = Self.springOut(Self.clamp01((t - 0.03) / 0.16))
+        let playFadeOut = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.22) / 0.25))
+        let playBloom = Self.lerp(1.0, 1.26, Self.easeOutCubic(Self.clamp01((t - 0.22) / 0.26)))
+        let playScale = Self.lerp(0.70, 1.0, playPop) * playBloom
+        let playSize = min(logoRect.height * 0.50, logoRect.width * 0.34) * playScale
+        playLayer.frame = localBounds
+        playLayer.path = Self.roundedPlayTrianglePath(
+            center: CGPoint(x: localBounds.midX, y: localBounds.midY),
+            size: max(8, playSize)
+        )
+        playLayer.opacity = Float(Self.clamp01(playPop) * playFadeOut)
+
+        // Feather-soft radial floating floor shadow strictly beneath the tilted logo; dissolves cleanly as it expands
+        let shadowW = logoRect.width * 0.88 * entryScale
+        let shadowH: CGFloat = 26.0 * entryScale
+        let shadowY = curRect.minY - shadowH - 12.0
+        shadowLayer.frame = CGRect(
+            x: curRect.midX - shadowW / 2,
+            y: shadowY,
+            width: shadowW,
+            height: shadowH
+        )
+        shadowLayer.opacity = Float(appear * pose * pose)
+
+        // Apply overlay alpha and seamlessly bring up hostWindow behind it
+        panel.alphaValue = targetAlpha * appear * overlayFade
+
+        if let host = hostWindow {
+            if t >= 0.58 {
+                if !hostShadowRestored {
+                    hostShadowRestored = true
+                    host.hasShadow = true
+                    host.invalidateShadow()
+                }
+                host.alphaValue = max(0.001, targetAlpha * hostReveal)
+            } else {
+                host.alphaValue = 0.001
+            }
+        }
+
+        CATransaction.commit()
+    }
+
+    private static func centeredTransform(
+        around center: CGPoint,
+        scale: CGFloat,
+        rotX: CGFloat,
+        rotY: CGFloat,
+        rotZ: CGFloat
+    ) -> CATransform3D {
+        let toOrigin = CATransform3DMakeTranslation(-center.x, -center.y, 0)
+        var local = CATransform3DMakeScale(scale, scale, 1)
+        if abs(rotX) > 0.0001 {
+            local = CATransform3DConcat(local, CATransform3DMakeRotation(rotX, 1, 0, 0))
+        }
+        if abs(rotY) > 0.0001 {
+            local = CATransform3DConcat(local, CATransform3DMakeRotation(rotY, 0, 1, 0))
+        }
+        if abs(rotZ) > 0.0001 {
+            local = CATransform3DConcat(local, CATransform3DMakeRotation(rotZ, 0, 0, 1))
+        }
+        var persp = CATransform3DIdentity
+        persp.m34 = -1.0 / 880.0
+        local = CATransform3DConcat(local, persp)
+        let back = CATransform3DMakeTranslation(center.x, center.y, 0)
+        return CATransform3DConcat(CATransform3DConcat(toOrigin, local), back)
+    }
+
+    private static func roundedPlayTrianglePath(center: CGPoint, size: CGFloat) -> CGPath {
+        let h = size * 0.50
+        let w = size * 0.866
+        let leftX = center.x - w * 0.36
+        let rightX = center.x + w * 0.64
+        let pTop = CGPoint(x: leftX, y: center.y + h)
+        let pBottom = CGPoint(x: leftX, y: center.y - h)
+        let pRight = CGPoint(x: rightX, y: center.y)
+        let radius = size * 0.145
+
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: leftX, y: center.y))
+        path.addArc(tangent1End: pTop, tangent2End: pRight, radius: radius)
+        path.addArc(tangent1End: pRight, tangent2End: pBottom, radius: radius)
+        path.addArc(tangent1End: pBottom, tangent2End: pTop, radius: radius)
+        path.closeSubpath()
+        return path
+    }
+
+    private static func clamp01(_ x: Double) -> CGFloat {
+        CGFloat(min(1.0, max(0.0, x)))
+    }
+
+    private static func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+        a + (b - a) * t
+    }
+
+    private static func easeOutCubic(_ t: CGFloat) -> CGFloat {
+        let inv = 1.0 - t
+        return 1.0 - inv * inv * inv
+    }
+
+    private static func easeInOutCubic(_ t: CGFloat) -> CGFloat {
+        t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0
+    }
+
+    private static func smootherStep(_ t: CGFloat) -> CGFloat {
+        t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+    }
+
+    /// Snappy spring-out curve (gentle ~2.5% settle) normalized to exact [0, 1].
+    private static func springOut(_ t: CGFloat) -> CGFloat {
+        guard t > 0 else { return 0 }
+        guard t < 1 else { return 1 }
+        let raw = 1.0 - exp(-6.8 * t) * (cos(4.8 * t) + 0.32 * sin(4.8 * t))
+        let end = 1.0 - exp(-6.8) * (cos(4.8) + 0.32 * sin(4.8))
+        return raw / end
+    }
+
+    /// Silky liquid-glass expansion spring (subtle ~1.2% organic settle) normalized to exact [0, 1].
+    private static func dampedSpring(_ t: CGFloat) -> CGFloat {
+        guard t > 0 else { return 0 }
+        guard t < 1 else { return 1 }
+        let raw = 1.0 - exp(-7.0 * t) * (cos(4.3 * t) + 0.42 * sin(4.3 * t))
+        let end = 1.0 - exp(-7.0) * (cos(4.3) + 0.42 * sin(4.3))
+        return raw / end
+    }
+}
+
 /// Target for Float's dedicated Position menu (⌃⌘1–6).
 private final class FloatPositionMenuTarget: NSObject {
     weak var module: FloatModule?
@@ -1477,6 +1983,9 @@ final class FloatModule: ExactModule {
     private weak var browser: FloatBrowserInstance?
     private var homeBackdropView: NSView?
     private var lastBackdropIsHome: Bool?
+    private var openingMorph: FloatOpeningMorphController?
+    private var openingPrepared = false
+    private var openingPlayed = false
     private var settingsWindow: FloatSettingsWindowController?
     private var shortcutsWindow: FloatShortcutsWindowController?
     private var hotKeyRef: EventHotKeyRef?
@@ -1539,6 +2048,8 @@ final class FloatModule: ExactModule {
     }
 
     override func destroy() {
+        openingMorph?.cancel(restoreHost: false)
+        openingMorph = nil
         homeBackdropView?.removeFromSuperview()
         homeBackdropView = nil
         lastBackdropIsHome = nil
@@ -1583,12 +2094,57 @@ final class FloatModule: ExactModule {
 
     // MARK: Window & Element Hatches
 
+    private var shouldAnimateOpening: Bool {
+        !context.agent
+            && ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1"
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private var effectiveTargetAlpha: CGFloat {
+        CGFloat(peeking ? min(alpha, peekAlpha) : alpha)
+    }
+
+    /// Suppresses the initial raw window flash before Exact's first draw connects window hatches.
+    fileprivate func prepareOpeningAnimation(for w: NSWindow) {
+        guard !openingPrepared, !openingPlayed, shouldAnimateOpening else { return }
+        openingPrepared = true
+        w.animationBehavior = .none
+        w.hasShadow = false
+        w.alphaValue = 0.001
+        // Failsafe in case window(_:) never arrives
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak w] in
+            guard let self, let w, !self.openingPlayed, self.openingMorph == nil else { return }
+            w.hasShadow = true
+            w.alphaValue = self.effectiveTargetAlpha
+            w.invalidateShadow()
+        }
+    }
+
+    private func startOpeningMorph(for w: NSWindow) {
+        guard !openingPlayed, shouldAnimateOpening else { return }
+        openingPlayed = true
+        w.animationBehavior = .none
+        w.hasShadow = false
+        w.alphaValue = 0.001
+        let morph = FloatOpeningMorphController(
+            hostWindow: w,
+            targetAlphaProvider: { [weak self] in self?.effectiveTargetAlpha ?? 1.0 },
+            isHomeProvider: { [weak self] in (self?.mode ?? "home") == "home" },
+            onComplete: { [weak self] in
+                self?.openingMorph = nil
+            }
+        )
+        openingMorph = morph
+        morph.start()
+    }
+
     override func window(_ exactWindow: ExactWindow) {
         guard let w = exactWindow.window else { return }
         hostWindow = w
         // Only apply initial window chrome and restore saved frame once — never on resize callbacks!
         if exactWindow.isNew {
-            configureChromelessWindow(w)
+            let willMorph = !openingPlayed && shouldAnimateOpening
+            configureChromelessWindow(w, deferVisibility: willMorph)
             installPositionMenu()
             installControlSpaceMonitor()
             if !cliHandled, !context.agent, ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1" {
@@ -1597,9 +2153,21 @@ final class FloatModule: ExactModule {
                     load(arg)
                 }
             }
+            if willMorph {
+                startOpeningMorph(for: w)
+            } else if openingPrepared && !openingPlayed {
+                w.hasShadow = true
+                w.alphaValue = effectiveTargetAlpha
+                w.invalidateShadow()
+            }
         } else {
             syncWindowBackdrop()
         }
+    }
+
+    override func windowEnded(_ exactWindow: ExactWindow) {
+        openingMorph?.cancel(restoreHost: false)
+        openingMorph = nil
     }
 
     override func element(_ element: ExactElement) {
@@ -1620,18 +2188,18 @@ final class FloatModule: ExactModule {
         }
     }
 
-    private func configureChromelessWindow(_ w: NSWindow) {
+    private func configureChromelessWindow(_ w: NSWindow, deferVisibility: Bool = false) {
         if !w.styleMask.contains(.fullSizeContentView) { w.styleMask.insert(.fullSizeContentView) }
         w.titlebarAppearsTransparent = true
         w.titleVisibility = .hidden
         if #available(macOS 11.0, *) { w.titlebarSeparatorStyle = .none }
         [.closeButton, .miniaturizeButton, .zoomButton].forEach { w.standardWindowButton($0)?.isHidden = true }
         w.appearance = NSAppearance(named: .darkAqua)
-        w.hasShadow = true
+        w.hasShadow = !deferVisibility
         w.level = onTop ? .floating : .normal
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         w.minSize = NSSize(width: 160, height: 90)
-        w.alphaValue = CGFloat(alpha)
+        w.alphaValue = deferVisibility ? 0.001 : CGFloat(alpha)
         w.ignoresMouseEvents = clickThrough
         syncWindowBackdrop()
         if !context.agent {
@@ -1971,7 +2539,8 @@ final class FloatModule: ExactModule {
 
     private func applyEffectiveAlpha(animated: Bool = true) {
         guard let window = hostWindow else { return }
-        let target = CGFloat(peeking ? min(alpha, peekAlpha) : alpha)
+        if openingMorph != nil { return }
+        let target = effectiveTargetAlpha
         if !animated || context.agent || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             window.alphaValue = target
         } else {
