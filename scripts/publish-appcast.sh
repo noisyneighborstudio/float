@@ -14,7 +14,7 @@ artifact=dist/Float-$version.zip
 [[ -f $artifact ]] || { echo "✗ missing $artifact; prepare did not run" >&2; exit 1; }
 
 # key via stdin: never on disk, never in argv
-signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | vendor/Sparkle-$SPARKLE_VERSION/bin/sign_update -f - -p $artifact)
+signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | .vendor/Sparkle-$SPARKLE_VERSION/bin/sign_update -f - -p $artifact)
 [[ ${#signature} -eq 88 ]] || { echo "✗ unexpected signature from sign_update" >&2; exit 1; }
 # a key that doesn't match the app's SUPublicEDKey makes every client reject the update
 public_key=$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' build/Float.app/Contents/Info.plist)
