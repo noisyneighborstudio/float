@@ -43,6 +43,7 @@ The download page lives in `site/` (zero-build static HTML + icons) and is hoste
 | Key | Action |
 |---|---|
 | ⌘, | Settings (Quick Fade shortcut/opacity & Show/Hide shortcut) |
+| ? | Floating Liquid Glass keyboard shortcuts HUD |
 | ⇧⌘H / ⇧⌘R | Home / Resume last |
 | ⌘L / ⇧⌘V | Open URL (or YouTube search) / open clipboard URL |
 | ⌘R, ⌘[ ⌘] | Reload, back/forward |

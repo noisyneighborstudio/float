@@ -32,6 +32,7 @@ shape FloatState
   peekHold: bool
   peeking: bool
   settingsOpen: bool
+  shortcutsOpen: bool
   peekPermissionGranted: bool
   canCheckUpdates: bool
   hasResume: bool
@@ -125,7 +126,7 @@ component Float
   state brokenResumeIcon = false
 
   resource vp = exactViewport() as shape Viewport
-  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, peekPermissionGranted=true)
+  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, shortcutsOpen=false, peekPermissionGranted=true)
   mutation cmd as shape Reply queue refreshes st
 
   derive isHome = st.mode == "home"
@@ -176,10 +177,19 @@ component Float
     send cmd = runFloatCommand("resumeLast", "")
 
   action openUrlBar
+    if st.shortcutsOpen
+      send cmd = runFloatCommand("closeShortcuts", "")
     urlDraft = st.mode == "web" ? st.currentUrl : ""
     urlOpen = true
     selectSeq = selectSeq + 1
     focus("url-input")
+
+  action toggleShortcuts
+    urlOpen = false
+    send cmd = runFloatCommand("toggleShortcuts", "")
+
+  action closeShortcuts
+    send cmd = runFloatCommand("closeShortcuts", "")
 
   action openSettings
     send cmd = runFloatCommand("openSettings", "")
@@ -400,6 +410,7 @@ component Float
         button appearance="none" width=4 height=4 overflow="hidden" press=fadeOut -exact-menu="view" aria-keyshortcuts="Meta+-" aria-label="More Transparent" testId="cmd-fade-out"
         button appearance="none" width=4 height=4 overflow="hidden" press=fadeIn -exact-menu="view" aria-keyshortcuts="Meta+=" aria-label="Less Transparent" testId="cmd-fade-in"
         button appearance="none" width=4 height=4 overflow="hidden" press=playPause -exact-menu="view" aria-keyshortcuts="Control+Space" aria-label="Play / Pause" testId="cmd-play-pause"
+        button appearance="none" width=4 height=4 overflow="hidden" press=toggleShortcuts -exact-menu="view" aria-label="Keyboard Shortcuts" testId="cmd-shortcuts"
         button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("0") -exact-menu="none" aria-label="Top Left" testId="cmd-dock-0"
         button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("1") -exact-menu="none" aria-label="Top Center" testId="cmd-dock-1"
         button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("2") -exact-menu="none" aria-label="Top Right" testId="cmd-dock-2"
@@ -411,3 +422,4 @@ component Float
         button appearance="none" width=4 height=4 overflow="hidden" press=stepPeekAlpha(0.05) -exact-menu="none" aria-label="Peek +5%" testId="cmd-peek-inc"
         button appearance="none" width=4 height=4 overflow="hidden" press=setPeekTrigger("hotkey") -exact-menu="none" aria-label="Peek Hotkey" testId="cmd-peek-hotkey"
         button appearance="none" width=4 height=4 overflow="hidden" press=setPeekHold("false") -exact-menu="none" aria-label="Peek Toggle" testId="cmd-peek-toggle"
+        button appearance="none" width=4 height=4 overflow="hidden" press=closeShortcuts -exact-menu="none" aria-label="Close Shortcuts" testId="cmd-shortcuts-close"
