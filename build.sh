@@ -50,8 +50,8 @@ CRATE="${PWD:t}-apple"
 EXACT_APP_DIR="$PWD" EXACT_DEVELOPER_ID="$SIGN" EXACT_RUST_SIGN_IDENTITY="$SIGN" \
   "$BUN" "$EXACT2/host/apple/build.mjs" "$CRATE" "${BUILD_ARGS[@]}"
 
-# Locate Exact's built macOS bundle
-BUILT_APP=$(find "$PWD/.exact" "$PWD/target" -maxdepth 8 -path "*/macos/Float.app" -type d 2>/dev/null | head -n 1)
+# Locate Exact's built macOS bundle (newest match if both dev and distribution bundles exist)
+BUILT_APP=$(find "$PWD/.exact" "$PWD/target" -maxdepth 8 -path "*/macos/Float.app" -type d -exec stat -f '%m %N' {} + 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
 [[ -n $BUILT_APP && -d $BUILT_APP ]] || { echo "✗ Exact macOS bundle not found after build" >&2; exit 1; }
 
 mkdir -p "${APP:h}"

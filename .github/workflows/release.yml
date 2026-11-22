@@ -56,8 +56,9 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
           security import "$cert" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
-          # Prepend the temporary build keychain while keeping the runner's login keychain intact
-          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          # Isolate the unlocked temporary build keychain during release signing so codesign
+          # does not hit an ambiguous-identity conflict with the runner's login keychain.
+          security list-keychains -d user -s "$keychain"
       - name: Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
