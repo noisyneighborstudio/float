@@ -228,6 +228,7 @@ const DEFAULT_STATE = {
   historyIndex: -1,
   fill: true,
   onTop: true,
+  expanded: false,
   aspectLocked: false,
   clickThrough: false,
   alpha: 1,
@@ -312,6 +313,7 @@ function buildFloatState() {
     currentUrl: data.currentUrl,
     fill: data.fill,
     onTop: data.onTop,
+    expanded: data.expanded,
     aspectLocked: data.aspectLocked,
     clickThrough: data.clickThrough,
     alpha: data.alpha,
@@ -670,6 +672,10 @@ async function handleCommand(op, arg) {
       data.sites = data.sites.filter((s) => s.host !== arg);
       saveState(data);
       break;
+    case 'toggleExpand':
+      data.expanded = !data.expanded;
+      saveState(data);
+      break;
     case 'toggleAspectLock':
       data.aspectLocked = !data.aspectLocked;
       saveState(data);
@@ -729,6 +735,7 @@ async function handleCommand(op, arg) {
       break;
     case 'dock':
       data.lastDock = Number(arg) || 0;
+      data.expanded = false;
       saveState(data);
       break;
     default:

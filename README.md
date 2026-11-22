@@ -64,6 +64,7 @@ Peek right through Float from **any** app without losing your spot. Holding `Rig
 
 ### Chromeless Window, Click-Through & 6-Zone Docking
 - **Top-Edge Drag Strip:** An invisible 18px strip along the top edge fades in on hover — drag anywhere on it to move Float, or **double-click** to snap and lock the window to the video's exact natural aspect ratio (`⇧⌘A`).
+- **Temporary Expand (`⇧⌘E`):** Temporarily enlarge and center Float for comfortable catalog browsing, then press `⇧⌘E` again (or dock with `⌃⌘1`–`⌃⌘6`) to restore your exact previous window size and position.
 - **Click-Through Ghost Mode (`⇧⌘K`):** Let clicks pass straight through the video to your editor or terminal underneath (automatically caps opacity at `60%` so you can see both).
 - **Animated Opacity (`⌘-` / `⌘=`):** Smoothly step opacity between `15%` and `100%`.
 - **Magnetic 6-Zone Docking (`⌃⌘1`–`⌃⌘6`):** Snap cleanly to Top Left / Center / Right or Bottom Left / Center / Right with a 12px screen margin.
@@ -104,6 +105,7 @@ Release builds automatically stay up to date via **Sparkle** (**Float › Check 
 | Shortcut | Action |
 | :--- | :--- |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd> | Toggle Video Fill (edge-to-edge player) |
+| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>E</kbd> | Expand / restore window for browsing |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>A</kbd> | Lock / unlock window to video aspect ratio |
 | Double-click top strip | Snap & toggle video aspect lock |
 | <kbd>⌘</kbd><kbd>T</kbd> | Toggle Always on Top |

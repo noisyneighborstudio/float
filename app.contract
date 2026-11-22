@@ -22,6 +22,7 @@ shape FloatState
   currentUrl: string
   fill: bool
   onTop: bool
+  expanded: bool
   aspectLocked: bool
   clickThrough: bool
   alpha: number
@@ -345,6 +346,9 @@ component Float
   action toggleFill
     send cmd = runFloatCommand("toggleFill", "")
 
+  action toggleExpand
+    send cmd = runFloatCommand("toggleExpand", "")
+
   action toggleAspectLock
     send cmd = runFloatCommand("toggleAspectLock", "")
 
@@ -647,6 +651,10 @@ component Float
             view class=KeyBadge
               text "⇧⌘F"
           row align-items="center" justify-content="space-between"
+            text "Expand Window" color="-exact-secondary-label"
+            view class=KeyBadge
+              text "⇧⌘E"
+          row align-items="center" justify-content="space-between"
             text "Play / Pause" color="-exact-secondary-label"
             view class=KeyBadge
               text "⌃Space"
@@ -756,6 +764,16 @@ component Float
           aria-selected=st.fill
           aria-label="Toggle Video Fill"
           testId="cmd-fill"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=toggleExpand
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+Shift+E"
+          aria-selected=st.expanded
+          aria-label="Expand Window"
+          testId="cmd-expand"
         button appearance="none"
           width=4
           height=4

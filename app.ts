@@ -31,6 +31,7 @@ interface PersistedFallback {
   historyIndex: number;
   fill: boolean;
   onTop: boolean;
+  expanded: boolean;
   aspectLocked: boolean;
   clickThrough: boolean;
   alpha: number;
@@ -54,6 +55,7 @@ const DEFAULT_FALLBACK: PersistedFallback = {
   historyIndex: -1,
   fill: true,
   onTop: true,
+  expanded: false,
   aspectLocked: false,
   clickThrough: false,
   alpha: 1,
@@ -197,6 +199,7 @@ function toFloatState(p: PersistedFallback): FloatState {
     currentUrl: p.currentUrl,
     fill: p.fill,
     onTop: p.onTop,
+    expanded: p.expanded,
     aspectLocked: p.aspectLocked,
     clickThrough: p.clickThrough,
     alpha: p.alpha,
@@ -274,6 +277,9 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
     case 'toggleFill':
       data.fill = !data.fill;
       break;
+    case 'toggleExpand':
+      data.expanded = !data.expanded;
+      break;
     case 'toggleAspectLock':
       data.aspectLocked = !data.aspectLocked;
       break;
@@ -338,6 +344,7 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       break;
     case 'dock':
       data.lastDock = Number(arg) || 0;
+      data.expanded = false;
       break;
     case 'recordPlayback': {
       // Used by automated tests to simulate a video playback event from the browser.

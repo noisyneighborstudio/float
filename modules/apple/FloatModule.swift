@@ -1221,7 +1221,7 @@ private final class FloatShortcutsWindowController: NSWindowController, NSWindow
         box.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: box.topAnchor, constant: 12),
-            stack.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -12),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: box.bottomAnchor, constant: -12),
             stack.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12),
             stack.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12),
         ])
@@ -1324,6 +1324,7 @@ private final class FloatShortcutsWindowController: NSWindowController, NSWindow
         let videoGroup = makeGroup("VIDEO & WINDOW", rows: [
             makeShortcutRow("Play / Pause", key: "⌃Space"),
             makeShortcutRow("Toggle Video Fill", key: "⇧⌘F"),
+            makeShortcutRow("Expand Window", key: "⇧⌘E"),
             makeShortcutRow("Lock Video Aspect", key: "⇧⌘A"),
             makeShortcutRow("Opacity − / +", key: "⌘−  ⌘="),
             makeShortcutRow("Click-Through", key: "⇧⌘K"),
@@ -1347,6 +1348,8 @@ private final class FloatShortcutsWindowController: NSWindowController, NSWindow
         columns.translatesAutoresizingMaskIntoConstraints = false
         rootStack.addArrangedSubview(columns)
         columns.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -32).isActive = true
+        navGroup.heightAnchor.constraint(equalTo: videoGroup.heightAnchor).isActive = true
+        globalGroup.heightAnchor.constraint(equalTo: videoGroup.heightAnchor).isActive = true
 
         // Mount inside native macOS 26 Liquid Glass (window itself owns the native corner mask & rim)
         if #available(macOS 26.0, *) {
@@ -1984,11 +1987,16 @@ final class FloatModule: ExactModule {
     private var pendingUrlLoad: String?
     private var cliHandled = false
     private var lastSelectSeq: String?
+    private var preExpandFrame: NSRect?
+    private var preExpandAspectRatio: NSSize?
+    private var resizeScrollerToken = 0
+    private var savedNestedScrollers: [(id: ObjectIdentifier, view: NSScrollView, v: Bool, h: Bool)] = []
 
     var mode = "home"
     var currentUrl = ""
     var fill: Bool
     var onTop = true
+    var expanded = false
     var aspectLocked = false
     var clickThrough = false
     var alpha: Double
@@ -2059,6 +2067,8 @@ final class FloatModule: ExactModule {
         if FloatHotKeyCenter.shared.active === self {
             FloatHotKeyCenter.shared.active = nil
         }
+        resizeScrollerToken += 1
+        savedNestedScrollers.removeAll()
     }
 
     fileprivate func attachBrowser(_ instance: FloatBrowserInstance) {
@@ -2229,6 +2239,8 @@ final class FloatModule: ExactModule {
                         scroll.drawsBackground = !isHome
                     }
                     scroll.backgroundColor = isHome ? .clear : .black
+                    if scroll.hasVerticalScroller { scroll.hasVerticalScroller = false }
+                    if scroll.hasHorizontalScroller { scroll.hasHorizontalScroller = false }
                 }
             }
         }
@@ -2319,6 +2331,7 @@ final class FloatModule: ExactModule {
         case "back": browser?.web.goBack()
         case "forward": browser?.web.goForward()
         case "toggleFill": toggleFill()
+        case "toggleExpand": toggleExpand()
         case "toggleAspectLock": toggleAspectLock()
         case "toggleTop": toggleTop()
         case "toggleClickThrough": toggleClickThrough()
@@ -2381,6 +2394,7 @@ final class FloatModule: ExactModule {
             "currentUrl": currentUrl,
             "fill": fill,
             "onTop": onTop,
+            "expanded": expanded,
             "aspectLocked": aspectLocked,
             "clickThrough": clickThrough,
             "alpha": (alpha * 100).rounded() / 100,
@@ -2481,7 +2495,156 @@ final class FloatModule: ExactModule {
         notifyChanged()
     }
 
+    private func expandedFrame(for current: NSRect, in vis: NSRect) -> NSRect {
+        let margin: CGFloat = 24
+        let maxW = max(320, vis.width - margin * 2)
+        let maxH = max(240, vis.height - margin * 2)
+        let preferredW = min(maxW, min(vis.width * 0.84, 1440))
+        let preferredH = min(maxH, min(vis.height * 0.84, 960))
+        let targetW = (current.width >= preferredW - 20 ? min(maxW, vis.width * 0.92) : preferredW).rounded()
+        let targetH = (current.height >= preferredH - 20 ? min(maxH, vis.height * 0.92) : preferredH).rounded()
+        let targetX = (vis.midX - targetW / 2).rounded()
+        let targetY = (vis.midY - targetH / 2).rounded()
+        return NSRect(x: targetX, y: targetY, width: targetW, height: targetH)
+    }
+
+    private func clampedToVisibleScreen(_ frame: NSRect, fallbackScreen: NSScreen?) -> NSRect {
+        if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }) {
+            return frame
+        }
+        guard let vis = fallbackScreen?.visibleFrame else { return frame }
+        let w = min(frame.width, vis.width)
+        let h = min(frame.height, vis.height)
+        let x = min(max(frame.origin.x, vis.minX), vis.maxX - w)
+        let y = min(max(frame.origin.y, vis.minY), vis.maxY - h)
+        return NSRect(x: x, y: y, width: w, height: h)
+    }
+
+    private func collectScrollViews(in root: NSView, out: inout [NSScrollView]) {
+        for sub in root.subviews {
+            if let sv = sub as? NSScrollView {
+                out.append(sv)
+            }
+            if !(sub is WKWebView) {
+                collectScrollViews(in: sub, out: &out)
+            }
+        }
+    }
+
+    private func suppressScrollViews(in window: NSWindow) {
+        guard let content = window.contentView else { return }
+        let rootScrollIds = Set(content.subviews.compactMap { ($0 as? NSScrollView).map(ObjectIdentifier.init) })
+        var allScrolls: [NSScrollView] = []
+        collectScrollViews(in: content, out: &allScrolls)
+        for sv in allScrolls {
+            let id = ObjectIdentifier(sv)
+            if rootScrollIds.contains(id) {
+                sv.hasVerticalScroller = false
+                sv.hasHorizontalScroller = false
+            } else {
+                if !savedNestedScrollers.contains(where: { $0.id == id }) {
+                    savedNestedScrollers.append((id: id, view: sv, v: sv.hasVerticalScroller, h: sv.hasHorizontalScroller))
+                }
+                sv.hasVerticalScroller = false
+                sv.hasHorizontalScroller = false
+            }
+            sv.verticalScroller?.isHidden = true
+            sv.horizontalScroller?.isHidden = true
+        }
+    }
+
+    private func restoreNestedScrollers() {
+        let toRestore = savedNestedScrollers
+        savedNestedScrollers.removeAll()
+        for entry in toRestore {
+            entry.view.hasVerticalScroller = entry.v
+            entry.view.hasHorizontalScroller = entry.h
+            if entry.v { entry.view.verticalScroller?.isHidden = false }
+            if entry.h { entry.view.horizontalScroller?.isHidden = false }
+        }
+    }
+
+    /// Animates the window frame outside Exact's synchronous `native.call` turn so
+    /// `ExactView.fit()` can reflow live on every frame while suppressing transient AppKit scrollers.
+    private func setWindowFrame(
+        _ target: NSRect,
+        on window: NSWindow,
+        animate: Bool,
+        completion: ((NSWindow) -> Void)? = nil
+    ) {
+        resizeScrollerToken += 1
+        let token = resizeScrollerToken
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.resizeScrollerToken == token else { return }
+            self.suppressScrollViews(in: window)
+            if !animate {
+                window.setFrame(target, display: true, animate: false)
+                completion?(window)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    guard let self, self.resizeScrollerToken == token else { return }
+                    self.restoreNestedScrollers()
+                }
+                return
+            }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                window.animator().setFrame(target, display: true)
+            }, completionHandler: { [weak self, weak window] in
+                guard let self, self.resizeScrollerToken == token else { return }
+                if let window { completion?(window) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    guard let self, self.resizeScrollerToken == token else { return }
+                    self.restoreNestedScrollers()
+                }
+            })
+        }
+    }
+
+    func toggleExpand() {
+        if expanded {
+            expanded = false
+            let restoreFrame = preExpandFrame
+            let restoreAspect = preExpandAspectRatio
+            preExpandFrame = nil
+            preExpandAspectRatio = nil
+            if !context.agent, let window = hostWindow {
+                let restoreWindowState: (NSWindow) -> Void = { [weak self] win in
+                    if self?.aspectLocked == true, let ratio = restoreAspect, ratio.width > 0, ratio.height > 0 {
+                        win.contentAspectRatio = ratio
+                    }
+                    win.setFrameAutosaveName("FloatWindow")
+                }
+                if let frame = restoreFrame {
+                    let target = clampedToVisibleScreen(frame, fallbackScreen: window.screen ?? NSScreen.main)
+                    let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                    setWindowFrame(target, on: window, animate: animate, completion: restoreWindowState)
+                } else {
+                    restoreWindowState(window)
+                }
+            }
+            notifyChanged()
+            return
+        }
+        expanded = true
+        if !context.agent, let window = hostWindow, let vis = (window.screen ?? NSScreen.main)?.visibleFrame {
+            let current = window.frame
+            preExpandFrame = current
+            preExpandAspectRatio = aspectLocked ? window.contentAspectRatio : nil
+            window.saveFrame(usingName: "FloatWindow")
+            window.setFrameAutosaveName("")
+            if aspectLocked {
+                window.contentResizeIncrements = NSSize(width: 1, height: 1)
+            }
+            let target = expandedFrame(for: current, in: vis)
+            let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            setWindowFrame(target, on: window, animate: animate)
+        }
+        notifyChanged()
+    }
+
     func toggleAspectLock() {
+        preExpandAspectRatio = nil
         if aspectLocked {
             aspectLocked = false
             hostWindow?.contentResizeIncrements = NSSize(width: 1, height: 1)
@@ -2501,8 +2664,12 @@ final class FloatModule: ExactModule {
             let h = (f.width * d[1] / d[0]).rounded()
             f.origin.y += f.height - h
             f.size.height = h
-            window.setFrame(f, display: true, animate: true)
-            window.contentAspectRatio = NSSize(width: d[0], height: d[1])
+            let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            self.setWindowFrame(f, on: window, animate: animate) { win in
+                if self.aspectLocked {
+                    win.contentAspectRatio = NSSize(width: d[0], height: d[1])
+                }
+            }
             self.aspectLocked = true
             self.notifyChanged()
         }
@@ -2745,12 +2912,35 @@ final class FloatModule: ExactModule {
 
     // tag 0–2: top left/center/right, 3–5: bottom left/center/right
     func dock(_ tag: Int) {
-        guard (0...5).contains(tag), let window = hostWindow, let vis = window.screen?.visibleFrame else { return }
-        let m: CGFloat = 12
-        let f = window.frame
-        let x = [vis.minX + m, vis.midX - f.width / 2, vis.maxX - f.width - m][tag % 3]
-        let y = tag < 3 ? vis.maxY - f.height - m : vis.minY + m
-        window.setFrame(NSRect(x: x, y: y, width: f.width, height: f.height), display: true, animate: true)
+        guard (0...5).contains(tag) else { return }
+        let wasExpanded = expanded
+        let restoreSize = preExpandFrame?.size
+        let restoreAspect = preExpandAspectRatio
+        if wasExpanded {
+            expanded = false
+            preExpandFrame = nil
+            preExpandAspectRatio = nil
+        }
+        if !context.agent, let window = hostWindow, let vis = (window.screen ?? NSScreen.main)?.visibleFrame {
+            let m: CGFloat = 12
+            let size = restoreSize ?? window.frame.size
+            let w = min(size.width, max(160, vis.width - m * 2))
+            let h = min(size.height, max(90, vis.height - m * 2))
+            let x = [vis.minX + m, vis.midX - w / 2, vis.maxX - w - m][tag % 3]
+            let y = tag < 3 ? vis.maxY - h - m : vis.minY + m
+            let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            setWindowFrame(NSRect(x: x, y: y, width: w, height: h), on: window, animate: animate) { [weak self] win in
+                if wasExpanded {
+                    if self?.aspectLocked == true, let ratio = restoreAspect, ratio.width > 0, ratio.height > 0 {
+                        win.contentAspectRatio = ratio
+                    }
+                    win.setFrameAutosaveName("FloatWindow")
+                }
+            }
+        }
+        if wasExpanded {
+            notifyChanged()
+        }
     }
 
     func toggleShown() {
