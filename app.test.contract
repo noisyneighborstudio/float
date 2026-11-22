@@ -133,3 +133,17 @@ test "settings configures global quick-fade trigger and opacity and persists acr
   expect state st.peekTrigger == "hotkey"
   expect state st.peekAlpha == 0.3
   expect state st.peekHold == false
+
+test "glassy keyboard shortcuts display opens as a separate window and closes cleanly"
+  clock data
+  expect state st.shortcutsOpen == false
+  expect tree missing "shortcuts-panel"
+
+  tap "cmd-shortcuts"
+  clock data
+  expect state st.shortcutsOpen == true
+  expect tree missing "shortcuts-panel"
+
+  tap "cmd-shortcuts-close"
+  clock data
+  expect state st.shortcutsOpen == false

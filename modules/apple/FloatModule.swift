@@ -161,6 +161,9 @@ private let floatTrackScript = """
   document.addEventListener('timeupdate', e => {
     if (isVid(e) && Date.now() - last > 5000) { last = Date.now(); send('time', e.target); }
   }, true);
+  const isEd = el => !!(el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)));
+  document.addEventListener('focusin', e => webkit.messageHandlers.fpPlay.postMessage({ event: 'edit', on: isEd(e.target) }), true);
+  document.addEventListener('focusout', () => setTimeout(() => webkit.messageHandlers.fpPlay.postMessage({ event: 'edit', on: isEd(document.activeElement) }), 0), true);
 })();
 """
 
@@ -476,6 +479,10 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
         guard let module, let web,
               let url = web.url, url.scheme?.hasPrefix("http") == true, let host = url.host,
               let b = m.body as? [String: Any] else { return }
+        if b["event"] as? String == "edit" {
+            module.webEditingText = b["on"] as? Bool ?? false
+            return
+        }
         let t = b["t"] as? Double ?? 0
         let d = b["d"] as? Double ?? 0
         guard t.isFinite, d.isFinite, t >= 0, d >= 0 else { return }
@@ -504,6 +511,7 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
     }
 
     func webView(_ w: WKWebView, didCommit navigation: WKNavigation!) {
+        module?.webEditingText = false
         syncFromWebView()
     }
 
@@ -945,6 +953,355 @@ private final class FloatSettingsWindowController: NSWindowController, NSWindowD
     }
 }
 
+/// Separate floating Liquid Glass keyboard shortcuts HUD (`?` while Float is focused).
+private final class FloatShortcutsPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    override func cancelOperation(_ sender: Any?) {
+        performClose(sender)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if mods == .command, event.charactersIgnoringModifiers?.lowercased() == "w" {
+            performClose(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+private final class FloatShortcutsWindowController: NSWindowController, NSWindowDelegate {
+    private weak var module: FloatModule?
+    private let panelWidth: CGFloat = 760
+    private let rootStack = NSStackView()
+    private let peekDescLabel = NSTextField(labelWithString: "Quick Fade (50%)")
+    private let peekKeyLabel = NSTextField(labelWithString: "Right ⌘")
+    private let showHideKeyLabel = NSTextField(labelWithString: "⌃⌥⌘F")
+
+    init(module: FloatModule) {
+        self.module = module
+        let panel = FloatShortcutsPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 300),
+            styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.titlebarAppearsTransparent = true
+        panel.titleVisibility = .hidden
+        if #available(macOS 11.0, *) { panel.titlebarSeparatorStyle = .none }
+        [.closeButton, .miniaturizeButton, .zoomButton].forEach { panel.standardWindowButton($0)?.isHidden = true }
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isMovableByWindowBackground = true
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        super.init(window: panel)
+        panel.delegate = self
+        buildUI()
+        refresh()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func makeKeycap(_ label: NSTextField) -> NSView {
+        label.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+        label.textColor = NSColor(calibratedWhite: 0.96, alpha: 1.0)
+        label.alignment = .center
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        pill.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        pill.layer?.borderWidth = 1
+        pill.layer?.cornerRadius = 6
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 7),
+            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -7),
+            label.topAnchor.constraint(equalTo: pill.topAnchor, constant: 2),
+            label.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -2),
+        ])
+        return pill
+    }
+
+    private func makeShortcutRow(titleField: NSTextField, keyField: NSTextField) -> NSView {
+        titleField.font = .systemFont(ofSize: 12)
+        titleField.textColor = NSColor(calibratedWhite: 0.92, alpha: 1.0)
+        titleField.lineBreakMode = .byTruncatingTail
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [titleField, spacer, makeKeycap(keyField)])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
+    private func makeShortcutRow(_ title: String, key: String) -> NSView {
+        makeShortcutRow(
+            titleField: NSTextField(labelWithString: title),
+            keyField: NSTextField(labelWithString: key)
+        )
+    }
+
+    private func makeGroup(_ heading: String, rows: [NSView]) -> NSView {
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
+        box.layer?.borderColor = NSColor.white.withAlphaComponent(0.11).cgColor
+        box.layer?.borderWidth = 1
+        box.layer?.cornerRadius = 12
+        box.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: heading)
+        title.font = .systemFont(ofSize: 10, weight: .semibold)
+        title.textColor = NSColor(calibratedRed: 0.50, green: 0.85, blue: 0.85, alpha: 1.0)
+
+        let stack = NSStackView(views: [title] + rows)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: box.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -12),
+            stack.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12),
+        ])
+        for row in rows {
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        return box
+    }
+
+    private func buildUI() {
+        guard let panel = window else { return }
+
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        rootStack.orientation = .vertical
+        rootStack.alignment = .leading
+        rootStack.spacing = 12
+        rootStack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 16, right: 16)
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(rootStack)
+        NSLayoutConstraint.activate([
+            rootStack.topAnchor.constraint(equalTo: container.topAnchor),
+            rootStack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            rootStack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            rootStack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            rootStack.widthAnchor.constraint(equalToConstant: panelWidth),
+        ])
+
+        // Header bar
+        let title = NSTextField(labelWithString: "Keyboard Shortcuts")
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        title.textColor = NSColor(calibratedWhite: 0.96, alpha: 1.0)
+
+        let hintText = NSTextField(labelWithString: "? or Esc")
+        hintText.font = .systemFont(ofSize: 10, weight: .medium)
+        hintText.textColor = NSColor(calibratedRed: 0.55, green: 0.89, blue: 0.89, alpha: 1.0)
+        hintText.translatesAutoresizingMaskIntoConstraints = false
+        let hintPill = NSView()
+        hintPill.wantsLayer = true
+        hintPill.layer?.backgroundColor = NSColor(calibratedRed: 0.25, green: 0.82, blue: 0.82, alpha: 0.16).cgColor
+        hintPill.layer?.borderColor = NSColor(calibratedRed: 0.31, green: 0.86, blue: 0.86, alpha: 0.34).cgColor
+        hintPill.layer?.borderWidth = 1
+        hintPill.layer?.cornerRadius = 9
+        hintPill.translatesAutoresizingMaskIntoConstraints = false
+        hintPill.addSubview(hintText)
+        NSLayoutConstraint.activate([
+            hintText.leadingAnchor.constraint(equalTo: hintPill.leadingAnchor, constant: 8),
+            hintText.trailingAnchor.constraint(equalTo: hintPill.trailingAnchor, constant: -8),
+            hintText.topAnchor.constraint(equalTo: hintPill.topAnchor, constant: 2),
+            hintText.bottomAnchor.constraint(equalTo: hintPill.bottomAnchor, constant: -2),
+        ])
+
+        let closeBtn = NSButton(title: "×", target: self, action: #selector(closeClicked(_:)))
+        closeBtn.isBordered = false
+        closeBtn.wantsLayer = true
+        closeBtn.font = .systemFont(ofSize: 15, weight: .medium)
+        closeBtn.contentTintColor = NSColor(calibratedWhite: 0.92, alpha: 1.0)
+        closeBtn.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        closeBtn.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        closeBtn.layer?.borderWidth = 1
+        closeBtn.layer?.cornerRadius = 12
+        closeBtn.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            closeBtn.widthAnchor.constraint(equalToConstant: 24),
+            closeBtn.heightAnchor.constraint(equalToConstant: 24),
+        ])
+
+        let headerSpacer = NSView()
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let headerRow = NSStackView(views: [title, hintPill, headerSpacer, closeBtn])
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 8
+        headerRow.translatesAutoresizingMaskIntoConstraints = false
+        rootStack.addArrangedSubview(headerRow)
+        headerRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -32).isActive = true
+
+        // Subtle divider
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        rootStack.addArrangedSubview(divider)
+        NSLayoutConstraint.activate([
+            divider.heightAnchor.constraint(equalToConstant: 1),
+            divider.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -32),
+        ])
+
+        // 3 balanced shortcut groups
+        let navGroup = makeGroup("NAVIGATION", rows: [
+            makeShortcutRow("Open URL or Search", key: "⌘L"),
+            makeShortcutRow("Open Clipboard URL", key: "⇧⌘V"),
+            makeShortcutRow("Home Mosaic", key: "⇧⌘H"),
+            makeShortcutRow("Resume Last Video", key: "⇧⌘R"),
+            makeShortcutRow("Back / Forward", key: "⌘[  ⌘]"),
+            makeShortcutRow("Reload Page", key: "⌘R"),
+        ])
+
+        let videoGroup = makeGroup("VIDEO & WINDOW", rows: [
+            makeShortcutRow("Play / Pause", key: "⌃Space"),
+            makeShortcutRow("Toggle Video Fill", key: "⇧⌘F"),
+            makeShortcutRow("Lock Video Aspect", key: "⇧⌘A"),
+            makeShortcutRow("Opacity − / +", key: "⌘−  ⌘="),
+            makeShortcutRow("Click-Through", key: "⇧⌘K"),
+            makeShortcutRow("Always on Top", key: "⌘T"),
+        ])
+
+        let globalGroup = makeGroup("POSITION & GLOBAL", rows: [
+            makeShortcutRow("Dock Top / Bottom", key: "⌃⌘1–6"),
+            makeShortcutRow(titleField: peekDescLabel, keyField: peekKeyLabel),
+            makeShortcutRow(titleField: NSTextField(labelWithString: "Show / Hide Float"), keyField: showHideKeyLabel),
+            makeShortcutRow("Settings", key: "⌘,"),
+            makeShortcutRow("Drag / Aspect Lock", key: "Top Strip"),
+            makeShortcutRow("Keyboard Shortcuts", key: "?"),
+        ])
+
+        let columns = NSStackView(views: [navGroup, videoGroup, globalGroup])
+        columns.orientation = .horizontal
+        columns.distribution = .fillEqually
+        columns.alignment = .top
+        columns.spacing = 10
+        columns.translatesAutoresizingMaskIntoConstraints = false
+        rootStack.addArrangedSubview(columns)
+        columns.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -32).isActive = true
+
+        // Mount inside native macOS 26 Liquid Glass (window itself owns the native corner mask & rim)
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: .zero)
+            glass.style = .regular
+            glass.tintColor = NSColor(calibratedRed: 0.07, green: 0.08, blue: 0.11, alpha: 0.44)
+            glass.contentView = container
+            panel.contentView = glass
+        } else {
+            let fx = NSVisualEffectView(frame: .zero)
+            fx.material = .hudWindow
+            fx.blendingMode = .behindWindow
+            fx.state = .active
+            fx.addSubview(container)
+            NSLayoutConstraint.activate([
+                container.topAnchor.constraint(equalTo: fx.topAnchor),
+                container.bottomAnchor.constraint(equalTo: fx.bottomAnchor),
+                container.leadingAnchor.constraint(equalTo: fx.leadingAnchor),
+                container.trailingAnchor.constraint(equalTo: fx.trailingAnchor),
+            ])
+            panel.contentView = fx
+        }
+    }
+
+    func show(relativeTo host: NSWindow?) {
+        guard let panel = window else { return }
+        refresh()
+        if !panel.isVisible {
+            if let vis = (host?.screen ?? NSScreen.main)?.visibleFrame {
+                let s = panel.frame.size
+                let origin = NSPoint(
+                    x: (vis.midX - s.width / 2).rounded(),
+                    y: (vis.midY - s.height / 2).rounded()
+                )
+                panel.setFrameOrigin(origin)
+            } else {
+                panel.center()
+            }
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                panel.alphaValue = 1
+                panel.makeKeyAndOrderFront(nil)
+            } else {
+                panel.alphaValue = 0
+                panel.makeKeyAndOrderFront(nil)
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.16
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().alphaValue = 1
+                }
+            }
+        } else {
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func hideAnimated() {
+        guard let panel = window, panel.isVisible else { return }
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            panel.orderOut(nil)
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().alphaValue = 0
+        }, completionHandler: {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+        })
+    }
+
+    func refresh() {
+        guard let module, let panel = window else { return }
+        let pct = Int((module.peekAlpha * 100).rounded())
+        peekDescLabel.stringValue = module.peekTrigger == "none" ? "Quick Fade (Off)" : "Quick Fade (\(pct)%)"
+        switch module.peekTrigger {
+        case "rightCommand": peekKeyLabel.stringValue = "Right ⌘"
+        case "rightOption": peekKeyLabel.stringValue = "Right ⌥"
+        case "hotkey": peekKeyLabel.stringValue = module.peekHotKeyLabel
+        default: peekKeyLabel.stringValue = "Off"
+        }
+        showHideKeyLabel.stringValue = module.hotKeyLabel
+
+        rootStack.layoutSubtreeIfNeeded()
+        let fit = rootStack.fittingSize
+        let size = NSSize(width: max(panelWidth, fit.width.rounded(.up)), height: max(220, fit.height.rounded(.up)))
+        if abs(panel.frame.height - size.height) > 1 || abs(panel.frame.width - size.width) > 1 {
+            panel.setContentSize(size)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        module?.shortcutsWindowDidClose()
+    }
+
+    @objc private func closeClicked(_ sender: Any?) {
+        module?.setShortcutsOpen(false)
+    }
+}
+
 /// Target for Float's dedicated Position menu (⌃⌘1–6).
 private final class FloatPositionMenuTarget: NSObject {
     weak var module: FloatModule?
@@ -971,6 +1328,7 @@ final class FloatModule: ExactModule {
     private weak var hostWindow: NSWindow?
     private weak var browser: FloatBrowserInstance?
     private var settingsWindow: FloatSettingsWindowController?
+    private var shortcutsWindow: FloatShortcutsWindowController?
     private var hotKeyRef: EventHotKeyRef?
     private var peekHotKeyRef: EventHotKeyRef?
     private var peekGlobalFlagsMonitor: Any?
@@ -995,6 +1353,8 @@ final class FloatModule: ExactModule {
     var peekHold: Bool
     var peeking = false
     var settingsOpen = false
+    var shortcutsOpen = false
+    var webEditingText = false
     var pendingSeek: Double?
 
     var hotKeyLabel: String { store.hotKey?.label ?? "None" }
@@ -1031,6 +1391,8 @@ final class FloatModule: ExactModule {
     override func destroy() {
         settingsWindow?.close()
         settingsWindow = nil
+        shortcutsWindow?.close()
+        shortcutsWindow = nil
         unregisterHotKey()
         teardownPeekTrigger()
         if let obs = activeObserver {
@@ -1060,6 +1422,7 @@ final class FloatModule: ExactModule {
 
     func notifyChanged() {
         settingsWindow?.refresh()
+        shortcutsWindow?.refresh()
         context.changed("float")
     }
 
@@ -1149,9 +1512,22 @@ final class FloatModule: ExactModule {
         guard controlSpaceMonitor == nil else { return }
         controlSpaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
+            let isHost = self.hostWindow != nil && event.window === self.hostWindow
+            let isShortcuts = self.shortcutsWindow?.window != nil && event.window === self.shortcutsWindow?.window
+            guard isHost || isShortcuts else { return event }
             let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
-            if mods == .control, event.keyCode == UInt16(kVK_Space), event.window === self.hostWindow {
+            if isHost, mods == .control, event.keyCode == UInt16(kVK_Space) {
                 self.playPause()
+                return nil
+            }
+            if self.shortcutsOpen, event.keyCode == UInt16(kVK_Escape), mods.isEmpty {
+                self.setShortcutsOpen(false)
+                return nil
+            }
+            if event.characters == "?", mods.intersection([.command, .control, .option]).isEmpty {
+                if isHost, let win = self.hostWindow, win.firstResponder is NSText { return event }
+                if isHost, self.mode == "web", self.webEditingText { return event }
+                self.setShortcutsOpen(!self.shortcutsOpen)
                 return nil
             }
             return event
@@ -1189,6 +1565,8 @@ final class FloatModule: ExactModule {
         case "dock": dock(Int(arg) ?? 0)
         case "openSettings": openSettings()
         case "closeSettings": closeSettings()
+        case "toggleShortcuts": setShortcutsOpen(!shortcutsOpen)
+        case "closeShortcuts": setShortcutsOpen(false)
         case "recordHotKey": recordHotKey()
         case "setPeekTrigger": setPeekTrigger(arg)
         case "setPeekAlpha": setPeekAlpha(Double(arg) ?? peekAlpha)
@@ -1250,6 +1628,7 @@ final class FloatModule: ExactModule {
             "peekHold": peekHold,
             "peeking": peeking,
             "settingsOpen": settingsOpen,
+            "shortcutsOpen": shortcutsOpen,
             "peekPermissionGranted": peekPermissionGranted,
             "canCheckUpdates": sparkle.canCheckForUpdates,
             "hasResume": hasResume,
@@ -1302,6 +1681,7 @@ final class FloatModule: ExactModule {
 
     func showHome() {
         mode = "home"
+        webEditingText = false
         if !context.agent { browser?.loadBlank() }
         notifyChanged()
     }
@@ -1401,6 +1781,7 @@ final class FloatModule: ExactModule {
     func fadeIn() { setAlpha(alpha + 0.1) }
 
     func openSettings() {
+        setShortcutsOpen(false)
         settingsOpen = true
         if !context.agent {
             if settingsWindow == nil {
@@ -1408,6 +1789,28 @@ final class FloatModule: ExactModule {
             }
             settingsWindow?.show(relativeTo: hostWindow)
         }
+        notifyChanged()
+    }
+
+    func setShortcutsOpen(_ open: Bool) {
+        guard shortcutsOpen != open else { return }
+        shortcutsOpen = open
+        if !context.agent {
+            if open {
+                if shortcutsWindow == nil {
+                    shortcutsWindow = FloatShortcutsWindowController(module: self)
+                }
+                shortcutsWindow?.show(relativeTo: hostWindow)
+            } else {
+                shortcutsWindow?.hideAnimated()
+            }
+        }
+        notifyChanged()
+    }
+
+    func shortcutsWindowDidClose() {
+        guard shortcutsOpen else { return }
+        shortcutsOpen = false
         notifyChanged()
     }
 

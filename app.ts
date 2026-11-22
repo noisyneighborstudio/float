@@ -25,6 +25,7 @@ interface PersistedFallback {
   peekHold: boolean;
   peeking: boolean;
   settingsOpen: boolean;
+  shortcutsOpen: boolean;
   lastDock: number;
   resume: { url: string; title: string; time: number; duration: number } | null;
   sites: { host: string; url: string; icon: string; last: number; count: number }[];
@@ -47,6 +48,7 @@ const DEFAULT_FALLBACK: PersistedFallback = {
   peekHold: true,
   peeking: false,
   settingsOpen: false,
+  shortcutsOpen: false,
   lastDock: -1,
   resume: null,
   sites: [],
@@ -148,6 +150,7 @@ function toFloatState(p: PersistedFallback): FloatState {
     peekHold: p.peekHold,
     peeking: p.peeking,
     settingsOpen: p.settingsOpen,
+    shortcutsOpen: p.shortcutsOpen,
     peekPermissionGranted: true,
     canCheckUpdates: false,
     hasResume,
@@ -253,6 +256,12 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       break;
     case 'closeSettings':
       data.settingsOpen = false;
+      break;
+    case 'toggleShortcuts':
+      data.shortcutsOpen = !data.shortcutsOpen;
+      break;
+    case 'closeShortcuts':
+      data.shortcutsOpen = false;
       break;
     case 'back':
       if (data.historyIndex > 0) {
