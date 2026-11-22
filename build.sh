@@ -18,10 +18,14 @@ if [[ -z ${EXACT2:-} ]]; then
 fi
 EXACT2=${EXACT2:-$HOME/Development/expo/exact2}
 
-# Prefer rustup's cargo and Bun 1.4.2 when present on this machine
+# Prefer rustup/asdf cargo and Bun 1.4.2 when present on this machine
+[[ -d "$HOME/.asdf/shims" ]] && export PATH="$HOME/.asdf/shims:$PATH"
 [[ -d "$HOME/.cargo/bin" ]] && export PATH="$HOME/.cargo/bin:$PATH"
 [[ -d "$HOME/.local/share/mise/installs/bun/1.4.2/bin" ]] && export PATH="$HOME/.local/share/mise/installs/bun/1.4.2/bin:$PATH"
 [[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
+if [[ -z ${CARGO_HOME:-} && ! -d "$HOME/.cargo/hermes-lean-sys" && -d "$HOME/.asdf/installs/rust/stable/hermes-lean-sys" ]]; then
+  export CARGO_HOME="$HOME/.asdf/installs/rust/stable"
+fi
 BUN=${BUN:-$(command -v bun)}
 
 # Sparkle: pinned + checksummed; stored in .vendor/ so Exact's source baker skips its framework symlinks
