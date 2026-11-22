@@ -102,6 +102,67 @@ private func floatCleanTitle(_ title: String, host: String) -> String {
     return title
 }
 
+private let floatAppleTVAutoPlayKinds: Set<String> = ["episode", "movie", "show", "season", "sporting-event"]
+private let floatAppleTVContentKinds: Set<String> = ["episode", "movie", "show", "season", "sporting-event", "clip"]
+
+/// Returns the Apple TV content kind (`episode`, `movie`, `show`, `season`, `sporting-event`, `clip`)
+/// when `url` points to a specific tv.apple.com content page, or `nil` for home/browse pages.
+private func floatAppleTVContentKind(_ url: URL) -> String? {
+    guard url.host?.lowercased() == "tv.apple.com" else { return nil }
+    let segs = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+    guard !segs.isEmpty else { return nil }
+    let start: Int
+    if segs[0].count == 2 && segs[0].allSatisfy({ $0.isASCII && $0.isLetter }) {
+        start = 1
+    } else {
+        start = 0
+    }
+    guard segs.count >= start + 2 else { return nil }
+    let kind = segs[start].lowercased()
+    return floatAppleTVContentKinds.contains(kind) ? kind : nil
+}
+
+/// Ensures tv.apple.com content resume links include `action=play` so Apple TV's router
+/// auto-launches playback instead of landing on a browse or detail page.
+private func floatAppleTVResumeURL(_ url: URL) -> URL {
+    guard let kind = floatAppleTVContentKind(url),
+          floatAppleTVAutoPlayKinds.contains(kind),
+          var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+        return url
+    }
+    if #available(macOS 13.0, *) {
+        var items = comps.percentEncodedQueryItems ?? []
+        if let idx = items.firstIndex(where: { $0.name == "action" }) {
+            items[idx] = URLQueryItem(name: "action", value: "play")
+        } else {
+            items.append(URLQueryItem(name: "action", value: "play"))
+        }
+        comps.percentEncodedQueryItems = items
+    } else {
+        var items = comps.queryItems ?? []
+        if let idx = items.firstIndex(where: { $0.name == "action" }) {
+            items[idx] = URLQueryItem(name: "action", value: "play")
+        } else {
+            items.append(URLQueryItem(name: "action", value: "play"))
+        }
+        comps.queryItems = items
+    }
+    return comps.url ?? url
+}
+
+private func floatIsGenericTitle(_ title: String, host: String) -> Bool {
+    if title.isEmpty || title.caseInsensitiveCompare(floatSiteName(host)) == .orderedSame {
+        return true
+    }
+    if host.lowercased() == "tv.apple.com" {
+        let lower = title.lowercased()
+        if lower == "apple tv" || lower == "apple tv+" || lower.hasPrefix("browse apple tv") {
+            return true
+        }
+    }
+    return false
+}
+
 // Pins the main video's player (video + site controls) to the window; works on any site.
 private func floatFillScript(_ on: Bool) -> String { """
 (() => {
@@ -167,15 +228,80 @@ private let floatTrackScript = """
 })();
 """
 
-// Best title for what's playing: Netflix player overlay → Media Session → og:title → document title
-private let floatTitleScript = """
+// Best title + canonical playback URL for what's playing.
+// On tv.apple.com, playback runs in an overlay on top of the current browse page (e.g. Home),
+// so web.url never changes; MusicKit.getInstance().nowPlayingItem exposes the active playable's URL & metadata.
+private let floatResumeMetaScript = """
 (() => {
-  const nf = document.querySelector('[data-uia="video-title"]');
-  if (nf) return [...nf.children].map(e => e.textContent.trim()).filter(Boolean).join(' · ') || nf.textContent.trim();
-  const ms = navigator.mediaSession && navigator.mediaSession.metadata;
-  if (ms && ms.title) return ms.artist ? `${ms.title} · ${ms.artist}` : ms.title;
-  const og = document.querySelector('meta[property="og:title"]');
-  return (og && og.content) || document.title;
+  let atvUrl = '';
+  let atvTitle = '';
+  let atvFallbackTitle = '';
+  if (location.hostname === 'tv.apple.com') {
+    try {
+      const mk = window.MusicKit && typeof window.MusicKit.getInstance === 'function'
+        ? window.MusicKit.getInstance()
+        : null;
+      const item = mk && (mk.nowPlayingItem || (mk.queue && mk.queue.currentItem));
+      const p = item && (item.defaultPlayable || (Array.isArray(item.playables) && item.playables[0]) || item.attributes);
+      if (p) {
+        if (typeof p.url === 'string' && p.url) {
+          atvUrl = p.url;
+        } else if (typeof p.canonicalId === 'string' && p.canonicalId) {
+          const kinds = {
+            Episode: 'episode',
+            Movie: 'movie',
+            Show: 'show',
+            Season: 'season',
+            SportingEvent: 'sporting-event',
+            Extra: 'clip',
+          };
+          const seg = kinds[p.contentType || item.contentType];
+          if (seg) {
+            const pathSf = (location.pathname.match(/^\\/([a-z]{2})(?:\\/|$)/i) || [])[1] || '';
+            const mkSf = typeof mk.storefrontId === 'string' && /^[a-z]{2}$/i.test(mk.storefrontId) ? mk.storefrontId : '';
+            const sf = (pathSf || mkSf).toLowerCase();
+            atvUrl = sf
+              ? `https://tv.apple.com/${sf}/${seg}/${encodeURIComponent(p.canonicalId)}`
+              : `https://tv.apple.com/${seg}/${encodeURIComponent(p.canonicalId)}`;
+          }
+        }
+        const cm = p.canonicalMetadata || {};
+        const ep = typeof cm.episodeTitle === 'string' ? cm.episodeTitle.trim() : '';
+        const show = typeof cm.showTitle === 'string' ? cm.showTitle.trim() : '';
+        const movie = typeof cm.movieTitle === 'string' ? cm.movieTitle.trim() : '';
+        const shortTitle = typeof cm.shortTitle === 'string' ? cm.shortTitle.trim() : '';
+        atvTitle = ep && show && ep !== show ? `${ep} · ${show}` : (ep || movie || shortTitle);
+        atvFallbackTitle = typeof p.title === 'string' ? p.title.trim() : (typeof item.title === 'string' ? item.title.trim() : '');
+      }
+      if (!atvUrl) {
+        const canon = document.querySelector('link[rel="canonical"]');
+        const ogUrl = document.querySelector('meta[property="og:url"]');
+        const cand = (canon && canon.href) || (ogUrl && ogUrl.content) || '';
+        if (/^https?:\\/\\/tv\\.apple\\.com\\/(?:[a-z]{2}\\/)?(?:episode|movie|show|season|sporting-event|clip)\\//i.test(cand)) {
+          atvUrl = cand;
+        }
+      }
+    } catch {}
+  }
+
+  let title = atvTitle;
+  if (!title) {
+    const nf = document.querySelector('[data-uia="video-title"]');
+    if (nf) {
+      title = [...nf.children].map(e => e.textContent.trim()).filter(Boolean).join(' · ') || nf.textContent.trim();
+    } else {
+      const ms = navigator.mediaSession && navigator.mediaSession.metadata;
+      if (ms && ms.title) {
+        title = ms.artist ? `${ms.title} · ${ms.artist}` : ms.title;
+      } else if (atvFallbackTitle) {
+        title = atvFallbackTitle;
+      } else {
+        const og = document.querySelector('meta[property="og:title"]');
+        title = (og && og.content) || document.title || '';
+      }
+    }
+  }
+  return { title: String(title || ''), url: String(atvUrl || '') };
 })()
 """
 
@@ -490,15 +616,27 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
             web.evaluateJavaScript(floatIconScript) { [weak module] icon, _ in
                 module?.recordSite(url, icon: icon as? String)
             }
-            if let seek = module.pendingSeek, t < seek - 10 {
-                web.evaluateJavaScript("[...document.querySelectorAll('video')].filter(v => !v.paused).forEach(v => v.currentTime = \(seek))")
-            }
-            module.pendingSeek = nil
         }
         // Skip trailers/previews/ads
         guard d > 180, t <= d else { return }
-        web.evaluateJavaScript(floatTitleScript) { [weak module] r, _ in
-            module?.recordResume(url: url, host: host, rawTitle: r as? String ?? "", time: t, duration: d)
+        if let seek = module.pendingSeek {
+            if t < seek - 10, seek < d {
+                web.evaluateJavaScript("[...document.querySelectorAll('video')].filter(v => !v.paused && v.duration > 180).forEach(v => v.currentTime = \(seek))")
+            }
+            module.pendingSeek = nil
+        }
+        web.evaluateJavaScript(floatResumeMetaScript) { [weak module] r, _ in
+            let meta = r as? [String: Any]
+            let rawTitle = meta?["title"] as? String ?? (r as? String ?? "")
+            var resumeUrl = url
+            if let candidate = meta?["url"] as? String,
+               !candidate.isEmpty,
+               let parsed = URL(string: candidate),
+               floatIsWeb(parsed),
+               parsed.host?.lowercased() == host.lowercased() {
+                resumeUrl = parsed
+            }
+            module?.recordResume(url: resumeUrl, host: host, rawTitle: rawTitle, time: t, duration: d)
         }
     }
 
@@ -1730,6 +1868,7 @@ final class FloatModule: ExactModule {
             url = c.url
         }
         guard let url, floatIsWeb(url) else { return }
+        pendingSeek = nil
         // Match URL.toString() normalization for bare host URLs like https://netflix.com/
         let normalized = url.path.isEmpty && url.query == nil && url.fragment == nil
             ? url.absoluteString + "/"
@@ -1754,14 +1893,16 @@ final class FloatModule: ExactModule {
     func showHome() {
         mode = "home"
         webEditingText = false
+        pendingSeek = nil
         if !context.agent { browser?.loadBlank() }
         notifyChanged()
     }
 
     func resumeLast() {
         guard let r = store.loadResume() else { return }
+        let target = URL(string: r.url).map { floatAppleTVResumeURL($0).absoluteString } ?? r.url
+        load(target)
         pendingSeek = r.time > 0 ? r.time : nil
-        load(r.url)
     }
 
     func openClipboard() {
@@ -2127,13 +2268,26 @@ final class FloatModule: ExactModule {
     }
 
     func recordResume(url: URL, host: String, rawTitle: String, time: Double, duration: Double) {
+        var targetUrl = floatAppleTVResumeURL(url)
         var title = floatCleanTitle(rawTitle, host: host)
-        // Player titles are often hidden with the controls; keep the last good one for this page
-        if let prev = store.loadResume(), prev.url == url.absoluteString,
-           title.isEmpty || title.caseInsensitiveCompare(floatSiteName(host)) == .orderedSame {
-            title = prev.title
+        if let prev = store.loadResume() {
+            let prevUrl = URL(string: prev.url)
+            // On tv.apple.com, closing the player clears MusicKit.nowPlayingItem before the video's
+            // final pause event arrives while web.url is still Home; keep the episode/movie URL.
+            if host.lowercased() == "tv.apple.com",
+               floatAppleTVContentKind(targetUrl) == nil,
+               let prevUrl,
+               floatAppleTVContentKind(prevUrl) != nil,
+               abs(prev.duration - duration) < 5 {
+                targetUrl = floatAppleTVResumeURL(prevUrl)
+            }
+            // Player titles are often hidden with the controls; keep the last good one for this page
+            let prevNormalized = prevUrl.map { floatAppleTVResumeURL($0).absoluteString } ?? prev.url
+            if prevNormalized == targetUrl.absoluteString, floatIsGenericTitle(title, host: host) {
+                title = prev.title
+            }
         }
-        store.saveResume(FloatResume(url: url.absoluteString, title: title, time: time, duration: duration))
+        store.saveResume(FloatResume(url: targetUrl.absoluteString, title: title, time: time, duration: duration))
         notifyChanged()
     }
 

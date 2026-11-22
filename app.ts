@@ -73,6 +73,47 @@ function cleanTitle(title: string, host: string): string {
   return title;
 }
 
+const APPLE_TV_AUTOPLAY_KINDS = new Set(['episode', 'movie', 'show', 'season', 'sporting-event']);
+const APPLE_TV_CONTENT_KINDS = new Set(['episode', 'movie', 'show', 'season', 'sporting-event', 'clip']);
+
+function appleTVContentKind(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl);
+    if (u.hostname.toLowerCase() !== 'tv.apple.com') return null;
+    const segs = u.pathname.split('/').filter(Boolean);
+    if (segs.length === 0) return null;
+    const start = /^[a-z]{2}$/i.test(segs[0]) ? 1 : 0;
+    if (segs.length < start + 2) return null;
+    const kind = segs[start].toLowerCase();
+    return APPLE_TV_CONTENT_KINDS.has(kind) ? kind : null;
+  } catch {
+    return null;
+  }
+}
+
+function appleTVResumeUrl(rawUrl: string): string {
+  const kind = appleTVContentKind(rawUrl);
+  if (!kind || !APPLE_TV_AUTOPLAY_KINDS.has(kind)) return rawUrl;
+  try {
+    const u = new URL(rawUrl);
+    u.searchParams.set('action', 'play');
+    return u.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function isGenericTitle(title: string, host: string): boolean {
+  if (!title || title.toLowerCase() === siteName(host).toLowerCase()) return true;
+  if (host.toLowerCase() === 'tv.apple.com') {
+    const lower = title.toLowerCase();
+    if (lower === 'apple tv' || lower === 'apple tv+' || lower.startsWith('browse apple tv')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function parseWebUrl(raw: string): string | null {
   const s = raw.trim();
   if (!s) return null;
@@ -202,7 +243,7 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       break;
     case 'resumeLast':
       if (data.resume) {
-        const url = parseWebUrl(data.resume.url);
+        const url = parseWebUrl(appleTVResumeUrl(data.resume.url));
         if (url) {
           data.mode = 'web';
           data.currentUrl = url;
@@ -301,11 +342,22 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
         });
       }
       if (payload.d > 180 && payload.t <= payload.d) {
+        let targetUrl = appleTVResumeUrl(payload.url);
         let title = cleanTitle(payload.title || '', host);
-        if (data.resume && data.resume.url === payload.url && (!title || title.toLowerCase() === siteName(host).toLowerCase())) {
-          title = data.resume.title;
+        if (data.resume) {
+          if (
+            host.toLowerCase() === 'tv.apple.com' &&
+            !appleTVContentKind(targetUrl) &&
+            appleTVContentKind(data.resume.url) &&
+            Math.abs(data.resume.duration - payload.d) < 5
+          ) {
+            targetUrl = appleTVResumeUrl(data.resume.url);
+          }
+          if (appleTVResumeUrl(data.resume.url) === targetUrl && isGenericTitle(title, host)) {
+            title = data.resume.title;
+          }
         }
-        data.resume = { url: payload.url, title, time: payload.t, duration: payload.d };
+        data.resume = { url: targetUrl, title, time: payload.t, duration: payload.d };
       }
       break;
     }
