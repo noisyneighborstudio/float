@@ -1,0 +1,413 @@
+// Float: chromeless, always-on-top macOS video browser built with Exact.
+routes nav
+  home "/"
+  open "/open"
+
+shape Viewport
+  width: number
+  height: number
+  prefersReducedMotion: bool
+
+shape Site
+  host: string
+  url: string
+  icon: string
+  name: string
+  initial: string
+  last: number
+  count: number
+
+shape FloatState
+  mode: string
+  currentUrl: string
+  fill: bool
+  onTop: bool
+  aspectLocked: bool
+  clickThrough: bool
+  alpha: number
+  hotkeyLabel: string
+  peekTrigger: string
+  peekAlpha: number
+  peekHotkeyLabel: string
+  peekHold: bool
+  peeking: bool
+  settingsOpen: bool
+  peekPermissionGranted: bool
+  canCheckUpdates: bool
+  hasResume: bool
+  resumeUrl: string
+  resumeTitle: string
+  resumeHost: string
+  resumeIcon: string
+  resumeTime: number
+  resumeDuration: number
+  sites: Site[]
+
+shape Reply
+  ok: bool
+
+fn pad2(n: number): string = n < 10 ? `0${n}` : `${n}`
+
+fn fmtTime(sec: number): string = (
+  floor(sec / 3600) > 0
+    ? `${floor(sec / 3600)}:${pad2(floor((sec - floor(sec / 3600) * 3600) / 60))}:${pad2(floor(sec) - floor(sec / 60) * 60)}`
+    : `${floor(sec / 60)}:${pad2(floor(sec) - floor(sec / 60) * 60)}`
+)
+
+fn tileX(idx: number, cols: number): number = (idx - floor(idx / cols) * cols) * 140
+fn tileY(idx: number, cols: number): number = floor(idx / cols) * 92
+
+style TileButton
+  position="relative"
+  width="100%"
+  height="100%"
+  border-radius=12
+  background-color="rgba(255, 255, 255, 0.06)"
+  border-width=1
+  border-style="solid"
+  border-color="rgba(255, 255, 255, 0.08)"
+  display="flex"
+  flex-direction="column"
+  align-items="center"
+  justify-content="center"
+  gap=8
+  padding=8
+  box-sizing="border-box"
+  color="#e8e8ea"
+  transition="scale 150ms ease, background-color 150ms ease"
+  :hover
+    background-color="rgba(255, 255, 255, 0.12)"
+
+style ResumeCard
+  display="flex"
+  flex-direction="row"
+  align-items="center"
+  gap=14
+  margin-bottom=14
+  padding-top=14
+  padding-bottom=14
+  padding-left=16
+  padding-right=16
+  border-radius=14
+  color="#e8e8ea"
+  background-image="linear-gradient(135deg, rgba(20, 160, 160, 0.28), rgba(255, 255, 255, 0.05))"
+  border-width=1
+  border-style="solid"
+  border-color="rgba(80, 220, 220, 0.25)"
+  transition="background-color 150ms ease"
+  width="100%"
+  box-sizing="border-box"
+  :hover
+    background-color="rgba(20, 160, 160, 0.14)"
+
+style RemoveBtn
+  position="absolute"
+  top=5
+  right=5
+  width=20
+  height=20
+  border-radius=10
+  display="flex"
+  align-items="center"
+  justify-content="center"
+  background-color="rgba(0, 0, 0, 0.6)"
+  color="#dddddd"
+  font-size=13
+  :hover
+    background-color="rgba(0, 0, 0, 0.9)"
+
+component Float
+  state urlOpen = false
+  state urlDraft = ""
+  state selectSeq = 0
+  state hoveredHost = ""
+  state brokenIcons: string[] = []
+  state brokenResumeIcon = false
+
+  resource vp = exactViewport() as shape Viewport
+  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, peekPermissionGranted=true)
+  mutation cmd as shape Reply queue refreshes st
+
+  derive isHome = st.mode == "home"
+  derive hasSites = st.sites.length > 0
+  derive isEmpty = not st.hasResume and not hasSites
+  derive gridInnerW = max(128, (vp.width > 0 ? vp.width : 640) - 32)
+  derive gridCols = max(1, floor((gridInnerW + 12) / 140))
+  derive gridRows = st.sites.length > 0 ? floor((st.sites.length + gridCols - 1) / gridCols) : 0
+  derive gridHeight = gridRows > 0 ? gridRows * 80 + (gridRows - 1) * 12 : 0
+  derive resumeProgress = st.resumeDuration > 0 ? min(100, (st.resumeTime / st.resumeDuration) * 100) : 0
+  derive resumeSubtitle = (
+    st.resumeDuration > 0
+      ? `${fmtTime(st.resumeTime)} of ${fmtTime(st.resumeDuration)} · ${st.resumeHost}`
+      : st.resumeHost
+  )
+  derive hotkeyMenuTitle = `Show/Hide Hotkey: ${st.hotkeyLabel != "" ? st.hotkeyLabel : "None"}…`
+
+  task onLaunch mount
+    after(1, checkInitialRoute)
+
+  action checkInitialRoute
+    let topEntry = top(nav)
+    if topEntry.name == "open"
+      let incoming = searchParam(topEntry, "u")
+      if incoming != ""
+        urlOpen = false
+        send cmd = runFloatCommand("load", incoming)
+      nav = replace(nav, "/")
+
+  action handleNavigate(location: string)
+    let next = go(nav, location)
+    let topEntry = top(next)
+    if topEntry.name == "open"
+      let incoming = searchParam(topEntry, "u")
+      if incoming != ""
+        urlOpen = false
+        send cmd = runFloatCommand("load", incoming)
+      nav = replace(next, "/")
+    else
+      nav = next
+
+  action showHome
+    urlOpen = false
+    send cmd = runFloatCommand("showHome", "")
+
+  action resumeLast
+    urlOpen = false
+    send cmd = runFloatCommand("resumeLast", "")
+
+  action openUrlBar
+    urlDraft = st.mode == "web" ? st.currentUrl : ""
+    urlOpen = true
+    selectSeq = selectSeq + 1
+    focus("url-input")
+
+  action openSettings
+    send cmd = runFloatCommand("openSettings", "")
+
+  action closeSettings
+    send cmd = runFloatCommand("closeSettings", "")
+
+  action setPeekTrigger(trigger: string)
+    send cmd = runFloatCommand("setPeekTrigger", trigger)
+
+  action setPeekAlpha(val: string)
+    send cmd = runFloatCommand("setPeekAlpha", val)
+
+  action stepPeekAlpha(delta: number)
+    let next = min(0.95, max(0.15, st.peekAlpha + delta))
+    send cmd = runFloatCommand("setPeekAlpha", `${next}`)
+
+  action setPeekHold(hold: string)
+    send cmd = runFloatCommand("setPeekHold", hold)
+
+  action editUrl(v: string)
+    urlDraft = v
+
+  action submitUrl
+    let target = urlDraft.trim()
+    urlOpen = false
+    if target != ""
+      send cmd = runFloatCommand("load", target)
+    else
+      send cmd = runFloatCommand("focusWeb", "")
+
+  action cancelUrl
+    urlOpen = false
+    send cmd = runFloatCommand("focusWeb", "")
+
+  action urlKeyDown(k: string)
+    if k == "Escape"
+      cancelUrl()
+
+  action openSite(url: string)
+    urlOpen = false
+    send cmd = runFloatCommand("load", url)
+
+  action removeSite(host: string)
+    send cmd = runFloatCommand("removeSite", host)
+
+  action hoverTile(host: string, inside: bool)
+    if inside
+      hoveredHost = host
+    else
+      if hoveredHost == host
+        hoveredHost = ""
+
+  action markIconBroken(host: string)
+    if not brokenIcons.includes(host)
+      brokenIcons = brokenIcons.concat([host])
+
+  action markResumeIconBroken
+    brokenResumeIcon = true
+
+  action openClipboard
+    urlOpen = false
+    send cmd = runFloatCommand("openClipboard", "")
+
+  action reloadPage
+    send cmd = runFloatCommand("reloadPage", "")
+
+  action goBack
+    send cmd = runFloatCommand("back", "")
+
+  action goForward
+    send cmd = runFloatCommand("forward", "")
+
+  action toggleFill
+    send cmd = runFloatCommand("toggleFill", "")
+
+  action toggleAspectLock
+    send cmd = runFloatCommand("toggleAspectLock", "")
+
+  action toggleTop
+    send cmd = runFloatCommand("toggleTop", "")
+
+  action toggleClickThrough
+    send cmd = runFloatCommand("toggleClickThrough", "")
+
+  action fadeOut
+    send cmd = runFloatCommand("fadeOut", "")
+
+  action fadeIn
+    send cmd = runFloatCommand("fadeIn", "")
+
+  action playPause
+    send cmd = runFloatCommand("playPause", "")
+
+  action dockPosition(pos: string)
+    send cmd = runFloatCommand("dock", pos)
+
+  action recordHotKey
+    send cmd = runFloatCommand("recordHotKey", "")
+
+  action checkForUpdates
+    send cmd = runFloatCommand("checkForUpdates", "")
+
+  action onBrowserMessage(payload: string)
+    if payload == "refresh"
+      refresh st
+
+  view
+    main testId="float-root"
+      viewport-fit="cover"
+      color-scheme="dark"
+      navigationKey=`${top(nav).id}`
+      navigate=handleNavigate
+      -exact-menu-remove="close-all show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows autofill paste-and-match-style find spelling-and-grammar substitutions transformations app-help actual-size zoom-in zoom-out back forward develop"
+      position="relative"
+      width="100%"
+      height="100%"
+      overflow="hidden"
+      background-color="#000000"
+      color="#e8e8ea"
+      font-family="system-ui"
+      font-size=13
+      user-select="none"
+
+      // Native WKWebView: always mounted to preserve back/forward history and media session
+      float-browser id="browser" testId="browser" mode=st.mode message=onBrowserMessage
+        position="absolute" inset=0 width="100%" height="100%" z-index=1
+
+      // Home screen: Resume card + Site mosaic grid + Empty state
+      if isHome
+        scroll testId="home-screen" position="absolute" inset=0 width="100%" height="100%" z-index=10
+          background-color="#0b0b0d"
+          background-image="linear-gradient(180deg, #1c1d22 0%, #0b0b0d 70%)"
+          padding-top=30 padding-left=16 padding-right=16 padding-bottom=16
+          box-sizing="border-box"
+
+          if isEmpty
+            column testId="empty-state" position="absolute" inset=0
+              align-items="center" justify-content="center" gap=4 padding=16
+              text "Video sites you watch will show up here." color="#8a8a90" font-size=13 text-align="center"
+              row align-items="center" justify-content="center" gap=4
+                text "Press" color="#8a8a90" font-size=13
+                view padding-top=1 padding-bottom=1 padding-left=6 padding-right=6
+                  border-radius=5 background-color="#2c2d33"
+                  text "⌘L" color="#dddddd" font-size=13 testId="empty-shortcut"
+                text "to open a URL." color="#8a8a90" font-size=13
+          else
+            column width="100%"
+              if st.hasResume
+                button appearance="none" class=ResumeCard press=resumeLast testId="resume-card"
+                  aria-label=`Resume ${st.resumeTitle}`
+                  if st.resumeIcon != "" and not brokenResumeIcon
+                    image st.resumeIcon width=40 height=40 border-radius=9 object-fit="contain" flex-shrink=0
+                  column flex=1 min-width=0 gap=2 align-items="flex-start"
+                    text "RESUME" font-size=11 letter-spacing=0.88 color="#7fd8d8" font-weight=500
+                    text st.resumeTitle font-size=15 font-weight=600 color="#e8e8ea" line-clamp=1 testId="resume-title"
+                    text resumeSubtitle font-size=12 color="#9a9aa0" line-clamp=1 testId="resume-sub"
+                    if st.resumeDuration > 0
+                      view width="100%" height=3 border-radius=2 background-color="rgba(255, 255, 255, 0.12)" margin-top=6 overflow="hidden"
+                        view height="100%" width=`${resumeProgress}%` background-color="#3fd0d0" testId="resume-progress"
+                  view width=34 height=34 border-radius=17 background-color="#3fd0d0" flex-shrink=0
+                    display="flex" align-items="center" justify-content="center" padding-left=3 box-sizing="border-box"
+                    text "▶" font-size=14 color="#062424"
+
+              if hasSites
+                view testId="site-grid" position="relative" width="100%" height=gridHeight
+                  for site, idx in st.sites key=site.host
+                    view position="absolute" top=0 left=0 width=128 height=80
+                      translate=`${tileX(idx, gridCols)}px ${tileY(idx, gridCols)}px`
+                      transition=(vp.prefersReducedMotion ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
+                      hover=hoverTile(site.host) testId=`tile-wrap-${site.host}`
+                      button appearance="none" class=TileButton press=openSite(site.url)
+                        scale=(hoveredHost == site.host ? 1.03 : 1)
+                        title=site.host aria-label=site.name testId=`tile-${site.host}`
+                        if site.icon != "" and not brokenIcons.includes(site.host)
+                          image site.icon width=40 height=40 border-radius=9 object-fit="contain"
+                        else
+                          view width=40 height=40 border-radius=9 background-color="#2c2d33"
+                            display="flex" align-items="center" justify-content="center"
+                            text site.initial font-size=20 font-weight=600 color="#e8e8ea"
+                        text site.name font-weight=500 font-size=13 color="#e8e8ea" max-width="90%" line-clamp=1 testId=`tile-name-${site.host}`
+                      button appearance="none" class=RemoveBtn press=removeSite(site.host)
+                        opacity=(hoveredHost == site.host ? 1 : 0)
+                        aria-label=`Remove ${site.name}` title="Remove" testId=`remove-${site.host}`
+                        text "×"
+
+      // Top-edge 18px drag strip: hover reveals, drag moves window, double-click locks video aspect
+      float-drag-strip id="drag-strip" testId="drag-strip"
+        position="absolute" top=0 left=0 right=0 height=18 z-index=20
+
+      // Floating URL / search bar overlay (⌘L)
+      if urlOpen
+        view testId="url-bar" position="absolute" top=24 left=10 right=10 z-index=30
+          input id="url-input" testId="url-input"
+            hatch="url-input" data-select-seq=`${selectSeq}`
+            value=urlDraft input=editUrl submit=submitUrl key=urlKeyDown
+            placeholder="URL or search — Enter to go, Esc to cancel"
+            aria-label="Location"
+            autofocus=true
+            width="100%" font-size=13 box-sizing="border-box"
+
+      // Mac menu bar & keyboard shortcut declarations (invisible strip clear of window edges; active across Home and Web)
+      row position="absolute" bottom=12 left=24 height=4 opacity=0 z-index=25
+        button appearance="none" width=4 height=4 overflow="hidden" press=checkForUpdates -exact-menu="about" disabled=(not st.canCheckUpdates) aria-label="Check for Updates…" testId="cmd-updates"
+        button appearance="none" width=4 height=4 overflow="hidden" press=openSettings -exact-menu="app" aria-keyshortcuts="Meta+," aria-label="Settings…" testId="cmd-settings"
+        button appearance="none" width=4 height=4 overflow="hidden" press=recordHotKey -exact-menu="app" aria-label=hotkeyMenuTitle testId="cmd-hotkey"
+        button appearance="none" width=4 height=4 overflow="hidden" press=showHome -exact-menu="view" aria-keyshortcuts="Meta+Shift+H" aria-label="Home" testId="cmd-home"
+        button appearance="none" width=4 height=4 overflow="hidden" press=resumeLast -exact-menu="view" aria-keyshortcuts="Meta+Shift+R" aria-label="Resume Last" testId="cmd-resume"
+        button appearance="none" width=4 height=4 overflow="hidden" press=openUrlBar -exact-menu="view" aria-keyshortcuts="Meta+L" aria-label="Open Location…" testId="cmd-open-url"
+        button appearance="none" width=4 height=4 overflow="hidden" press=openClipboard -exact-menu="view" aria-keyshortcuts="Meta+Shift+V" aria-label="Open URL from Clipboard" testId="cmd-clipboard"
+        button appearance="none" width=4 height=4 overflow="hidden" press=reloadPage -exact-menu="view" aria-keyshortcuts="Meta+R" aria-label="Reload" testId="cmd-reload"
+        button appearance="none" width=4 height=4 overflow="hidden" press=goBack -exact-menu="view" aria-keyshortcuts="Meta+[" aria-label="Back" testId="cmd-back"
+        button appearance="none" width=4 height=4 overflow="hidden" press=goForward -exact-menu="view" aria-keyshortcuts="Meta+]" aria-label="Forward" testId="cmd-forward"
+        button appearance="none" width=4 height=4 overflow="hidden" press=toggleFill -exact-menu="view" aria-keyshortcuts="Meta+Shift+F" aria-selected=st.fill aria-label="Toggle Video Fill" testId="cmd-fill"
+        button appearance="none" width=4 height=4 overflow="hidden" press=toggleAspectLock -exact-menu="view" aria-keyshortcuts="Meta+Shift+A" aria-selected=st.aspectLocked aria-label="Lock to Video Aspect" testId="cmd-aspect"
+        button appearance="none" width=4 height=4 overflow="hidden" press=toggleTop -exact-menu="view" aria-keyshortcuts="Meta+T" aria-selected=st.onTop aria-label="Toggle Always on Top" testId="cmd-top"
+        button appearance="none" width=4 height=4 overflow="hidden" press=toggleClickThrough -exact-menu="view" aria-keyshortcuts="Meta+Shift+K" aria-selected=st.clickThrough aria-label="Toggle Click-Through" testId="cmd-click-through"
+        button appearance="none" width=4 height=4 overflow="hidden" press=fadeOut -exact-menu="view" aria-keyshortcuts="Meta+-" aria-label="More Transparent" testId="cmd-fade-out"
+        button appearance="none" width=4 height=4 overflow="hidden" press=fadeIn -exact-menu="view" aria-keyshortcuts="Meta+=" aria-label="Less Transparent" testId="cmd-fade-in"
+        button appearance="none" width=4 height=4 overflow="hidden" press=playPause -exact-menu="view" aria-keyshortcuts="Control+Space" aria-label="Play / Pause" testId="cmd-play-pause"
+        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("0") -exact-menu="none" aria-label="Top Left" testId="cmd-dock-0"
+        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("1") -exact-menu="none" aria-label="Top Center" testId="cmd-dock-1"
+        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("2") -exact-menu="none" aria-label="Top Right" testId="cmd-dock-2"
+        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("3") -exact-menu="none" aria-label="Bottom Left" testId="cmd-dock-3"
+        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("4") -exact-menu="none" aria-label="Bottom Center" testId="cmd-dock-4"
+        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("5") -exact-menu="none" aria-label="Bottom Right" testId="cmd-dock-5"
+        button appearance="none" width=4 height=4 overflow="hidden" press=closeSettings -exact-menu="none" aria-label="Close Settings" testId="cmd-settings-close"
+        button appearance="none" width=4 height=4 overflow="hidden" press=setPeekAlpha("0.25") -exact-menu="none" aria-label="Peek 25%" testId="cmd-peek-25"
+        button appearance="none" width=4 height=4 overflow="hidden" press=stepPeekAlpha(0.05) -exact-menu="none" aria-label="Peek +5%" testId="cmd-peek-inc"
+        button appearance="none" width=4 height=4 overflow="hidden" press=setPeekTrigger("hotkey") -exact-menu="none" aria-label="Peek Hotkey" testId="cmd-peek-hotkey"
+        button appearance="none" width=4 height=4 overflow="hidden" press=setPeekHold("false") -exact-menu="none" aria-label="Peek Toggle" testId="cmd-peek-toggle"

@@ -1,0 +1,135 @@
+test "empty home screen shows guidance and opens URL bar"
+  clock data
+  expect tree has "home-screen"
+  expect tree has "empty-state"
+  expect text "empty-shortcut" == "⌘L"
+  expect tree missing "url-bar"
+
+  tap "cmd-open-url"
+  expect tree has "url-bar"
+  expect tree has "url-input"
+
+  type "url-input" key "Escape"
+  expect tree missing "url-bar"
+  expect state st.mode == "home"
+
+test "URL bar resolves domains, full URLs, YouTube searches, and blocks non-http schemes"
+  clock data
+
+  // Bare domain adds https://
+  tap "cmd-open-url"
+  type "url-input" "netflix.com"
+  type "url-input" key "Enter"
+  clock data
+  expect tree missing "url-bar"
+  expect state st.mode == "web"
+  expect state st.currentUrl == "https://netflix.com/"
+
+  // Plain words become a YouTube search
+  tap "cmd-open-url"
+  type "url-input" "lofi beats"
+  type "url-input" key "Enter"
+  clock data
+  expect state st.mode == "web"
+  expect state st.currentUrl == "https://www.youtube.com/results?search_query=lofi%20beats"
+
+  // Security hardening: non-http(s) URLs are rejected
+  tap "cmd-home"
+  clock data
+  expect state st.mode == "home"
+  tap "cmd-open-url"
+  type "url-input" "file:///etc/passwd"
+  type "url-input" key "Enter"
+  clock data
+  expect state st.mode == "home"
+
+test "window toggles, opacity clamping, and video fill persist across reload"
+  clock data
+  expect state st.fill == true
+  expect state st.onTop == true
+  expect state st.aspectLocked == false
+  expect state st.clickThrough == false
+  expect state st.alpha == 1
+
+  // Toggle video fill off
+  tap "cmd-fill"
+  clock data
+  expect state st.fill == false
+
+  // Toggle always on top off
+  tap "cmd-top"
+  clock data
+  expect state st.onTop == false
+
+  // Click-through caps opacity at 0.6 when above 0.6
+  tap "cmd-click-through"
+  clock data
+  expect state st.clickThrough == true
+  expect state st.alpha == 0.6
+
+  // Fade out/in adjusts opacity
+  tap "cmd-fade-out"
+  clock data
+  expect state st.alpha == 0.5
+  tap "cmd-fade-in"
+  clock data
+  expect state st.alpha == 0.6
+
+  // Aspect lock toggles
+  tap "cmd-aspect"
+  clock data
+  expect state st.aspectLocked == true
+
+  // Fill and alpha survive reload
+  reload
+  clock data
+  expect state st.fill == false
+  expect state st.alpha == 0.6
+
+test "incoming protocol_handlers URL loads the page and returns route to root"
+  at "/open?u=https%3A%2F%2Fvimeo.com%2F12345"
+  clock +5
+  clock data
+  expect state st.mode == "web"
+  expect state st.currentUrl == "https://vimeo.com/12345"
+  tap "cmd-home"
+  clock data
+  expect state st.mode == "home"
+
+test "settings configures global quick-fade trigger and opacity and persists across reload"
+  clock data
+  expect state st.settingsOpen == false
+  expect state st.peekTrigger == "rightCommand"
+  expect state st.peekAlpha == 0.5
+  expect state st.peekHold == true
+
+  tap "cmd-settings"
+  clock data
+  expect state st.settingsOpen == true
+  expect tree missing "settings-card"
+
+  tap "cmd-peek-25"
+  clock data
+  expect state st.peekAlpha == 0.25
+
+  tap "cmd-peek-inc"
+  clock data
+  expect state st.peekAlpha == 0.3
+
+  tap "cmd-peek-hotkey"
+  clock data
+  expect state st.peekTrigger == "hotkey"
+
+  tap "cmd-peek-toggle"
+  clock data
+  expect state st.peekHold == false
+
+  tap "cmd-settings-close"
+  clock data
+  expect state st.settingsOpen == false
+
+  reload
+  clock data
+  expect state st.peekTrigger == "hotkey"
+  expect state st.peekAlpha == 0.3
+  expect state st.peekHold == false

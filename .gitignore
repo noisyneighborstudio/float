@@ -1,5 +1,11 @@
 build/
-.DS_Store
 dist/
+dist.*/
 vendor/
+.vendor/
 node_modules/
+target/
+.exact/
+.env.local
+app.contract.d.ts
+*.DS_Store
