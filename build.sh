@@ -11,11 +11,17 @@ ID=com.sethwebster.${NAME:l}
 APP=${OUT:-build}/$NAME.app
 SIGN=${SIGN:-Developer ID Application: Seth Webster (P8ZBH5878Q)}
 VERSION=${VERSION:-0.0.0} BUILD=${BUILD:-0}
-EXACT2=${EXACT2:-/Users/sethwebster/Development/expo/exact2}
+if [[ -z ${EXACT2:-} ]]; then
+  for cand in "$HOME/Development/exact2-main" "$HOME/Development/expo/exact2" "$HOME/Development/exact2"; do
+    [[ -f "$cand/host/apple/build.mjs" ]] && { EXACT2="$cand"; break; }
+  done
+fi
+EXACT2=${EXACT2:-$HOME/Development/expo/exact2}
 
 # Prefer rustup's cargo and Bun 1.4.2 when present on this machine
 [[ -d "$HOME/.cargo/bin" ]] && export PATH="$HOME/.cargo/bin:$PATH"
 [[ -d "$HOME/.local/share/mise/installs/bun/1.4.2/bin" ]] && export PATH="$HOME/.local/share/mise/installs/bun/1.4.2/bin:$PATH"
+[[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
 BUN=${BUN:-$(command -v bun)}
 
 # Sparkle: pinned + checksummed; stored in .vendor/ so Exact's source baker skips its framework symlinks
