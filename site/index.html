@@ -1935,21 +1935,52 @@
 
   <script>
     (() => {
-      // ── 1. Hydrate latest GitHub release dynamically (fallback v1.1.0) ──
-      fetch("https://api.github.com/repos/noisyneighborstudio/float/releases/latest")
-        .then(r => r.ok ? r.json() : null)
-        .then(rel => {
-          if (!rel || !rel.tag_name) return;
-          const ver = rel.tag_name;
-          const asset = (rel.assets || []).find(a => /\.zip$/i.test(a.name));
-          const dl = asset ? asset.browser_download_url : rel.html_url;
-          const sizeMB = asset && asset.size ? (asset.size / (1024 * 1024)).toFixed(1) + " MB" : null;
-          document.querySelectorAll(".js-download-link").forEach(a => { a.href = dl; });
-          document.querySelectorAll(".js-release-url").forEach(a => { a.href = rel.html_url || a.href; });
-          document.querySelectorAll(".js-version, .js-version-short").forEach(el => { el.textContent = ver; });
-          if (sizeMB) document.querySelectorAll(".js-size").forEach(el => { el.textContent = sizeMB; });
+      // ── 1. Hydrate latest release dynamically (appcast.xml CDN first, GitHub API fallback) ──
+      function applyRelease({ tag, dl, sizeMB, releaseUrl }) {
+        if (dl) document.querySelectorAll(".js-download-link").forEach(a => { a.href = dl; });
+        if (releaseUrl) document.querySelectorAll(".js-release-url").forEach(a => { a.href = releaseUrl; });
+        if (tag) document.querySelectorAll(".js-version, .js-version-short").forEach(el => { el.textContent = tag; });
+        if (sizeMB) document.querySelectorAll(".js-size").forEach(el => { el.textContent = sizeMB; });
+      }
+
+      fetch("https://raw.githubusercontent.com/noisyneighborstudio/float/appcasts/appcast.xml")
+        .then(r => r.ok ? r.text() : null)
+        .then(xml => {
+          if (!xml) return false;
+          const doc = new DOMParser().parseFromString(xml, "application/xml");
+          const enc = doc.querySelector("item > enclosure");
+          if (!enc) return false;
+          const SPK = "http://www.andymatuschak.org/xml-namespaces/sparkle";
+          const ver = enc.getAttribute("sparkle:shortVersionString") || enc.getAttributeNS(SPK, "shortVersionString");
+          const dl = enc.getAttribute("url");
+          const bytes = Number(enc.getAttribute("length"));
+          if (!ver || !dl) return false;
+          const tag = ver.startsWith("v") ? ver : `v${ver}`;
+          applyRelease({
+            tag,
+            dl,
+            sizeMB: Number.isFinite(bytes) && bytes > 0 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : null,
+            releaseUrl: `https://github.com/noisyneighborstudio/float/releases/tag/${tag}`,
+          });
+          return true;
         })
-        .catch(() => {});
+        .catch(() => false)
+        .then(ok => {
+          if (ok) return;
+          return fetch("https://api.github.com/repos/noisyneighborstudio/float/releases/latest")
+            .then(r => r.ok ? r.json() : null)
+            .then(rel => {
+              if (!rel || !rel.tag_name) return;
+              const asset = (rel.assets || []).find(a => /\.zip$/i.test(a.name));
+              applyRelease({
+                tag: rel.tag_name,
+                dl: asset ? asset.browser_download_url : rel.html_url,
+                sizeMB: asset && asset.size ? `${(asset.size / (1024 * 1024)).toFixed(1)} MB` : null,
+                releaseUrl: rel.html_url,
+              });
+            })
+            .catch(() => {});
+        });
 
       // ── 2. Interactive macOS Float Demo ──
       const desktop = document.getElementById("desktop");

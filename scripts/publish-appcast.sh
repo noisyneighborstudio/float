@@ -58,3 +58,29 @@ git -C $pub -c user.name=github-actions -c user.email=github-actions@github.com 
 git -C $pub push --quiet $remote HEAD:appcasts
 rm -rf $pub
 echo "✓ Published $version → $FLOAT_FEED_URL"
+
+# update baked-in download version on main so Cloudflare Pages auto-deploys site/ (GITHUB_TOKEN push won't re-trigger Actions)
+site_pub=$(mktemp -d)
+trap 'rm -rf "$site_pub"' EXIT
+git clone --quiet --depth 10 --branch main $remote $site_pub
+node scripts/update-site-version.mjs \
+  --site-dir "$site_pub/site" \
+  --version "$version" \
+  --tag "$tag" \
+  --url "$url" \
+  --size "$size" \
+  --build "$build" \
+  --published "$published" \
+  --signature "$signature" \
+  --repo "$FLOAT_UPDATES_REPO"
+if ! git -C $site_pub diff --quiet -- site/ || [[ -n $(git -C $site_pub status --porcelain -- site/) ]]; then
+  git -C $site_pub add -- site/index.html site/latest.json
+  git -C $site_pub -c user.name=github-actions -c user.email=github-actions@github.com commit --quiet -m "chore(site): update download page to $tag"
+  pushed=0
+  for _ in 1 2 3; do
+    if git -C $site_pub push --quiet $remote HEAD:main; then pushed=1; break; fi
+    git -C $site_pub pull --quiet --rebase $remote main
+  done
+  (( pushed == 1 )) || { echo "✗ failed to push site version update to main" >&2; exit 1; }
+  echo "✓ Updated site/ on main → $tag"
+fi
