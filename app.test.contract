@@ -47,9 +47,24 @@ test "window toggles, opacity clamping, and video fill persist across reload"
   clock data
   expect state st.fill == true
   expect state st.onTop == true
+  expect state st.expanded == false
   expect state st.aspectLocked == false
   expect state st.clickThrough == false
   expect state st.alpha == 1
+
+  // Expand window toggles on and off, and docking exits expanded mode
+  tap "cmd-expand"
+  clock data
+  expect state st.expanded == true
+  tap "cmd-expand"
+  clock data
+  expect state st.expanded == false
+  tap "cmd-expand"
+  clock data
+  expect state st.expanded == true
+  tap "cmd-dock-0"
+  clock data
+  expect state st.expanded == false
 
   // Toggle video fill off
   tap "cmd-fill"
