@@ -13,6 +13,9 @@ if (existsSync(cargoBin) && !(process.env.PATH ?? '').startsWith(`${cargoBin}:`)
 if (!process.env.CARGO_HOME && !existsSync(resolve(home, '.cargo/hermes-lean-sys')) && existsSync(resolve(home, '.asdf/installs/rust/stable/hermes-lean-sys'))) {
   process.env.CARGO_HOME = resolve(home, '.asdf/installs/rust/stable');
 }
+if (!process.env.RUSTUP_HOME && !existsSync(resolve(home, '.rustup/toolchains')) && existsSync(resolve(home, '.asdf/installs/rust/stable/toolchains'))) {
+  process.env.RUSTUP_HOME = resolve(home, '.asdf/installs/rust/stable');
+}
 const candidates = [
   process.env.EXACT,
   process.env.EXACT2,

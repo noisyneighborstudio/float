@@ -19,13 +19,16 @@ if [[ -z ${EXACT2:-} ]]; then
 fi
 EXACT2=${EXACT2:-$HOME/Development/exact}
 
-# Prefer rustup/asdf cargo and Bun 1.4.2 when present on this machine
-[[ -d "$HOME/.cargo/bin" ]] && export PATH="$HOME/.cargo/bin:$PATH"
+# Prefer rustup cargo over asdf shims, and Bun 1.4.2 when present on this machine
 [[ -d "$HOME/.asdf/shims" ]] && export PATH="$HOME/.asdf/shims:$PATH"
+[[ -d "$HOME/.cargo/bin" ]] && export PATH="$HOME/.cargo/bin:$PATH"
 [[ -d "$HOME/.local/share/mise/installs/bun/1.4.2/bin" ]] && export PATH="$HOME/.local/share/mise/installs/bun/1.4.2/bin:$PATH"
 [[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
 if [[ -z ${CARGO_HOME:-} && ! -d "$HOME/.cargo/hermes-lean-sys" && -d "$HOME/.asdf/installs/rust/stable/hermes-lean-sys" ]]; then
   export CARGO_HOME="$HOME/.asdf/installs/rust/stable"
+fi
+if [[ -z ${RUSTUP_HOME:-} ]] && command -v rustup >/dev/null 2>&1; then
+  export RUSTUP_HOME="$(rustup show home)"
 fi
 BUN=${BUN:-$(command -v bun)}
 

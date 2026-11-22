@@ -111,6 +111,10 @@ jobs:
             git -C "$EXACT" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false reset --hard origin/main
           fi
           (cd "$EXACT" && rustc --version && bun install --frozen-lockfile)
+          if [[ -z "${RUSTUP_HOME:-}" ]] && command -v rustup >/dev/null 2>&1; then
+            RUSTUP_HOME="$(cd "$EXACT" && rustup show home)"
+            echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          fi
           EXACT_SHA="$(git -C "$EXACT" rev-parse --short HEAD)"
           echo "EXACT=$EXACT" >> "$GITHUB_ENV"
           echo "EXACT2=$EXACT" >> "$GITHUB_ENV"
