@@ -1,4 +1,4 @@
-// Float: chromeless, always-on-top macOS video browser built with Exact.
+// Float: chromeless, always-on-top video browser built with Exact.
 routes nav
   home "/"
   open "/open"
@@ -35,6 +35,8 @@ shape FloatState
   shortcutsOpen: bool
   peekPermissionGranted: bool
   canCheckUpdates: bool
+  nativeBackdrop: bool
+  browserFrame: string
   hasResume: bool
   resumeUrl: string
   resumeTitle: string
@@ -51,8 +53,8 @@ fn pad2(n: number): string = n < 10 ? `0${n}` : `${n}`
 
 fn fmtTime(sec: number): string = (
   floor(sec / 3600) > 0
-    ? `${floor(sec / 3600)}:${pad2(floor((sec - floor(sec / 3600) * 3600) / 60))}:${pad2(floor(sec) - floor(sec / 60) * 60)}`
-    : `${floor(sec / 60)}:${pad2(floor(sec) - floor(sec / 60) * 60)}`
+  ? `${floor(sec / 3600)}:${pad2(floor((sec - floor(sec / 3600) * 3600) / 60))}:${pad2(floor(sec) - floor(sec / 60) * 60)}`
+  : `${floor(sec / 60)}:${pad2(floor(sec) - floor(sec / 60) * 60)}`
 )
 
 fn tileX(idx: number, cols: number): number = (idx - floor(idx / cols) * cols) * 140
@@ -63,10 +65,10 @@ style TileButton
   width="100%"
   height="100%"
   border-radius=12
-  background-color="rgba(255, 255, 255, 0.08)"
+  background-color="-exact-tertiary-fill"
   border-width=1
   border-style="solid"
-  border-color="rgba(255, 255, 255, 0.14)"
+  border-color="-exact-separator"
   display="flex"
   flex-direction="column"
   align-items="center"
@@ -74,10 +76,10 @@ style TileButton
   gap=8
   padding=8
   box-sizing="border-box"
-  color="#e8e8ea"
+  color="-exact-label"
   transition="scale 150ms ease, background-color 150ms ease"
   :hover
-    background-color="rgba(255, 255, 255, 0.16)"
+    background-color="-exact-fill"
 
 style ResumeCard
   display="flex"
@@ -90,16 +92,17 @@ style ResumeCard
   padding-left=16
   padding-right=16
   border-radius=14
-  color="#e8e8ea"
+  color="-exact-label"
+  background-color="-exact-secondary-fill"
   background-image="linear-gradient(135deg, rgba(20, 160, 160, 0.28), rgba(255, 255, 255, 0.05))"
   border-width=1
   border-style="solid"
-  border-color="rgba(80, 220, 220, 0.25)"
+  border-color="-exact-separator"
   transition="background-color 150ms ease"
   width="100%"
   box-sizing="border-box"
   :hover
-    background-color="rgba(20, 160, 160, 0.14)"
+    background-color="-exact-fill"
 
 style RemoveBtn
   position="absolute"
@@ -111,19 +114,48 @@ style RemoveBtn
   display="flex"
   align-items="center"
   justify-content="center"
-  background-color="rgba(0, 0, 0, 0.6)"
-  color="#dddddd"
+  background-color="-exact-secondary-background"
+  color="-exact-label"
   font-size=13
   :hover
-    background-color="rgba(0, 0, 0, 0.9)"
+    background-color="-exact-tertiary-background"
+
+style OverlaySheet
+  position="absolute"
+  top=36
+  left=24
+  right=24
+  z-index=35
+  padding=16
+  border-radius=14
+  background-color="-exact-secondary-background"
+  border-width=1
+  border-style="solid"
+  border-color="-exact-separator"
+  box-sizing="border-box"
+  display="flex"
+  flex-direction="column"
+  gap=12
+
+style KeyBadge
+  padding-top=2
+  padding-bottom=2
+  padding-left=6
+  padding-right=6
+  border-radius=5
+  background-color="-exact-secondary-fill"
+  border-width=1
+  border-style="solid"
+  border-color="-exact-separator"
 
 component Float
   state urlOpen = false
   state urlDraft = ""
   state selectSeq = 0
   state hoveredHost = ""
-  state brokenIcons: string[] = []
-  state brokenResumeIcon = false
+  state prevFrame = ""
+  state shownFrame = ""
+  state browserDragging = false
 
   resource vp = exactViewport() as shape Viewport
   resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, shortcutsOpen=false, peekPermissionGranted=true)
@@ -132,20 +164,56 @@ component Float
   derive isHome = st.mode == "home"
   derive hasSites = st.sites.length > 0
   derive isEmpty = not st.hasResume and not hasSites
-  derive gridInnerW = max(128, (vp.width > 0 ? vp.width : 640) - 32)
+  derive vpW = vp.width > 0 ? vp.width : 640
+  derive vpH = vp.height > 0 ? vp.height : 360
+  derive gridInnerW = max(128, vpW - 32)
   derive gridCols = max(1, floor((gridInnerW + 12) / 140))
   derive gridRows = st.sites.length > 0 ? floor((st.sites.length + gridCols - 1) / gridCols) : 0
   derive gridHeight = gridRows > 0 ? gridRows * 80 + (gridRows - 1) * 12 : 0
   derive resumeProgress = st.resumeDuration > 0 ? min(100, (st.resumeTime / st.resumeDuration) * 100) : 0
   derive resumeSubtitle = (
     st.resumeDuration > 0
-      ? `${fmtTime(st.resumeTime)} of ${fmtTime(st.resumeDuration)} · ${st.resumeHost}`
-      : st.resumeHost
+    ? `${fmtTime(st.resumeTime)} of ${fmtTime(st.resumeDuration)} · ${st.resumeHost}`
+    : st.resumeHost
   )
   derive hotkeyMenuTitle = `Show/Hide Hotkey: ${st.hotkeyLabel != "" ? st.hotkeyLabel : "None"}…`
+  derive peekPercent = `${round(st.peekAlpha * 100)}%`
 
   task onLaunch mount
     after(1, checkInitialRoute)
+
+  task onBrowserTick mount
+    every(120, pollBrowserFrame)
+
+  action pollBrowserFrame
+    if not isHome and st.browserFrame != ""
+      if st.browserFrame != shownFrame
+        let wasEmpty = shownFrame == ""
+        prevFrame = shownFrame
+        shownFrame = st.browserFrame
+        if wasEmpty and not urlOpen
+          focus("linux-browser")
+      refresh st
+
+  action browserDown(e: PointerEvent)
+    if not urlOpen
+      browserDragging = true
+      focus("linux-browser")
+      send cmd = runFloatCommand("pointerDown", `${e.offsetX / vpW},${e.offsetY / vpH}`)
+
+  action browserMove(e: PointerEvent)
+    if browserDragging and not urlOpen
+      send cmd = runFloatCommand("pointerMove", `${e.offsetX / vpW},${e.offsetY / vpH}`)
+
+  action browserUp(e: PointerEvent)
+    if browserDragging
+      browserDragging = false
+      send cmd = runFloatCommand("pointerUp", `${e.offsetX / vpW},${e.offsetY / vpH}`)
+
+  action browserKey(k: string, e: KeyboardEvent)
+    if not urlOpen and k != "Shift" and k != "Control" and k != "Meta" and k != "Alt" and k != "AltGraph" and k != "CapsLock"
+      let mods = `${e.ctrlKey ? "C" : ""}${e.metaKey ? "M" : ""}${e.altKey ? "A" : ""}${e.shiftKey ? "S" : ""}`
+      send cmd = runFloatCommand("key", `${mods}:${k}`)
 
   action checkInitialRoute
     let topEntry = top(nav)
@@ -170,6 +238,9 @@ component Float
 
   action showHome
     urlOpen = false
+    browserDragging = false
+    prevFrame = ""
+    shownFrame = ""
     send cmd = runFloatCommand("showHome", "")
 
   action resumeLast
@@ -179,10 +250,12 @@ component Float
   action openUrlBar
     if st.shortcutsOpen
       send cmd = runFloatCommand("closeShortcuts", "")
-    urlDraft = st.mode == "web" ? st.currentUrl : ""
+    let nextDraft = st.mode == "web" ? st.currentUrl : ""
+    urlDraft = nextDraft
     urlOpen = true
     selectSeq = selectSeq + 1
     focus("url-input")
+    setSelectionRange("url-input", 0, nextDraft.length)
 
   action toggleShortcuts
     urlOpen = false
@@ -220,14 +293,27 @@ component Float
       send cmd = runFloatCommand("load", target)
     else
       send cmd = runFloatCommand("focusWeb", "")
+    if st.browserFrame != ""
+      focus("linux-browser")
 
   action cancelUrl
     urlOpen = false
     send cmd = runFloatCommand("focusWeb", "")
+    if not isHome and st.browserFrame != ""
+      focus("linux-browser")
 
-  action urlKeyDown(k: string)
+  action urlKeyDown(k: string, e: KeyboardEvent)
     if k == "Escape"
       cancelUrl()
+    else if (e.ctrlKey or e.metaKey) and (k == "a" or k == "A")
+      setSelectionRange("url-input", 0, urlDraft.length)
+    else if (e.metaKey and k == "Backspace") or (e.ctrlKey and (k == "u" or k == "U"))
+      urlDraft = ""
+      setSelectionRange("url-input", 0, 0)
+    else if e.metaKey and k == "ArrowLeft"
+      setSelectionRange("url-input", 0, 0)
+    else if e.metaKey and k == "ArrowRight"
+      setSelectionRange("url-input", urlDraft.length, urlDraft.length)
 
   action openSite(url: string)
     urlOpen = false
@@ -242,13 +328,6 @@ component Float
     else
       if hoveredHost == host
         hoveredHost = ""
-
-  action markIconBroken(host: string)
-    if not brokenIcons.includes(host)
-      brokenIcons = brokenIcons.concat([host])
-
-  action markResumeIconBroken
-    brokenResumeIcon = true
 
   action openClipboard
     urlOpen = false
@@ -301,125 +380,540 @@ component Float
     main testId="float-root"
       viewport-fit="cover"
       color-scheme="dark"
+      accent-color="light-dark(#0f766e, #3fd0d0)"
       navigationKey=`${top(nav).id}`
       navigate=handleNavigate
-      -exact-menu-remove="close-all show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows autofill paste-and-match-style find spelling-and-grammar substitutions transformations app-help actual-size zoom-in zoom-out back forward develop"
+      -exact-menu-remove="close-all show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows paste-and-match-style find spelling-and-grammar substitutions transformations app-help actual-size zoom-in zoom-out back forward develop"
       position="relative"
       width="100%"
       height="100%"
       overflow="hidden"
-      background-color=(isHome ? "transparent" : "#000000")
-      color="#e8e8ea"
-      font-family="system-ui"
+      background-color=(isHome and st.nativeBackdrop ? "transparent" : "-exact-background")
+      color="-exact-label"
       font-size=13
       user-select="none"
 
       // Native WKWebView: always mounted to preserve back/forward history and media session
-      float-browser id="browser" testId="browser" mode=st.mode message=onBrowserMessage
-        position="absolute" inset=0 width="100%" height="100%" z-index=1
+      float-browser id="browser"
+        testId="browser"
+        mode=st.mode
+        message=onBrowserMessage
+        position="absolute"
+        inset=0
+        width="100%"
+        height="100%"
+        z-index=1
+
+      // Linux / non-native live browser bridge surface (when running with linux-browser-bridge)
+      if not isHome and not st.nativeBackdrop
+        if st.browserFrame != ""
+          view id="linux-browser"
+            testId="linux-browser"
+            position="absolute"
+            inset=0
+            width="100%"
+            height="100%"
+            z-index=5
+            tabindex=0
+            pointerdown=browserDown
+            pointermove=browserMove
+            pointerup=browserUp
+            key=browserKey
+            opacity=st.alpha
+            background-color="-exact-background"
+            if prevFrame != ""
+              image prevFrame position="absolute"
+                inset=0
+                width="100%"
+                height="100%"
+                object-fit="fill"
+            image st.browserFrame position="absolute"
+              inset=0
+              width="100%"
+              height="100%"
+              object-fit="fill"
+        else
+          column testId="linux-web-placeholder"
+            position="absolute"
+            inset=0
+            z-index=5
+            align-items="center"
+            justify-content="center"
+            gap=6
+            padding=24
+            background-color="-exact-background"
+            text st.currentUrl color="-exact-label" font-size=14 text-align="center"
+            text "Press ⌘⇧H for Home · ⌘L to open another URL" color="-exact-secondary-label"
+              font-size=12
+              text-align="center"
 
       // Home screen: Resume card + Site mosaic grid + Empty state (over native macOS Liquid Glass backdrop)
       if isHome
-        scroll testId="home-screen" position="absolute" inset=0 width="100%" height="100%" z-index=10
-          background-color="transparent"
-          padding-top=30 padding-left=16 padding-right=16 padding-bottom=16
+        scroll testId="home-screen"
+          position="absolute"
+          inset=0
+          width="100%"
+          height="100%"
+          z-index=10
+          background-color=(st.nativeBackdrop ? "transparent" : "-exact-background")
+          background-image=(st.nativeBackdrop ? "none" : "linear-gradient(180deg, #1c1d22 0%, #0b0b0d 70%)")
+          padding-top=30
+          padding-left=16
+          padding-right=16
+          padding-bottom=16
           box-sizing="border-box"
 
           if isEmpty
-            column testId="empty-state" position="absolute" inset=0
-              align-items="center" justify-content="center" gap=4 padding=16
-              text "Video sites you watch will show up here." color="rgba(255, 255, 255, 0.72)" font-size=13 text-align="center"
+            column testId="empty-state"
+              position="absolute"
+              inset=0
+              align-items="center"
+              justify-content="center"
+              gap=4
+              padding=16
+              text "Video sites you watch will show up here." color="-exact-secondary-label"
+                font-size=13
+                text-align="center"
               row align-items="center" justify-content="center" gap=4
-                text "Press" color="rgba(255, 255, 255, 0.72)" font-size=13
-                view padding-top=1 padding-bottom=1 padding-left=6 padding-right=6
-                  border-radius=5 background-color="rgba(255, 255, 255, 0.14)"
-                  border-width=1 border-style="solid" border-color="rgba(255, 255, 255, 0.22)"
-                  text "⌘L" color="#f5f5f7" font-size=13 testId="empty-shortcut"
-                text "to open a URL." color="rgba(255, 255, 255, 0.72)" font-size=13
+                text "Press" color="-exact-secondary-label" font-size=13
+                view class=KeyBadge
+                  text "⌘L" color="-exact-label" font-size=13 testId="empty-shortcut"
+                text "to open a URL." color="-exact-secondary-label" font-size=13
           else
             column width="100%"
               if st.hasResume
-                button appearance="none" class=ResumeCard press=resumeLast testId="resume-card"
+                button appearance="none"
+                  class=ResumeCard
+                  press=resumeLast
+                  testId="resume-card"
                   aria-label=`Resume ${st.resumeTitle}`
-                  if st.resumeIcon != "" and not brokenResumeIcon
-                    image st.resumeIcon width=40 height=40 border-radius=9 object-fit="contain" flex-shrink=0
+                  if st.resumeIcon != ""
+                    image st.resumeIcon width=40
+                      height=40
+                      border-radius=9
+                      object-fit="contain"
+                      flex-shrink=0
                   column flex=1 min-width=0 gap=2 align-items="flex-start"
-                    text "RESUME" font-size=11 letter-spacing=0.88 color="#7fd8d8" font-weight=500
-                    text st.resumeTitle font-size=15 font-weight=600 color="#e8e8ea" line-clamp=1 testId="resume-title"
-                    text resumeSubtitle font-size=12 color="rgba(255, 255, 255, 0.70)" line-clamp=1 testId="resume-sub"
+                    text "RESUME" font-size=11
+                      letter-spacing=0.88
+                      color="-exact-system-teal"
+                      font-weight=500
+                    text st.resumeTitle font-size=15
+                      font-weight=600
+                      color="-exact-label"
+                      line-clamp=1
+                      testId="resume-title"
+                    text resumeSubtitle font-size=12
+                      color="-exact-secondary-label"
+                      line-clamp=1
+                      testId="resume-sub"
                     if st.resumeDuration > 0
-                      view width="100%" height=3 border-radius=2 background-color="rgba(255, 255, 255, 0.12)" margin-top=6 overflow="hidden"
-                        view height="100%" width=`${resumeProgress}%` background-color="#3fd0d0" testId="resume-progress"
-                  view width=34 height=34 border-radius=17 background-color="#3fd0d0" flex-shrink=0
-                    display="flex" align-items="center" justify-content="center" padding-left=3 box-sizing="border-box"
-                    text "▶" font-size=14 color="#062424"
+                      view width="100%"
+                        height=3
+                        border-radius=2
+                        background-color="-exact-secondary-fill"
+                        margin-top=6
+                        overflow="hidden"
+                        view height="100%"
+                          width=`${resumeProgress}%`
+                          background-color="AccentColor"
+                          testId="resume-progress"
+                  view width=34
+                    height=34
+                    border-radius=17
+                    background-color="AccentColor"
+                    flex-shrink=0
+                    display="flex"
+                    align-items="center"
+                    justify-content="center"
+                    padding-left=3
+                    box-sizing="border-box"
+                    text "▶" font-size=14 color="AccentColorText"
 
               if hasSites
                 view testId="site-grid" position="relative" width="100%" height=gridHeight
                   for site, idx in st.sites key=site.host
-                    view position="absolute" top=0 left=0 width=128 height=80
+                    view position="absolute"
+                      top=0
+                      left=0
+                      width=128
+                      height=80
                       translate=`${tileX(idx, gridCols)}px ${tileY(idx, gridCols)}px`
                       transition=(vp.prefersReducedMotion ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
-                      hover=hoverTile(site.host) testId=`tile-wrap-${site.host}`
-                      button appearance="none" class=TileButton press=openSite(site.url)
+                      hover=hoverTile(site.host)
+                      testId=`tile-wrap-${site.host}`
+                      button appearance="none"
+                        class=TileButton
+                        press=openSite(site.url)
                         scale=(hoveredHost == site.host ? 1.03 : 1)
-                        title=site.host aria-label=site.name testId=`tile-${site.host}`
-                        if site.icon != "" and not brokenIcons.includes(site.host)
+                        title=site.host
+                        aria-label=site.name
+                        testId=`tile-${site.host}`
+                        if site.icon != ""
                           image site.icon width=40 height=40 border-radius=9 object-fit="contain"
                         else
-                          view width=40 height=40 border-radius=9 background-color="rgba(255, 255, 255, 0.14)"
-                            display="flex" align-items="center" justify-content="center"
-                            text site.initial font-size=20 font-weight=600 color="#e8e8ea"
-                        text site.name font-weight=500 font-size=13 color="#e8e8ea" max-width="90%" line-clamp=1 testId=`tile-name-${site.host}`
-                      button appearance="none" class=RemoveBtn press=removeSite(site.host)
+                          view width=40
+                            height=40
+                            border-radius=9
+                            background-color="-exact-secondary-fill"
+                            display="flex"
+                            align-items="center"
+                            justify-content="center"
+                            text site.initial font-size=20 font-weight=600 color="-exact-label"
+                        text site.name font-weight=500
+                          font-size=13
+                          color="-exact-label"
+                          max-width="90%"
+                          line-clamp=1
+                          testId=`tile-name-${site.host}`
+                      button appearance="none"
+                        class=RemoveBtn
+                        press=removeSite(site.host)
                         opacity=(hoveredHost == site.host ? 1 : 0)
-                        aria-label=`Remove ${site.name}` title="Remove" testId=`remove-${site.host}`
+                        aria-label=`Remove ${site.name}`
+                        title="Remove"
+                        testId=`remove-${site.host}`
                         text "×"
 
       // Top-edge 18px drag strip: hover reveals, drag moves window, double-click locks video aspect
-      float-drag-strip id="drag-strip" testId="drag-strip"
-        position="absolute" top=0 left=0 right=0 height=18 z-index=20
+      float-drag-strip id="drag-strip"
+        testId="drag-strip"
+        position="absolute"
+        top=0
+        left=0
+        right=0
+        height=18
+        z-index=20
 
       // Floating URL / search bar overlay (⌘L)
       if urlOpen
         view testId="url-bar" position="absolute" top=24 left=10 right=10 z-index=30
-          input id="url-input" testId="url-input"
-            hatch="url-input" data-select-seq=`${selectSeq}`
-            value=urlDraft input=editUrl submit=submitUrl key=urlKeyDown
+          input id="url-input"
+            testId="url-input"
+            hatch="url-input"
+            data-select-seq=`${selectSeq}`
+            value=urlDraft
+            input=editUrl
+            submit=submitUrl
+            key=urlKeyDown
             placeholder="URL or search — Enter to go, Esc to cancel"
             aria-label="Location"
             autofocus=true
-            width="100%" font-size=13 box-sizing="border-box"
+            width="100%"
+            font-size=13
+            box-sizing="border-box"
 
-      // Mac menu bar & keyboard shortcut declarations (invisible strip clear of window edges; active across Home and Web)
+      // Non-native Settings sheet (macOS uses its native Liquid Glass Settings NSPanel)
+      if st.settingsOpen and not st.nativeBackdrop
+        column class=OverlaySheet testId="linux-settings"
+          row align-items="center" justify-content="space-between"
+            text "Settings" role="heading" aria-level=3
+            button press=closeSettings aria-label="Close Settings"
+              text "Done"
+          row align-items="center" justify-content="space-between" gap=12
+            text "Quick Fade Opacity" color="-exact-secondary-label"
+            row align-items="center" gap=6
+              button press=stepPeekAlpha(-0.05) aria-label="Decrease Quick Fade Opacity"
+                text "−"
+              text peekPercent font-weight=600
+              button press=stepPeekAlpha(0.05) aria-label="Increase Quick Fade Opacity"
+                text "+"
+          row align-items="center" justify-content="space-between" gap=12
+            text "Video Fill" color="-exact-secondary-label"
+            button press=toggleFill
+              text (st.fill ? "On" : "Off")
+
+      // Non-native Keyboard Shortcuts HUD (macOS uses its native Liquid Glass Shortcuts NSPanel)
+      if st.shortcutsOpen and not st.nativeBackdrop
+        column class=OverlaySheet testId="linux-shortcuts"
+          row align-items="center" justify-content="space-between"
+            text "Keyboard Shortcuts" role="heading" aria-level=3
+            button press=closeShortcuts aria-label="Close Shortcuts"
+              text "Done"
+          row align-items="center" justify-content="space-between"
+            text "Open URL / Search" color="-exact-secondary-label"
+            view class=KeyBadge
+              text "⌘L"
+          row align-items="center" justify-content="space-between"
+            text "Open URL from Clipboard" color="-exact-secondary-label"
+            view class=KeyBadge
+              text "⇧⌘V"
+          row align-items="center" justify-content="space-between"
+            text "Home / Resume Last" color="-exact-secondary-label"
+            view class=KeyBadge
+              text "⇧⌘H · ⇧⌘R"
+          row align-items="center" justify-content="space-between"
+            text "Toggle Video Fill" color="-exact-secondary-label"
+            view class=KeyBadge
+              text "⇧⌘F"
+          row align-items="center" justify-content="space-between"
+            text "Play / Pause" color="-exact-secondary-label"
+            view class=KeyBadge
+              text "⌃Space"
+          row align-items="center" justify-content="space-between"
+            text "Opacity" color="-exact-secondary-label"
+            view class=KeyBadge
+              text "⌘- · ⌘="
+
+      // Menu bar & keyboard shortcut declarations (invisible strip clear of window edges; active across Home and Web)
       row position="absolute" bottom=12 left=24 height=4 opacity=0 z-index=25
-        button appearance="none" width=4 height=4 overflow="hidden" press=checkForUpdates -exact-menu="about" disabled=(not st.canCheckUpdates) aria-label="Check for Updates…" testId="cmd-updates"
-        button appearance="none" width=4 height=4 overflow="hidden" press=openSettings -exact-menu="app" aria-keyshortcuts="Meta+," aria-label="Settings…" testId="cmd-settings"
-        button appearance="none" width=4 height=4 overflow="hidden" press=recordHotKey -exact-menu="app" aria-label=hotkeyMenuTitle testId="cmd-hotkey"
-        button appearance="none" width=4 height=4 overflow="hidden" press=showHome -exact-menu="view" aria-keyshortcuts="Meta+Shift+H" aria-label="Home" testId="cmd-home"
-        button appearance="none" width=4 height=4 overflow="hidden" press=resumeLast -exact-menu="view" aria-keyshortcuts="Meta+Shift+R" aria-label="Resume Last" testId="cmd-resume"
-        button appearance="none" width=4 height=4 overflow="hidden" press=openUrlBar -exact-menu="view" aria-keyshortcuts="Meta+L" aria-label="Open Location…" testId="cmd-open-url"
-        button appearance="none" width=4 height=4 overflow="hidden" press=openClipboard -exact-menu="view" aria-keyshortcuts="Meta+Shift+V" aria-label="Open URL from Clipboard" testId="cmd-clipboard"
-        button appearance="none" width=4 height=4 overflow="hidden" press=reloadPage -exact-menu="view" aria-keyshortcuts="Meta+R" aria-label="Reload" testId="cmd-reload"
-        button appearance="none" width=4 height=4 overflow="hidden" press=goBack -exact-menu="view" aria-keyshortcuts="Meta+[" aria-label="Back" testId="cmd-back"
-        button appearance="none" width=4 height=4 overflow="hidden" press=goForward -exact-menu="view" aria-keyshortcuts="Meta+]" aria-label="Forward" testId="cmd-forward"
-        button appearance="none" width=4 height=4 overflow="hidden" press=toggleFill -exact-menu="view" aria-keyshortcuts="Meta+Shift+F" aria-selected=st.fill aria-label="Toggle Video Fill" testId="cmd-fill"
-        button appearance="none" width=4 height=4 overflow="hidden" press=toggleAspectLock -exact-menu="view" aria-keyshortcuts="Meta+Shift+A" aria-selected=st.aspectLocked aria-label="Lock to Video Aspect" testId="cmd-aspect"
-        button appearance="none" width=4 height=4 overflow="hidden" press=toggleTop -exact-menu="view" aria-keyshortcuts="Meta+T" aria-selected=st.onTop aria-label="Toggle Always on Top" testId="cmd-top"
-        button appearance="none" width=4 height=4 overflow="hidden" press=toggleClickThrough -exact-menu="view" aria-keyshortcuts="Meta+Shift+K" aria-selected=st.clickThrough aria-label="Toggle Click-Through" testId="cmd-click-through"
-        button appearance="none" width=4 height=4 overflow="hidden" press=fadeOut -exact-menu="view" aria-keyshortcuts="Meta+-" aria-label="More Transparent" testId="cmd-fade-out"
-        button appearance="none" width=4 height=4 overflow="hidden" press=fadeIn -exact-menu="view" aria-keyshortcuts="Meta+=" aria-label="Less Transparent" testId="cmd-fade-in"
-        button appearance="none" width=4 height=4 overflow="hidden" press=playPause -exact-menu="view" aria-keyshortcuts="Control+Space" aria-label="Play / Pause" testId="cmd-play-pause"
-        button appearance="none" width=4 height=4 overflow="hidden" press=toggleShortcuts -exact-menu="view" aria-label="Keyboard Shortcuts" testId="cmd-shortcuts"
-        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("0") -exact-menu="none" aria-label="Top Left" testId="cmd-dock-0"
-        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("1") -exact-menu="none" aria-label="Top Center" testId="cmd-dock-1"
-        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("2") -exact-menu="none" aria-label="Top Right" testId="cmd-dock-2"
-        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("3") -exact-menu="none" aria-label="Bottom Left" testId="cmd-dock-3"
-        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("4") -exact-menu="none" aria-label="Bottom Center" testId="cmd-dock-4"
-        button appearance="none" width=4 height=4 overflow="hidden" press=dockPosition("5") -exact-menu="none" aria-label="Bottom Right" testId="cmd-dock-5"
-        button appearance="none" width=4 height=4 overflow="hidden" press=closeSettings -exact-menu="none" aria-label="Close Settings" testId="cmd-settings-close"
-        button appearance="none" width=4 height=4 overflow="hidden" press=setPeekAlpha("0.25") -exact-menu="none" aria-label="Peek 25%" testId="cmd-peek-25"
-        button appearance="none" width=4 height=4 overflow="hidden" press=stepPeekAlpha(0.05) -exact-menu="none" aria-label="Peek +5%" testId="cmd-peek-inc"
-        button appearance="none" width=4 height=4 overflow="hidden" press=setPeekTrigger("hotkey") -exact-menu="none" aria-label="Peek Hotkey" testId="cmd-peek-hotkey"
-        button appearance="none" width=4 height=4 overflow="hidden" press=setPeekHold("false") -exact-menu="none" aria-label="Peek Toggle" testId="cmd-peek-toggle"
-        button appearance="none" width=4 height=4 overflow="hidden" press=closeShortcuts -exact-menu="none" aria-label="Close Shortcuts" testId="cmd-shortcuts-close"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=checkForUpdates
+          -exact-menu="about"
+          disabled=(not st.canCheckUpdates)
+          aria-label="Check for Updates…"
+          testId="cmd-updates"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=openSettings
+          -exact-menu="app"
+          aria-keyshortcuts="Meta+,"
+          aria-label="Settings…"
+          testId="cmd-settings"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=recordHotKey
+          -exact-menu="app"
+          aria-label=hotkeyMenuTitle
+          testId="cmd-hotkey"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=showHome
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+Shift+H"
+          aria-label="Home"
+          testId="cmd-home"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=resumeLast
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+Shift+R"
+          aria-label="Resume Last"
+          testId="cmd-resume"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=openUrlBar
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+L"
+          aria-label="Open Location…"
+          testId="cmd-open-url"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=openClipboard
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+Shift+V"
+          aria-label="Open URL from Clipboard"
+          testId="cmd-clipboard"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=reloadPage
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+R"
+          aria-label="Reload"
+          testId="cmd-reload"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=goBack
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+["
+          aria-label="Back"
+          testId="cmd-back"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=goForward
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+]"
+          aria-label="Forward"
+          testId="cmd-forward"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=toggleFill
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+Shift+F"
+          aria-selected=st.fill
+          aria-label="Toggle Video Fill"
+          testId="cmd-fill"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=toggleAspectLock
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+Shift+A"
+          aria-selected=st.aspectLocked
+          aria-label="Lock to Video Aspect"
+          testId="cmd-aspect"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=toggleTop
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+T"
+          aria-selected=st.onTop
+          aria-label="Toggle Always on Top"
+          testId="cmd-top"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=toggleClickThrough
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+Shift+K"
+          aria-selected=st.clickThrough
+          aria-label="Toggle Click-Through"
+          testId="cmd-click-through"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=fadeOut
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+-"
+          aria-label="More Transparent"
+          testId="cmd-fade-out"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=fadeIn
+          -exact-menu="view"
+          aria-keyshortcuts="Meta+="
+          aria-label="Less Transparent"
+          testId="cmd-fade-in"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=playPause
+          -exact-menu="view"
+          aria-keyshortcuts="Control+Space"
+          aria-label="Play / Pause"
+          testId="cmd-play-pause"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=toggleShortcuts
+          -exact-menu="view"
+          aria-label="Keyboard Shortcuts"
+          testId="cmd-shortcuts"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=dockPosition("0")
+          -exact-menu="none"
+          aria-label="Top Left"
+          testId="cmd-dock-0"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=dockPosition("1")
+          -exact-menu="none"
+          aria-label="Top Center"
+          testId="cmd-dock-1"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=dockPosition("2")
+          -exact-menu="none"
+          aria-label="Top Right"
+          testId="cmd-dock-2"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=dockPosition("3")
+          -exact-menu="none"
+          aria-label="Bottom Left"
+          testId="cmd-dock-3"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=dockPosition("4")
+          -exact-menu="none"
+          aria-label="Bottom Center"
+          testId="cmd-dock-4"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=dockPosition("5")
+          -exact-menu="none"
+          aria-label="Bottom Right"
+          testId="cmd-dock-5"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=closeSettings
+          -exact-menu="none"
+          aria-label="Close Settings"
+          testId="cmd-settings-close"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=setPeekAlpha("0.25")
+          -exact-menu="none"
+          aria-label="Peek 25%"
+          testId="cmd-peek-25"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=stepPeekAlpha(0.05)
+          -exact-menu="none"
+          aria-label="Peek +5%"
+          testId="cmd-peek-inc"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=setPeekTrigger("hotkey")
+          -exact-menu="none"
+          aria-label="Peek Hotkey"
+          testId="cmd-peek-hotkey"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=setPeekHold("false")
+          -exact-menu="none"
+          aria-label="Peek Toggle"
+          testId="cmd-peek-toggle"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=closeShortcuts
+          -exact-menu="none"
+          aria-label="Close Shortcuts"
+          testId="cmd-shortcuts-close"

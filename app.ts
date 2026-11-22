@@ -1,12 +1,28 @@
 import type { Answer, Result, Sources, Storage } from './app.contract.d.ts';
 
 export const appId = 'com.sethwebster.float';
-export const grants = 'fs.read app:/data/float.json\nfs.write app:/data/float.json';
+export const grants = [
+  'fs.read app:/data/float.json',
+  'fs.write app:/data/float.json',
+  'fs.read app:/data/linux-bridge.txt',
+  'net.fetch http://127.0.0.1:17420',
+].join('\n');
 
 type FloatState = Result<'loadFloatState'>;
 type Site = FloatState['sites'][number];
 
 const STORE_FILE = 'app:/data/float.json';
+const BRIDGE_FILE = 'app:/data/linux-bridge.txt';
+
+async function readBridgeUrl(storage: Storage): Promise<string | null> {
+  try {
+    const bytes = await storage.fs.readFile(BRIDGE_FILE);
+    const url = new TextDecoder().decode(bytes).trim();
+    return url.startsWith('http://127.0.0.1:') ? url.replace(/\/+$/, '') : null;
+  } catch {
+    return null;
+  }
+}
 
 interface PersistedFallback {
   mode: string;
@@ -194,6 +210,8 @@ function toFloatState(p: PersistedFallback): FloatState {
     shortcutsOpen: p.shortcutsOpen,
     peekPermissionGranted: true,
     canCheckUpdates: false,
+    nativeBackdrop: false,
+    browserFrame: '',
     hasResume,
     resumeUrl,
     resumeTitle,
@@ -378,6 +396,15 @@ const sources: Sources = {
         // Web module has no sync call; fall back to local store on web.
       }
     }
+    const bridge = await readBridgeUrl(storage);
+    if (bridge) {
+      try {
+        const res = await fetch(`${bridge}/state`);
+        if (res.ok) return (await res.json()) as FloatState;
+      } catch {
+        // Bridge unavailable; fall back to local store.
+      }
+    }
     return toFloatState(await readFallback(storage));
   },
   runFloatCommand: async ([op, arg], _store, storage, native) => {
@@ -386,6 +413,19 @@ const sources: Sources = {
         return native.call({ op, arg }) as Result<'runFloatCommand'>;
       } catch {
         // Fall through to storage fallback when running on web without native call.
+      }
+    }
+    const bridge = await readBridgeUrl(storage);
+    if (bridge) {
+      try {
+        const res = await fetch(`${bridge}/cmd`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ op, arg }),
+        });
+        if (res.ok) return (await res.json()) as Result<'runFloatCommand'>;
+      } catch {
+        // Bridge unavailable; fall back to local store.
       }
     }
     return runFallbackCommand(op, arg, storage);

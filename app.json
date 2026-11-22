@@ -1,12 +1,14 @@
 {
-  "$schema": "/Users/sethwebster/Development/expo/exact2/scripts/app.schema.json",
+  "$schema": "/Users/sethwebster/Development/exact/scripts/app.schema.json",
   "name": "Float",
   "short_name": "Float",
   "id": "com.sethwebster.float",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0b0b0d",
-  "background_color_dark": "#0b0b0d",
+  "color_scheme_dark": {
+    "background_color": "#0b0b0d"
+  },
   "app": {
     "id": "com.sethwebster.float",
     "name": "Float",
@@ -36,6 +38,7 @@
   ],
   "host": {
     "web": {},
+    "linux": {},
     "macos": {
       "icon": "Float.icon",
       "minimumOS": "14.0",
@@ -53,6 +56,7 @@
   "deploy": {
     "store": {
       "web": "0",
+      "linux": "0",
       "macos": "0"
     }
   }

@@ -11,16 +11,17 @@ ID=com.sethwebster.${NAME:l}
 APP=${OUT:-build}/$NAME.app
 SIGN=${SIGN:-Developer ID Application: Seth Webster (P8ZBH5878Q)}
 VERSION=${VERSION:-0.0.0} BUILD=${BUILD:-0}
+EXACT2=${EXACT:-${EXACT2:-}}
 if [[ -z ${EXACT2:-} ]]; then
-  for cand in "$HOME/Development/exact2-main" "$HOME/Development/expo/exact2" "$HOME/Development/exact2"; do
+  for cand in "$HOME/Development/exact" "$HOME/Development/expo/exact" "$HOME/Development/exact2-main" "$HOME/Development/expo/exact2" "$HOME/Development/exact2"; do
     [[ -f "$cand/host/apple/build.mjs" ]] && { EXACT2="$cand"; break; }
   done
 fi
-EXACT2=${EXACT2:-$HOME/Development/expo/exact2}
+EXACT2=${EXACT2:-$HOME/Development/exact}
 
 # Prefer rustup/asdf cargo and Bun 1.4.2 when present on this machine
-[[ -d "$HOME/.asdf/shims" ]] && export PATH="$HOME/.asdf/shims:$PATH"
 [[ -d "$HOME/.cargo/bin" ]] && export PATH="$HOME/.cargo/bin:$PATH"
+[[ -d "$HOME/.asdf/shims" ]] && export PATH="$HOME/.asdf/shims:$PATH"
 [[ -d "$HOME/.local/share/mise/installs/bun/1.4.2/bin" ]] && export PATH="$HOME/.local/share/mise/installs/bun/1.4.2/bin:$PATH"
 [[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
 if [[ -z ${CARGO_HOME:-} && ! -d "$HOME/.cargo/hermes-lean-sys" && -d "$HOME/.asdf/installs/rust/stable/hermes-lean-sys" ]]; then
@@ -83,7 +84,8 @@ fi
 # Stable identity → keychain "Always Allow" (Netflix DRM keys) survives rebuilds
 # Inside-out: Sparkle's helpers/framework (release builds), Exact dylibs, then app; notarization needs a secure timestamp
 TS=--timestamp=none; [[ -n ${NOTARIZE:-} ]] && TS=--timestamp
-sign() { codesign --force --options runtime $TS -s "$SIGN" "$@"; }
+SIGN_OPTS=(); [[ $SIGN != - ]] && SIGN_OPTS=(--options runtime)
+sign() { codesign --force $SIGN_OPTS $TS -s "$SIGN" "$@"; }
 if [[ $BUILD != 0 ]]; then
   FW="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
   sign "$FW/XPCServices/Installer.xpc"
