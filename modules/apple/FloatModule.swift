@@ -1302,6 +1302,16 @@ private final class FloatShortcutsWindowController: NSWindowController, NSWindow
     }
 }
 
+/// Non-interactive Liquid Glass window backdrop for the Home screen (macOS 26+ native glass, older HUD material fallback).
+@available(macOS 26.0, *)
+private final class FloatHomeGlassView: NSGlassEffectView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+private final class FloatHomeVisualEffectView: NSVisualEffectView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// Target for Float's dedicated Position menu (⌃⌘1–6).
 private final class FloatPositionMenuTarget: NSObject {
     weak var module: FloatModule?
@@ -1327,6 +1337,8 @@ final class FloatModule: ExactModule {
     private let sparkle: SparkleBridge
     private weak var hostWindow: NSWindow?
     private weak var browser: FloatBrowserInstance?
+    private var homeBackdropView: NSView?
+    private var lastBackdropIsHome: Bool?
     private var settingsWindow: FloatSettingsWindowController?
     private var shortcutsWindow: FloatShortcutsWindowController?
     private var hotKeyRef: EventHotKeyRef?
@@ -1389,6 +1401,9 @@ final class FloatModule: ExactModule {
     }
 
     override func destroy() {
+        homeBackdropView?.removeFromSuperview()
+        homeBackdropView = nil
+        lastBackdropIsHome = nil
         settingsWindow?.close()
         settingsWindow = nil
         shortcutsWindow?.close()
@@ -1414,6 +1429,7 @@ final class FloatModule: ExactModule {
 
     fileprivate func attachBrowser(_ instance: FloatBrowserInstance) {
         browser = instance
+        syncWindowBackdrop()
         if let pending = pendingUrlLoad {
             pendingUrlLoad = nil
             load(pending)
@@ -1421,6 +1437,7 @@ final class FloatModule: ExactModule {
     }
 
     func notifyChanged() {
+        syncWindowBackdrop()
         settingsWindow?.refresh()
         shortcutsWindow?.refresh()
         context.changed("float")
@@ -1442,6 +1459,8 @@ final class FloatModule: ExactModule {
                     load(arg)
                 }
             }
+        } else {
+            syncWindowBackdrop()
         }
     }
 
@@ -1469,16 +1488,69 @@ final class FloatModule: ExactModule {
         w.titleVisibility = .hidden
         if #available(macOS 11.0, *) { w.titlebarSeparatorStyle = .none }
         [.closeButton, .miniaturizeButton, .zoomButton].forEach { w.standardWindowButton($0)?.isHidden = true }
-        w.backgroundColor = .black
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.hasShadow = true
         w.level = onTop ? .floating : .normal
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         w.minSize = NSSize(width: 160, height: 90)
         w.alphaValue = CGFloat(alpha)
         w.ignoresMouseEvents = clickThrough
+        syncWindowBackdrop()
         if !context.agent {
             // Preserve existing Float users' saved window position & size
             w.setFrameUsingName("FloatWindow")
             w.setFrameAutosaveName("FloatWindow")
+        }
+    }
+
+    private func installHomeBackdrop(in w: NSWindow) {
+        guard let content = w.contentView else { return }
+        if let existing = homeBackdropView, existing.superview === content { return }
+        homeBackdropView?.removeFromSuperview()
+        let backdrop: NSView
+        if #available(macOS 26.0, *) {
+            let glass = FloatHomeGlassView(frame: content.bounds)
+            glass.style = .regular
+            backdrop = glass
+        } else {
+            let fx = FloatHomeVisualEffectView(frame: content.bounds)
+            fx.material = .hudWindow
+            fx.blendingMode = .behindWindow
+            fx.state = .active
+            backdrop = fx
+        }
+        backdrop.autoresizingMask = [.width, .height]
+        backdrop.setAccessibilityElement(false)
+        content.addSubview(backdrop, positioned: .below, relativeTo: content.subviews.first)
+        homeBackdropView = backdrop
+    }
+
+    private func syncWindowBackdrop() {
+        let isHome = (mode == "home")
+        browser?.web.isHidden = isHome
+        guard let w = hostWindow else { return }
+        installHomeBackdrop(in: w)
+        homeBackdropView?.isHidden = !isHome
+        if let content = w.contentView {
+            for sub in content.subviews {
+                if let scroll = sub as? NSScrollView {
+                    if scroll.drawsBackground != !isHome {
+                        scroll.drawsBackground = !isHome
+                    }
+                    scroll.backgroundColor = isHome ? .clear : .black
+                }
+            }
+        }
+        if isHome {
+            if w.isOpaque { w.isOpaque = false }
+            if w.backgroundColor != .clear { w.backgroundColor = .clear }
+        } else {
+            if !w.isOpaque { w.isOpaque = true }
+            if w.backgroundColor != .black { w.backgroundColor = .black }
+        }
+        if lastBackdropIsHome != isHome {
+            lastBackdropIsHome = isHome
+            w.invalidateShadow()
         }
     }
 

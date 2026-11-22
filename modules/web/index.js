@@ -6,6 +6,8 @@ export const roster = {
   'float-drag-strip': { snapshot: false },
 };
 
+const HOME_BG = 'linear-gradient(180deg, #1c1d22 0%, #0b0b0d 70%)';
+
 export function create(tag, element, json) {
   const props = JSON.parse(json);
   const root = element.shadowRoot ?? element.attachShadow({ mode: 'open' });
@@ -15,8 +17,9 @@ export function create(tag, element, json) {
     box.addEventListener('mouseenter', () => { box.style.opacity = '1'; });
     box.addEventListener('mouseleave', () => { box.style.opacity = '0'; });
   } else {
-    box.style.cssText = 'width:100%;height:100%;background:#000;';
-    box.dataset.mode = props.mode ?? 'home';
+    const mode = props.mode ?? 'home';
+    box.style.cssText = `width:100%;height:100%;background:${mode === 'home' ? HOME_BG : '#000'};`;
+    box.dataset.mode = mode;
   }
   root.replaceChildren(box);
   return { tag, box };
@@ -25,7 +28,9 @@ export function create(tag, element, json) {
 export function setProps(h, json) {
   const props = JSON.parse(json);
   if (h.tag === 'float-browser') {
-    h.box.dataset.mode = props.mode ?? 'home';
+    const mode = props.mode ?? 'home';
+    h.box.dataset.mode = mode;
+    h.box.style.background = mode === 'home' ? HOME_BG : '#000';
   }
 }
 
