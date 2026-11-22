@@ -1,11 +1,10 @@
 <div align="center">
   <a href="https://float.video">
-    <img src="site/icon.png" alt="Float app icon" width="116" height="116" />
+    <img src="docs/readme-header.png" alt="Float — Video that floats. Nothing else." width="100%" />
   </a>
 
-  <h1>Float</h1>
+  <br /><br />
 
-  <p><strong>Video that floats. Nothing else.</strong></p>
   <p>
     A chromeless, always-on-top macOS video browser built with Exact, AppKit, and <code>WKWebView</code>.<br />
     Automatically pins any site's video player edge-to-edge — zero tabs, zero sidebars, zero Electron bloat.
