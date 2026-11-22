@@ -23,14 +23,21 @@ jobs:
           persist-credentials: false
       - name: Update local Exact checkout
         env:
-          EXACT2: ${{ env.EXACT2 || '/Users/sethwebster/Development/exact2-main' }}
+          EXACT: ${{ env.EXACT || '/Users/sethwebster/Development/exact' }}
         run: |
           set -euo pipefail
-          export PATH="$HOME/.asdf/shims:$HOME/.cargo/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-          git -C "$EXACT2" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false fetch origin main
-          git -C "$EXACT2" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false reset --hard origin/main
-          (cd "$EXACT2" && bun install --frozen-lockfile)
-          echo "EXACT2=$EXACT2" >> "$GITHUB_ENV"
+          export PATH="$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          EXACT_REPO="git@github.com:expo/exact.git"
+          if [[ ! -d "$EXACT/.git" ]]; then
+            git clone -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false --depth 1 "$EXACT_REPO" "$EXACT"
+          else
+            git -C "$EXACT" remote set-url origin "$EXACT_REPO"
+            git -C "$EXACT" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false fetch origin main
+            git -C "$EXACT" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false reset --hard origin/main
+          fi
+          (cd "$EXACT" && rustc --version && bun install --frozen-lockfile)
+          echo "EXACT=$EXACT" >> "$GITHUB_ENV"
+          echo "EXACT2=$EXACT" >> "$GITHUB_ENV"
       # GitHub release downloads 504 for minutes at a time; build.sh only fetches Sparkle on a miss.
       - uses: actions/cache@v4
         with:
@@ -71,7 +78,7 @@ jobs:
           NOTARY_KEY_ISSUER: ${{ secrets.NOTARY_KEY_ISSUER }}
         run: |
           set -euo pipefail
-          export PATH="$HOME/.asdf/shims:$HOME/.cargo/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          export PATH="$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
           for name in SIGN SPARKLE_PRIVATE_KEY NOTARY_KEY_ID NOTARY_KEY_ISSUER; do
             [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
           done

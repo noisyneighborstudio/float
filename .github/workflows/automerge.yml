@@ -98,17 +98,24 @@ jobs:
       - name: Update local Exact checkout to latest main
         id: exact
         env:
-          EXACT2: ${{ env.EXACT2 || '/Users/sethwebster/Development/exact2-main' }}
+          EXACT: ${{ env.EXACT || '/Users/sethwebster/Development/exact' }}
         run: |
           set -euo pipefail
-          export PATH="$HOME/.local/bin:$HOME/.asdf/shims:$HOME/.cargo/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-          git -C "$EXACT2" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false fetch origin main
-          git -C "$EXACT2" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false reset --hard origin/main
-          (cd "$EXACT2" && bun install --frozen-lockfile)
-          EXACT_SHA="$(git -C "$EXACT2" rev-parse --short HEAD)"
-          echo "EXACT2=$EXACT2" >> "$GITHUB_ENV"
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          EXACT_REPO="git@github.com:expo/exact.git"
+          if [[ ! -d "$EXACT/.git" ]]; then
+            git clone -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false --depth 1 "$EXACT_REPO" "$EXACT"
+          else
+            git -C "$EXACT" remote set-url origin "$EXACT_REPO"
+            git -C "$EXACT" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false fetch origin main
+            git -C "$EXACT" -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.required=false reset --hard origin/main
+          fi
+          (cd "$EXACT" && rustc --version && bun install --frozen-lockfile)
+          EXACT_SHA="$(git -C "$EXACT" rev-parse --short HEAD)"
+          echo "EXACT=$EXACT" >> "$GITHUB_ENV"
+          echo "EXACT2=$EXACT" >> "$GITHUB_ENV"
           echo "sha=$EXACT_SHA" >> "$GITHUB_OUTPUT"
-          echo "Exact2 main at $EXACT_SHA"
+          echo "Exact main at $EXACT_SHA"
 
       - name: Verify against latest Exact, build, and test (with agentic repair on drift)
         id: verify
@@ -119,7 +126,7 @@ jobs:
           EXACT_SHA: ${{ steps.exact.outputs.sha }}
         run: |
           set -euo pipefail
-          export PATH="$HOME/.local/bin:$HOME/.asdf/shims:$HOME/.cargo/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
           if [[ -z "${CARGO_HOME:-}" && ! -d "$HOME/.cargo/hermes-lean-sys" && -d "$HOME/.asdf/installs/rust/stable/hermes-lean-sys" ]]; then
             export CARGO_HOME="$HOME/.asdf/installs/rust/stable"
           fi
