@@ -1498,7 +1498,7 @@ private final class FloatOpeningMorphController: NSObject {
     private var finished = false
     private var hostShadowRestored = false
 
-    private let totalDuration: CFTimeInterval = 0.84
+    private let totalDuration: CFTimeInterval = 0.64
 
     init(
         hostWindow: NSWindow,
@@ -1516,16 +1516,16 @@ private final class FloatOpeningMorphController: NSObject {
         self.targetRect = NSRect(x: pad, y: pad, width: hostFrame.width, height: hostFrame.height)
 
         // Proportion the glassy Float logo pane (~1.58:1 aspect like Float.icon) cleanly for any window size
-        let maxLogoW = min(232, hostFrame.width * 0.72)
-        let maxLogoH = min(146, hostFrame.height * 0.72)
-        var logoW = min(max(hostFrame.width * 0.36, 136), maxLogoW)
+        let maxLogoW = min(204, hostFrame.width * 0.64)
+        let maxLogoH = min(130, hostFrame.height * 0.64)
+        var logoW = min(max(hostFrame.width * 0.30, 116), maxLogoW)
         var logoH = logoW / 1.58
         if logoH > maxLogoH {
             logoH = maxLogoH
             logoW = min(maxLogoW, logoH * 1.58)
         }
-        logoW = max(72, logoW)
-        logoH = max(46, logoH)
+        logoW = max(68, logoW)
+        logoH = max(44, logoH)
         self.logoRect = NSRect(
             x: targetRect.midX - logoW / 2,
             y: targetRect.midY - logoH / 2,
@@ -1715,27 +1715,26 @@ private final class FloatOpeningMorphController: NSObject {
         let targetAlpha = targetAlphaProvider()
         let isHome = isHomeProvider()
 
-        // Phase A (0.00 -> 0.18s): Glassy logo blooms into existence
-        let appear = Self.easeOutCubic(Self.clamp01(t / 0.15))
-        let entryScale = Self.lerp(0.76, 1.0, Self.springOut(Self.clamp01(t / 0.20)))
-        let entryLiftY = Self.lerp(-14.0, 0.0, Self.easeOutCubic(Self.clamp01(t / 0.18)))
+        // Single continuous gesture (0.00 -> 0.64s): immediate glassy logo presence flowing
+        // directly into full window expansion with zero pause between materialize and morph.
+        let appear = Self.easeOutCubic(Self.clamp01(t / 0.09))
+        let liftY = Self.lerp(-10.0, 0.0, Self.easeOutCubic(Self.clamp01(t / 0.44)))
 
-        // Phase B (0.20 -> 0.72s): Fluid Liquid Glass morph from tilted logo into exact window shape
-        let morphU = Self.clamp01((t - 0.20) / 0.50)
-        let morphSpring = Self.dampedSpring(morphU)
-        let morphSmooth = Self.smootherStep(morphU)
+        let morphU = Self.clamp01(t / 0.52)
+        let morphSmooth = Self.continuousMorph(morphU)
+        let morphSize = morphSmooth + sin(morphU * .pi) * pow(morphU, 3.0) * 0.012
 
-        // 3D logo perspective pose unwinds smoothly to flat plane
-        let pose = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.19) / 0.44))
-        let rotZ = pose * (9.5 * .pi / 180.0)
-        let rotY = pose * (-20.0 * .pi / 180.0)
+        // 3D logo perspective unwinds on the same unified curve from frame 0
+        let pose = 1.0 - Self.continuousMorph(Self.clamp01(t / 0.48))
+        let rotZ = pose * (10.0 * .pi / 180.0)
+        let rotY = pose * (-22.0 * .pi / 180.0)
         let rotX = pose * (4.5 * .pi / 180.0)
 
         // Morphing rectangle & corner radius
-        let curW = Self.lerp(logoRect.width, targetRect.width, morphSpring)
-        let curH = Self.lerp(logoRect.height, targetRect.height, morphSpring)
-        let curCenterX = Self.lerp(logoRect.midX, targetRect.midX, morphSpring)
-        let curCenterY = Self.lerp(logoRect.midY, targetRect.midY, morphSpring) + entryLiftY
+        let curW = Self.lerp(logoRect.width, targetRect.width, morphSize)
+        let curH = Self.lerp(logoRect.height, targetRect.height, morphSize)
+        let curCenterX = Self.lerp(logoRect.midX, targetRect.midX, morphSmooth)
+        let curCenterY = Self.lerp(logoRect.midY, targetRect.midY, morphSmooth) + liftY
         let curRect = NSRect(
             x: curCenterX - curW / 2,
             y: curCenterY - curH / 2,
@@ -1747,9 +1746,9 @@ private final class FloatOpeningMorphController: NSObject {
             min(curW, curH) * 0.48
         )
 
-        // Phase C (0.58 -> 0.84s): Seamless cross-fade handoff into real hostWindow
-        let hostReveal = Self.easeOutCubic(Self.clamp01((t - 0.58) / 0.15))
-        let overlayFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.66) / 0.17))
+        // Seamless cross-fade handoff into real hostWindow as the glass finishes landing
+        let hostReveal = Self.easeOutCubic(Self.clamp01((t - 0.40) / 0.14))
+        let overlayFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.48) / 0.16))
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -1787,10 +1786,10 @@ private final class FloatOpeningMorphController: NSObject {
                 ).cgColor
         }
 
-        // Apply centered 3D perspective + tilt + entrance scale around the morphing glass center
+        // Apply centered 3D perspective + tilt around the morphing glass center
         stageView.layer?.transform = Self.centeredTransform(
             around: CGPoint(x: curRect.midX, y: curRect.midY),
-            scale: entryScale,
+            scale: 1.0,
             rotX: rotX,
             rotY: rotY,
             rotZ: rotZ
@@ -1799,16 +1798,16 @@ private final class FloatOpeningMorphController: NSObject {
         // Update interior optical layers
         tealDepthLayer.frame = localBounds
         tealDepthLayer.cornerRadius = clampedRadius
-        tealDepthLayer.opacity = Float(1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.22) / 0.44)))
+        tealDepthLayer.opacity = Float(1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.06) / 0.42)))
 
-        // Diagonal sheen sweeps smoothly across the unfolding glass
-        let sheenT = Self.easeInOutCubic(Self.clamp01((t - 0.06) / 0.58))
-        let sheenShift = Self.lerp(-0.55, 0.75, sheenT)
+        // Diagonal sheen sweeps continuously across the unfolding glass
+        let sheenT = Self.easeInOutCubic(Self.clamp01(t / 0.48))
+        let sheenShift = Self.lerp(-0.55, 0.78, sheenT)
         sheenLayer.frame = localBounds
         sheenLayer.cornerRadius = clampedRadius
         sheenLayer.startPoint = CGPoint(x: max(-0.5, sheenShift - 0.35), y: 1.0)
         sheenLayer.endPoint = CGPoint(x: min(1.5, sheenShift + 0.55), y: 0.0)
-        let sheenVis = (1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.42) / 0.28))) * appear
+        let sheenVis = (1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.28) / 0.24))) * appear
         sheenLayer.opacity = Float(0.85 * sheenVis)
 
         // Luminous cyan-turquoise bevel rim stretches to trace the window, then dissolves into native rim
@@ -1819,7 +1818,7 @@ private final class FloatOpeningMorphController: NSObject {
         let rimRect = localBounds.insetBy(dx: rimWidth * 0.5, dy: rimWidth * 0.5)
         let rimRadius = max(0, clampedRadius - rimWidth * 0.5)
         rimMaskLayer.path = CGPath(roundedRect: rimRect, cornerWidth: rimRadius, cornerHeight: rimRadius, transform: nil)
-        let rimFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.54) / 0.22))
+        let rimFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.36) / 0.20))
         rimGradientLayer.opacity = Float(0.96 * rimFade)
 
         innerHighlightLayer.frame = localBounds
@@ -1828,23 +1827,21 @@ private final class FloatOpeningMorphController: NSObject {
         innerHighlightLayer.path = CGPath(roundedRect: innerRect, cornerWidth: innerRadius, cornerHeight: innerRadius, transform: nil)
         innerHighlightLayer.opacity = Float(0.70 * (1.0 - morphSmooth))
 
-        // Rounded play triangle: pops in slightly staggered, then blooms & dissolves as window opens
-        let playPop = Self.springOut(Self.clamp01((t - 0.03) / 0.16))
-        let playFadeOut = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.22) / 0.25))
-        let playBloom = Self.lerp(1.0, 1.26, Self.easeOutCubic(Self.clamp01((t - 0.22) / 0.26)))
-        let playScale = Self.lerp(0.70, 1.0, playPop) * playBloom
-        let playSize = min(logoRect.height * 0.50, logoRect.width * 0.34) * playScale
+        // Rounded play triangle appears immediately with the glass, then blooms & dissolves in one move
+        let playFadeOut = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.10) / 0.24))
+        let playBloom = Self.lerp(0.92, 1.26, Self.easeOutCubic(Self.clamp01(t / 0.34)))
+        let playSize = min(logoRect.height * 0.52, logoRect.width * 0.35) * playBloom
         playLayer.frame = localBounds
         playLayer.path = Self.roundedPlayTrianglePath(
             center: CGPoint(x: localBounds.midX, y: localBounds.midY),
             size: max(8, playSize)
         )
-        playLayer.opacity = Float(Self.clamp01(playPop) * playFadeOut)
+        playLayer.opacity = Float(appear * playFadeOut)
 
         // Feather-soft radial floating floor shadow strictly beneath the tilted logo; dissolves cleanly as it expands
-        let shadowW = logoRect.width * 0.88 * entryScale
-        let shadowH: CGFloat = 26.0 * entryScale
-        let shadowY = curRect.minY - shadowH - 12.0
+        let shadowW = logoRect.width * 0.90
+        let shadowH: CGFloat = 24.0
+        let shadowY = curRect.minY - shadowH - 10.0
         shadowLayer.frame = CGRect(
             x: curRect.midX - shadowW / 2,
             y: shadowY,
@@ -1857,7 +1854,7 @@ private final class FloatOpeningMorphController: NSObject {
         panel.alphaValue = targetAlpha * appear * overlayFade
 
         if let host = hostWindow {
-            if t >= 0.58 {
+            if t >= 0.40 {
                 if !hostShadowRestored {
                     hostShadowRestored = true
                     host.hasShadow = true
@@ -1933,26 +1930,14 @@ private final class FloatOpeningMorphController: NSObject {
         t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0
     }
 
-    private static func smootherStep(_ t: CGFloat) -> CGFloat {
-        t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-    }
-
-    /// Snappy spring-out curve (gentle ~2.5% settle) normalized to exact [0, 1].
-    private static func springOut(_ t: CGFloat) -> CGFloat {
+    /// Unified asymmetric fluid curve: moving cleanly from frame 0 with an energetic liquid sweep
+    /// and a long, silky deceleration into the exact window bounds.
+    private static func continuousMorph(_ t: CGFloat) -> CGFloat {
         guard t > 0 else { return 0 }
         guard t < 1 else { return 1 }
-        let raw = 1.0 - exp(-6.8 * t) * (cos(4.8 * t) + 0.32 * sin(4.8 * t))
-        let end = 1.0 - exp(-6.8) * (cos(4.8) + 0.32 * sin(4.8))
-        return raw / end
-    }
-
-    /// Silky liquid-glass expansion spring (subtle ~1.2% organic settle) normalized to exact [0, 1].
-    private static func dampedSpring(_ t: CGFloat) -> CGFloat {
-        guard t > 0 else { return 0 }
-        guard t < 1 else { return 1 }
-        let raw = 1.0 - exp(-7.0 * t) * (cos(4.3 * t) + 0.42 * sin(4.3 * t))
-        let end = 1.0 - exp(-7.0) * (cos(4.3) + 0.42 * sin(4.3))
-        return raw / end
+        let a = pow(t, 1.65)
+        let b = pow(1.0 - t, 2.35)
+        return a / (a + b)
     }
 }
 
