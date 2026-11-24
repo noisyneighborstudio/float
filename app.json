@@ -15,8 +15,7 @@
     "command": "float"
   },
   "modules": [
-    "float-browser",
-    "float-drag-strip"
+    "float-browser"
   ],
   "hatches": {
     "url-input": [

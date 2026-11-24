@@ -178,11 +178,14 @@ function fillScript(on) {
     const ON = ${Boolean(on)}, ATTR = 'data-fp-pin', ID = '__fp_pin_style';
     const CSS = \`
       html:has([\${ATTR}]), html:has([\${ATTR}]) body { overflow: hidden !important; }
+      [data-fp-anc] { transform: none !important; filter: none !important; perspective: none !important; contain: none !important; will-change: auto !important; }
       [\${ATTR}] { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important;
-        max-width: none !important; max-height: none !important; margin: 0 !important; transform: none !important;
+        max-width: none !important; max-height: none !important; margin: 0 !important; padding: 0 !important; transform: none !important;
         z-index: 2147483647 !important; background: #000 !important; }
-      [\${ATTR}] [data-fp-path] { width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important; }
-      [\${ATTR}] video[data-fp-path] { position: absolute !important; inset: 0 !important; }
+      [\${ATTR}] [data-fp-path] { width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important;
+        margin: 0 !important; padding: 0 !important; transform: none !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; }
+      [\${ATTR}] video[data-fp-path] { position: absolute !important; inset: 0 !important; width: 100% !important; height: 100% !important;
+        margin: 0 !important; padding: 0 !important; transform: none !important; }
       [\${ATTR}] video, video[\${ATTR}] { object-fit: contain !important; }\`;
     const main = () => [...document.querySelectorAll('video')]
       .filter(v => v.currentSrc && v.currentTime > 0 && v.offsetWidth * v.offsetHeight > innerWidth * innerHeight * 0.15)
@@ -205,6 +208,7 @@ function fillScript(on) {
       if (ON && curVid && curVid.currentSrc) return;
       cur && cur.removeAttribute(ATTR);
       document.querySelectorAll('[data-fp-path]').forEach(e => e.removeAttribute('data-fp-path'));
+      document.querySelectorAll('[data-fp-anc]').forEach(e => e.removeAttribute('data-fp-anc'));
       let s = document.getElementById(ID);
       if (!ON) { s && s.remove(); cur && dispatchEvent(new Event('resize')); return; }
       if (!s) { s = document.createElement('style'); s.id = ID; s.textContent = CSS; (document.head || document.documentElement).appendChild(s); }
@@ -213,6 +217,7 @@ function fillScript(on) {
       const p = player(v);
       p.setAttribute(ATTR, '');
       for (let e = v; e && e !== p; e = e.parentElement) e.setAttribute('data-fp-path', '');
+      for (let e = p.parentElement; e && e !== document.documentElement; e = e.parentElement) e.setAttribute('data-fp-anc', '');
       dispatchEvent(new Event('resize'));
     }
     apply();
@@ -678,6 +683,10 @@ async function handleCommand(op, arg) {
       break;
     case 'toggleAspectLock':
       data.aspectLocked = !data.aspectLocked;
+      saveState(data);
+      break;
+    case 'setAspectLocked':
+      data.aspectLocked = arg === 'true';
       saveState(data);
       break;
     case 'toggleTop':

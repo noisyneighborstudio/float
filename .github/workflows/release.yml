@@ -91,6 +91,8 @@ jobs:
           for name in SIGN SPARKLE_PRIVATE_KEY; do
             [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
           done
+          mkdir -p .exact
+          ln -sfn "$EXACT" .exact/checkout
           npm ci --no-audit --no-fund
           npx semantic-release
       - name: Remove temporary credentials

@@ -6,6 +6,7 @@ export const grants = [
   'fs.write app:/data/float.json',
   'fs.read app:/data/linux-bridge.txt',
   'net.fetch http://127.0.0.1:17420',
+  'device.window-management',
 ].join('\n');
 
 type FloatState = Result<'loadFloatState'>;
@@ -283,6 +284,9 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
     case 'toggleAspectLock':
       data.aspectLocked = !data.aspectLocked;
       break;
+    case 'setAspectLocked':
+      data.aspectLocked = arg === 'true';
+      break;
     case 'toggleTop':
       data.onTop = !data.onTop;
       break;
@@ -436,6 +440,16 @@ const sources: Sources = {
       }
     }
     return runFallbackCommand(op, arg, storage);
+  },
+  queryVideoAspect: async (_args, _store, _storage, native) => {
+    if (native?.available) {
+      try {
+        return (await native.later({ op: 'videoAspect' })) as Result<'queryVideoAspect'>;
+      } catch {
+        // Fall through on web without native later.
+      }
+    }
+    return { ok: true, ratio: 16 / 9 };
   },
 };
 

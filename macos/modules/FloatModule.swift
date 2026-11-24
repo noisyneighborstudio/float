@@ -170,11 +170,14 @@ private func floatFillScript(_ on: Bool) -> String { """
   const ON = \(on), ATTR = 'data-fp-pin', ID = '__fp_pin_style';
   const CSS = `
     html:has([${ATTR}]), html:has([${ATTR}]) body { overflow: hidden !important; }
+    [data-fp-anc] { transform: none !important; filter: none !important; perspective: none !important; contain: none !important; will-change: auto !important; }
     [${ATTR}] { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important;
-      max-width: none !important; max-height: none !important; margin: 0 !important; transform: none !important;
+      max-width: none !important; max-height: none !important; margin: 0 !important; padding: 0 !important; transform: none !important;
       z-index: 2147483647 !important; background: #000 !important; }
-    [${ATTR}] [data-fp-path] { width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important; }
-    [${ATTR}] video[data-fp-path] { position: absolute !important; inset: 0 !important; }
+    [${ATTR}] [data-fp-path] { width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important;
+      margin: 0 !important; padding: 0 !important; transform: none !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; }
+    [${ATTR}] video[data-fp-path] { position: absolute !important; inset: 0 !important; width: 100% !important; height: 100% !important;
+      margin: 0 !important; padding: 0 !important; transform: none !important; }
     [${ATTR}] video, video[${ATTR}] { object-fit: contain !important; }`;
   const main = () => [...document.querySelectorAll('video')]
     .filter(v => v.currentSrc && v.currentTime > 0 && v.offsetWidth * v.offsetHeight > innerWidth * innerHeight * 0.15)
@@ -197,6 +200,7 @@ private func floatFillScript(_ on: Bool) -> String { """
     if (ON && curVid && curVid.currentSrc) return;
     cur && cur.removeAttribute(ATTR);
     document.querySelectorAll('[data-fp-path]').forEach(e => e.removeAttribute('data-fp-path'));
+    document.querySelectorAll('[data-fp-anc]').forEach(e => e.removeAttribute('data-fp-anc'));
     let s = document.getElementById(ID);
     if (!ON) { s && s.remove(); cur && dispatchEvent(new Event('resize')); return; }
     if (!s) { s = document.createElement('style'); s.id = ID; s.textContent = CSS; (document.head || document.documentElement).appendChild(s); }
@@ -205,6 +209,7 @@ private func floatFillScript(_ on: Bool) -> String { """
     const p = player(v);
     p.setAttribute(ATTR, '');
     for (let e = v; e && e !== p; e = e.parentElement) e.setAttribute('data-fp-path', '');
+    for (let e = p.parentElement; e && e !== document.documentElement; e = e.parentElement) e.setAttribute('data-fp-anc', '');
     dispatchEvent(new Event('resize'));
   }
   apply();
@@ -465,6 +470,7 @@ private final class FloatStore {
 /// Process-wide Sparkle 2 updater controller (linked via host.macos.swiftPackages).
 private final class FloatUpdater {
     static let shared = FloatUpdater()
+    private var started = false
     private lazy var controller = SPUStandardUpdaterController(
         startingUpdater: true,
         updaterDelegate: nil,
@@ -472,16 +478,19 @@ private final class FloatUpdater {
     )
 
     func start() {
+        guard !started else { return }
+        started = true
         _ = controller
     }
 
     var canCheckForUpdates: Bool {
-        controller.updater.canCheckForUpdates
+        started ? controller.updater.canCheckForUpdates : false
     }
 
     func checkForUpdates() {
         // Open Sparkle's window on the next main-queue turn, not inside native.call.
         DispatchQueue.main.async { [self] in
+            start()
             controller.checkForUpdates(nil)
         }
     }
@@ -535,23 +544,9 @@ private final class FloatHotKeyCenter {
     }
 }
 
-/// Top-edge hover drag strip: fades in on hover even when inactive, drags window, double-click toggles aspect lock.
-private final class FloatDragStripView: NSView {
+/// WKWebView subclass that suppresses initial window flash before the opening morph attaches.
+private final class FloatWebView: WKWebView {
     weak var module: FloatModule?
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
-        alphaValue = 0
-        addTrackingArea(NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self
-        ))
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -559,35 +554,6 @@ private final class FloatDragStripView: NSView {
             module?.prepareOpeningAnimation(for: win)
         }
     }
-
-    override func mouseEntered(with e: NSEvent) {
-        animator().alphaValue = 1
-    }
-
-    override func mouseExited(with e: NSEvent) {
-        animator().alphaValue = 0
-    }
-
-    override func mouseDown(with e: NSEvent) {
-        if e.clickCount == 2 {
-            module?.toggleAspectLock()
-            return
-        }
-        window?.performDrag(with: e)
-    }
-
-    override var mouseDownCanMoveWindow: Bool { true }
-}
-
-private final class FloatDragStripInstance: ExactNativeInstance {
-    private let strip = FloatDragStripView(frame: .zero)
-
-    init(_ module: FloatModule, _ events: ExactNativeEvents) {
-        super.init(events: events)
-        strip.module = module
-    }
-
-    override var view: ExactNativeView { strip }
 }
 
 /// Delegate helper inheriting NSObject for WKNavigationDelegate, WKUIDelegate, and WKScriptMessageHandler.
@@ -677,7 +643,7 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
 
 /// Native WKWebView instance owning video playback, fill script, isolated fpPlay tracking, and navigation.
 fileprivate final class FloatBrowserInstance: ExactNativeInstance {
-    let web: WKWebView
+    let web: FloatWebView
     private let delegate = FloatBrowserDelegate()
     // Tracking script + fpPlay bridge live here; page JS can't reach them to forge messages.
     private let trackWorld = WKContentWorld.world(name: "float-track")
@@ -688,7 +654,8 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         cfg.allowsAirPlayForMediaPlayback = true
         cfg.preferences.isElementFullscreenEnabled = true
         cfg.websiteDataStore = module.context.agent ? .nonPersistent() : .default()
-        web = WKWebView(frame: .zero, configuration: cfg)
+        web = FloatWebView(frame: .zero, configuration: cfg)
+        web.module = module
         super.init(events: events)
         delegate.module = module
         delegate.web = web
@@ -1461,6 +1428,7 @@ private final class FloatOpeningMorphController: NSObject {
     private weak var hostWindow: NSWindow?
     private let targetAlphaProvider: () -> CGFloat
     private let isHomeProvider: () -> Bool
+    private let onBeforeReveal: () -> Void
     private let onComplete: () -> Void
 
     private let panel: FloatOpeningMorphPanel
@@ -1486,6 +1454,7 @@ private final class FloatOpeningMorphController: NSObject {
     private var displayLink: CADisplayLink?
     private var startTimestamp: CFTimeInterval?
     private var finished = false
+    private var hostRevealPrepared = false
     private var hostShadowRestored = false
 
     private let totalDuration: CFTimeInterval = 0.64
@@ -1494,11 +1463,13 @@ private final class FloatOpeningMorphController: NSObject {
         hostWindow: NSWindow,
         targetAlphaProvider: @escaping () -> CGFloat,
         isHomeProvider: @escaping () -> Bool,
+        onBeforeReveal: @escaping () -> Void,
         onComplete: @escaping () -> Void
     ) {
         self.hostWindow = hostWindow
         self.targetAlphaProvider = targetAlphaProvider
         self.isHomeProvider = isHomeProvider
+        self.onBeforeReveal = onBeforeReveal
         self.onComplete = onComplete
 
         let hostFrame = hostWindow.frame
@@ -1658,6 +1629,7 @@ private final class FloatOpeningMorphController: NSObject {
         applyFrame(elapsed: 0)
         panel.order(.above, relativeTo: host.windowNumber)
         let link = rootView.displayLink(target: self, selector: #selector(step(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
@@ -1844,6 +1816,10 @@ private final class FloatOpeningMorphController: NSObject {
         panel.alphaValue = targetAlpha * appear * overlayFade
 
         if let host = hostWindow {
+            if t >= 0.36, !hostRevealPrepared {
+                hostRevealPrepared = true
+                onBeforeReveal()
+            }
             if t >= 0.40 {
                 if !hostShadowRestored {
                     hostShadowRestored = true
@@ -1937,9 +1913,6 @@ final class FloatModule: ExactModule {
             "float-browser": ExactNativeFactory(for: FloatModule.self, firstFrame: true) { mod, _, events in
                 FloatBrowserInstance(mod, events)
             },
-            "float-drag-strip": ExactNativeFactory(for: FloatModule.self, firstFrame: true) { mod, _, events in
-                FloatDragStripInstance(mod, events)
-            },
         ]
     }
 
@@ -1951,6 +1924,7 @@ final class FloatModule: ExactModule {
     private var openingMorph: FloatOpeningMorphController?
     private var openingPrepared = false
     private var openingPlayed = false
+    private var openingHostRevealing = false
     private var settingsWindow: FloatSettingsWindowController?
     private var shortcutsWindow: FloatShortcutsWindowController?
     private var hotKeyRef: EventHotKeyRef?
@@ -1962,10 +1936,6 @@ final class FloatModule: ExactModule {
     private var pendingUrlLoad: String?
     private var cliHandled = false
     private var lastSelectSeq: String?
-    private var preExpandFrame: NSRect?
-    private var preExpandAspectRatio: NSSize?
-    private var resizeScrollerToken = 0
-    private var savedNestedScrollers: [(id: ObjectIdentifier, view: NSScrollView, v: Bool, h: Bool)] = []
 
     var mode = "home"
     var currentUrl = ""
@@ -1997,7 +1967,6 @@ final class FloatModule: ExactModule {
         peekHold = store.peekHold
         super.init(context: context)
         if !context.agent {
-            FloatUpdater.shared.start()
             FloatHotKeyCenter.shared.active = self
             FloatHotKeyCenter.shared.installIfNeeded()
             registerHotKey()
@@ -2007,7 +1976,7 @@ final class FloatModule: ExactModule {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                guard let self else { return }
+                guard let self, self.openingMorph == nil else { return }
                 self.installPeekTrigger()
                 self.notifyChanged()
             }
@@ -2037,8 +2006,6 @@ final class FloatModule: ExactModule {
         if FloatHotKeyCenter.shared.active === self {
             FloatHotKeyCenter.shared.active = nil
         }
-        resizeScrollerToken += 1
-        savedNestedScrollers.removeAll()
     }
 
     fileprivate func attachBrowser(_ instance: FloatBrowserInstance) {
@@ -2088,6 +2055,7 @@ final class FloatModule: ExactModule {
     private func startOpeningMorph(for w: NSWindow) {
         guard !openingPlayed, shouldAnimateOpening else { return }
         openingPlayed = true
+        openingHostRevealing = false
         w.animationBehavior = .none
         w.hasShadow = false
         w.alphaValue = 0.001
@@ -2095,11 +2063,24 @@ final class FloatModule: ExactModule {
             hostWindow: w,
             targetAlphaProvider: { [weak self] in self?.effectiveTargetAlpha ?? 1.0 },
             isHomeProvider: { [weak self] in (self?.mode ?? "home") == "home" },
+            onBeforeReveal: { [weak self] in
+                guard let self else { return }
+                self.openingHostRevealing = true
+                self.syncWindowBackdrop()
+            },
             onComplete: { [weak self] in
-                self?.openingMorph = nil
+                guard let self else { return }
+                self.openingMorph = nil
+                self.openingHostRevealing = false
+                self.syncWindowBackdrop()
+                if !self.context.agent {
+                    FloatUpdater.shared.start()
+                    self.notifyChanged()
+                }
             }
         )
         openingMorph = morph
+        syncWindowBackdrop()
         morph.start()
     }
 
@@ -2119,10 +2100,15 @@ final class FloatModule: ExactModule {
             }
             if willMorph {
                 startOpeningMorph(for: w)
-            } else if openingPrepared && !openingPlayed {
-                w.hasShadow = true
-                w.alphaValue = effectiveTargetAlpha
-                w.invalidateShadow()
+            } else {
+                if openingPrepared && !openingPlayed {
+                    w.hasShadow = true
+                    w.alphaValue = effectiveTargetAlpha
+                    w.invalidateShadow()
+                }
+                if !context.agent {
+                    FloatUpdater.shared.start()
+                }
             }
         } else {
             syncWindowBackdrop()
@@ -2200,7 +2186,8 @@ final class FloatModule: ExactModule {
         browser?.web.isHidden = isHome
         guard let w = hostWindow else { return }
         installHomeBackdrop(in: w)
-        homeBackdropView?.isHidden = !isHome
+        let suppressBackdrop = openingMorph != nil && !openingHostRevealing
+        homeBackdropView?.isHidden = !isHome || suppressBackdrop
         if let content = w.contentView {
             for sub in content.subviews {
                 if let scroll = sub as? NSScrollView {
@@ -2208,8 +2195,6 @@ final class FloatModule: ExactModule {
                         scroll.drawsBackground = !isHome
                     }
                     scroll.backgroundColor = isHome ? .clear : .black
-                    if scroll.hasVerticalScroller { scroll.hasVerticalScroller = false }
-                    if scroll.hasHorizontalScroller { scroll.hasHorizontalScroller = false }
                 }
             }
         }
@@ -2271,7 +2256,8 @@ final class FloatModule: ExactModule {
         case "forward": browser?.web.goForward()
         case "toggleFill": toggleFill()
         case "toggleExpand": toggleExpand()
-        case "toggleAspectLock": toggleAspectLock()
+        case "toggleAspectLock": setAspectLocked(!aspectLocked)
+        case "setAspectLocked": setAspectLocked(arg == "true")
         case "toggleTop": toggleTop()
         case "toggleClickThrough": toggleClickThrough()
         case "fadeOut": fadeOut()
@@ -2296,6 +2282,31 @@ final class FloatModule: ExactModule {
         default: throw ExactNativeRefusal("unknown op \(op)")
         }
         return ["ok": true]
+    }
+
+    override func later(_ request: [String: Any], reply: ExactReply) {
+        guard (request["op"] as? String) == "videoAspect" else {
+            reply.fail("unknown op")
+            return
+        }
+        if context.agent {
+            reply.send(["ok": true, "ratio": 16.0 / 9.0])
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let web = self.browser?.web else {
+                reply.send(["ok": false, "ratio": 0.0])
+                return
+            }
+            let js = "(() => { const v=[...document.querySelectorAll('video')].sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0]; return v && v.videoWidth && v.videoHeight ? [v.videoWidth, v.videoHeight] : null })()"
+            web.evaluateJavaScript(js) { r, _ in
+                if let d = r as? [Double], d.count == 2, d[0] > 0, d[1] > 0 {
+                    reply.send(["ok": true, "ratio": d[0] / d[1]])
+                } else {
+                    reply.send(["ok": false, "ratio": 0.0])
+                }
+            }
+        }
     }
 
     private func snapshotState() -> [String: Any] {
@@ -2435,195 +2446,24 @@ final class FloatModule: ExactModule {
         notifyChanged()
     }
 
-    private func expandedFrame(for current: NSRect, in vis: NSRect) -> NSRect {
-        let margin: CGFloat = 24
-        let maxW = max(320, vis.width - margin * 2)
-        let maxH = max(240, vis.height - margin * 2)
-        let preferredW = min(maxW, min(vis.width * 0.84, 1440))
-        let preferredH = min(maxH, min(vis.height * 0.84, 960))
-        let targetW = (current.width >= preferredW - 20 ? min(maxW, vis.width * 0.92) : preferredW).rounded()
-        let targetH = (current.height >= preferredH - 20 ? min(maxH, vis.height * 0.92) : preferredH).rounded()
-        let targetX = (vis.midX - targetW / 2).rounded()
-        let targetY = (vis.midY - targetH / 2).rounded()
-        return NSRect(x: targetX, y: targetY, width: targetW, height: targetH)
-    }
-
-    private func clampedToVisibleScreen(_ frame: NSRect, fallbackScreen: NSScreen?) -> NSRect {
-        if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }) {
-            return frame
-        }
-        guard let vis = fallbackScreen?.visibleFrame else { return frame }
-        let w = min(frame.width, vis.width)
-        let h = min(frame.height, vis.height)
-        let x = min(max(frame.origin.x, vis.minX), vis.maxX - w)
-        let y = min(max(frame.origin.y, vis.minY), vis.maxY - h)
-        return NSRect(x: x, y: y, width: w, height: h)
-    }
-
-    private func collectScrollViews(in root: NSView, out: inout [NSScrollView]) {
-        for sub in root.subviews {
-            if let sv = sub as? NSScrollView {
-                out.append(sv)
-            }
-            if !(sub is WKWebView) {
-                collectScrollViews(in: sub, out: &out)
-            }
-        }
-    }
-
-    private func suppressScrollViews(in window: NSWindow) {
-        guard let content = window.contentView else { return }
-        let rootScrollIds = Set(content.subviews.compactMap { ($0 as? NSScrollView).map(ObjectIdentifier.init) })
-        var allScrolls: [NSScrollView] = []
-        collectScrollViews(in: content, out: &allScrolls)
-        for sv in allScrolls {
-            let id = ObjectIdentifier(sv)
-            if rootScrollIds.contains(id) {
-                sv.hasVerticalScroller = false
-                sv.hasHorizontalScroller = false
-            } else {
-                if !savedNestedScrollers.contains(where: { $0.id == id }) {
-                    savedNestedScrollers.append((id: id, view: sv, v: sv.hasVerticalScroller, h: sv.hasHorizontalScroller))
-                }
-                sv.hasVerticalScroller = false
-                sv.hasHorizontalScroller = false
-            }
-            sv.verticalScroller?.isHidden = true
-            sv.horizontalScroller?.isHidden = true
-        }
-    }
-
-    private func restoreNestedScrollers() {
-        let toRestore = savedNestedScrollers
-        savedNestedScrollers.removeAll()
-        for entry in toRestore {
-            entry.view.hasVerticalScroller = entry.v
-            entry.view.hasHorizontalScroller = entry.h
-            if entry.v { entry.view.verticalScroller?.isHidden = false }
-            if entry.h { entry.view.horizontalScroller?.isHidden = false }
-        }
-    }
-
-    /// Animates the window frame outside Exact's synchronous `native.call` turn so
-    /// `ExactView.fit()` can reflow live on every frame while suppressing transient AppKit scrollers.
-    private func setWindowFrame(
-        _ target: NSRect,
-        on window: NSWindow,
-        animate: Bool,
-        completion: ((NSWindow) -> Void)? = nil
-    ) {
-        resizeScrollerToken += 1
-        let token = resizeScrollerToken
-        DispatchQueue.main.async { [weak self, weak window] in
-            guard let self, let window, self.resizeScrollerToken == token else { return }
-            self.suppressScrollViews(in: window)
-            if !animate {
-                window.setFrame(target, display: true, animate: false)
-                completion?(window)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                    guard let self, self.resizeScrollerToken == token else { return }
-                    self.restoreNestedScrollers()
-                }
-                return
-            }
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.22
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                window.animator().setFrame(target, display: true)
-            }, completionHandler: { [weak self, weak window] in
-                guard let self, self.resizeScrollerToken == token else { return }
-                if let window { completion?(window) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                    guard let self, self.resizeScrollerToken == token else { return }
-                    self.restoreNestedScrollers()
-                }
-            })
-        }
-    }
-
     func toggleExpand() {
-        if expanded {
-            expanded = false
-            let restoreFrame = preExpandFrame
-            let restoreAspect = preExpandAspectRatio
-            preExpandFrame = nil
-            preExpandAspectRatio = nil
-            if !context.agent, let window = hostWindow {
-                let restoreWindowState: (NSWindow) -> Void = { [weak self] win in
-                    if self?.aspectLocked == true, let ratio = restoreAspect, ratio.width > 0, ratio.height > 0 {
-                        win.contentAspectRatio = ratio
-                    }
-                    win.setFrameAutosaveName("FloatWindow")
-                }
-                if let frame = restoreFrame {
-                    let target = clampedToVisibleScreen(frame, fallbackScreen: window.screen ?? NSScreen.main)
-                    let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-                    setWindowFrame(target, on: window, animate: animate, completion: restoreWindowState)
-                } else {
-                    restoreWindowState(window)
-                }
-            }
-            notifyChanged()
-            return
-        }
-        expanded = true
-        if !context.agent, let window = hostWindow, let vis = (window.screen ?? NSScreen.main)?.visibleFrame {
-            let current = window.frame
-            preExpandFrame = current
-            preExpandAspectRatio = aspectLocked ? window.contentAspectRatio : nil
-            window.saveFrame(usingName: "FloatWindow")
-            window.setFrameAutosaveName("")
-            if aspectLocked {
-                window.contentResizeIncrements = NSSize(width: 1, height: 1)
-            }
-            let target = expandedFrame(for: current, in: vis)
-            let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            setWindowFrame(target, on: window, animate: animate)
-        }
+        expanded.toggle()
         notifyChanged()
     }
 
-    func toggleAspectLock() {
-        preExpandAspectRatio = nil
-        if aspectLocked {
-            aspectLocked = false
-            hostWindow?.contentResizeIncrements = NSSize(width: 1, height: 1)
-            notifyChanged()
-            return
-        }
-        if context.agent {
-            aspectLocked = true
-            notifyChanged()
-            return
-        }
-        guard let web = browser?.web else { return }
-        let js = "(() => { const v=[...document.querySelectorAll('video')].sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0]; return v && v.videoWidth ? [v.videoWidth, v.videoHeight] : null })()"
-        web.evaluateJavaScript(js) { [weak self] r, _ in
-            guard let self, let window = self.hostWindow, let d = r as? [Double], d.count == 2, d[1] > 0 else { return }
-            var f = window.frame
-            let h = (f.width * d[1] / d[0]).rounded()
-            f.origin.y += f.height - h
-            f.size.height = h
-            let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            self.setWindowFrame(f, on: window, animate: animate) { win in
-                if self.aspectLocked {
-                    win.contentAspectRatio = NSSize(width: d[0], height: d[1])
-                }
-            }
-            self.aspectLocked = true
-            self.notifyChanged()
-        }
+    func setAspectLocked(_ locked: Bool) {
+        guard aspectLocked != locked else { return }
+        aspectLocked = locked
+        notifyChanged()
     }
 
     func toggleTop() {
         onTop.toggle()
-        hostWindow?.level = onTop ? .floating : .normal
         notifyChanged()
     }
 
     func toggleClickThrough() {
         clickThrough.toggle()
-        hostWindow?.ignoresMouseEvents = clickThrough
         if clickThrough && alpha > 0.6 {
             setAlpha(0.6)
         } else {
@@ -2631,6 +2471,7 @@ final class FloatModule: ExactModule {
         }
     }
 
+    /// Used by global Quick Fade (`peeking`), which still runs via Carbon/NSEvent when Float is inactive.
     private func applyEffectiveAlpha(animated: Bool = true) {
         guard let window = hostWindow else { return }
         if openingMorph != nil { return }
@@ -2649,7 +2490,6 @@ final class FloatModule: ExactModule {
     func setAlpha(_ value: Double) {
         alpha = min(1.0, max(0.15, value))
         store.alpha = alpha
-        applyEffectiveAlpha()
         notifyChanged()
     }
 
@@ -2853,32 +2693,8 @@ final class FloatModule: ExactModule {
     // tag 0–2: top left/center/right, 3–5: bottom left/center/right
     func dock(_ tag: Int) {
         guard (0...5).contains(tag) else { return }
-        let wasExpanded = expanded
-        let restoreSize = preExpandFrame?.size
-        let restoreAspect = preExpandAspectRatio
-        if wasExpanded {
+        if expanded {
             expanded = false
-            preExpandFrame = nil
-            preExpandAspectRatio = nil
-        }
-        if !context.agent, let window = hostWindow, let vis = (window.screen ?? NSScreen.main)?.visibleFrame {
-            let m: CGFloat = 12
-            let size = restoreSize ?? window.frame.size
-            let w = min(size.width, max(160, vis.width - m * 2))
-            let h = min(size.height, max(90, vis.height - m * 2))
-            let x = [vis.minX + m, vis.midX - w / 2, vis.maxX - w - m][tag % 3]
-            let y = tag < 3 ? vis.maxY - h - m : vis.minY + m
-            let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            setWindowFrame(NSRect(x: x, y: y, width: w, height: h), on: window, animate: animate) { [weak self] win in
-                if wasExpanded {
-                    if self?.aspectLocked == true, let ratio = restoreAspect, ratio.width > 0, ratio.height > 0 {
-                        win.contentAspectRatio = ratio
-                    }
-                    win.setFrameAutosaveName("FloatWindow")
-                }
-            }
-        }
-        if wasExpanded {
             notifyChanged()
         }
     }

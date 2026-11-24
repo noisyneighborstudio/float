@@ -31,6 +31,10 @@ if [[ -z ${RUSTUP_HOME:-} ]] && command -v rustup >/dev/null 2>&1; then
 fi
 BUN=${BUN:-$(command -v bun)}
 
+# Ensure .exact/checkout resolves local @exact/* packages before building
+mkdir -p .exact
+ln -sfn "$EXACT2" .exact/checkout
+
 # Clean prior bundle before Exact's source baker scans the workspace
 rm -rf "$APP"
 

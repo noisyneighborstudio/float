@@ -1,4 +1,6 @@
 // Float: chromeless, always-on-top video browser built with Exact.
+use getScreenDetails, getWindowBounds, ScreenDetails, WindowBounds from "@exact/window-management"
+
 routes nav
   home "/"
   open "/open"
@@ -49,6 +51,10 @@ shape FloatState
 
 shape Reply
   ok: bool
+
+shape AspectReply
+  ok: bool
+  ratio: number
 
 fn pad2(n: number): string = n < 10 ? `0${n}` : `${n}`
 
@@ -154,13 +160,25 @@ component Float
   state urlDraft = ""
   state selectSeq = 0
   state hoveredHost = ""
+  state dragStripHovered = false
   state prevFrame = ""
   state shownFrame = ""
   state browserDragging = false
+  state savedBoundsX = 0
+  state savedBoundsY = 0
+  state savedBoundsW = 0
+  state savedBoundsH = 0
+  state hasSavedBounds = false
+  state lockedAspect = 0
+  state pendingBoundsOp = ""
+  state pendingDockTag = 0
 
   resource vp = exactViewport() as shape Viewport
+  resource screens = getScreenDetails() as shape ScreenDetails else empty()
   resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, shortcutsOpen=false, peekPermissionGranted=true)
   mutation cmd as shape Reply queue refreshes st
+  mutation bounds as shape WindowBounds then applyWindowBounds
+  mutation videoAspect as shape AspectReply then applyVideoAspect
 
   derive isHome = st.mode == "home"
   derive hasSites = st.sites.length > 0
@@ -217,6 +235,8 @@ component Float
       send cmd = runFloatCommand("key", `${mods}:${k}`)
 
   action checkInitialRoute
+    setWindowAlwaysOnTop(st.onTop)
+    setWindowIgnoreMouseEvents(st.clickThrough)
     let topEntry = top(nav)
     if topEntry.name == "open"
       let incoming = searchParam(topEntry, "u")
@@ -330,6 +350,9 @@ component Float
       if hoveredHost == host
         hoveredHost = ""
 
+  action hoverDragStrip(inside: bool)
+    dragStripHovered = inside
+
   action openClipboard
     urlOpen = false
     send cmd = runFloatCommand("openClipboard", "")
@@ -346,29 +369,150 @@ component Float
   action toggleFill
     send cmd = runFloatCommand("toggleFill", "")
 
+  action applyWindowBounds
+    let op = pendingBoundsOp
+    pendingBoundsOp = ""
+    match bounds
+      case some(b)
+        if b.outerWidth > 0 and b.outerHeight > 0
+          let s = screens.currentScreen
+          let availL = s.availLeft
+          let availT = s.availTop
+          let availW = s.availWidth > 0 ? s.availWidth : 1440
+          let availH = s.availHeight > 0 ? s.availHeight : 900
+          if op == "expand"
+            savedBoundsX = b.screenX
+            savedBoundsY = b.screenY
+            savedBoundsW = b.outerWidth
+            savedBoundsH = b.outerHeight
+            hasSavedBounds = true
+            let margin = 24
+            let maxW = max(320, availW - margin * 2)
+            let maxH = max(240, availH - margin * 2)
+            let prefW = min(maxW, min(availW * 0.84, 1440))
+            let prefH = min(maxH, min(availH * 0.84, 960))
+            let targetW = round(b.outerWidth >= prefW - 20 ? min(maxW, availW * 0.92) : prefW)
+            let targetH = round(b.outerHeight >= prefH - 20 ? min(maxH, availH * 0.92) : prefH)
+            let targetX = round(availL + (availW - targetW) / 2)
+            let targetY = round(availT + (availH - targetH) / 2)
+            if st.aspectLocked
+              setAspectRatio(0)
+            setBounds(DOMRect(x=targetX, y=targetY, width=targetW, height=targetH), true)
+          else if op == "dock"
+            let m = 12
+            let tag = pendingDockTag
+            let w = min(b.outerWidth, max(160, availW - m * 2))
+            let h = min(b.outerHeight, max(90, availH - m * 2))
+            let col = tag - floor(tag / 3) * 3
+            let x = col == 0 ? availL + m : (col == 1 ? round(availL + (availW - w) / 2) : availL + availW - w - m)
+            let y = tag < 3 ? availT + m : availT + availH - h - m
+            setBounds(DOMRect(x=x, y=y, width=w, height=h), true)
+          else if op == "aspect"
+            if lockedAspect > 0
+              let h = max(90, round(b.outerWidth / lockedAspect))
+              setBounds(DOMRect(x=b.screenX, y=b.screenY, width=b.outerWidth, height=h), true)
+              setAspectRatio(lockedAspect)
+      case none
+        pendingBoundsOp = ""
+
+  action applyVideoAspect
+    match videoAspect
+      case some(a)
+        if a.ok and a.ratio > 0
+          lockedAspect = a.ratio
+          pendingBoundsOp = "aspect"
+          send bounds = getWindowBounds()
+          send cmd = runFloatCommand("setAspectLocked", "true")
+      case none
+        lockedAspect = 0
+
   action toggleExpand
-    send cmd = runFloatCommand("toggleExpand", "")
+    if st.expanded
+      pendingBoundsOp = ""
+      if hasSavedBounds and savedBoundsW > 0 and savedBoundsH > 0
+        let s = screens.currentScreen
+        let availL = s.availLeft
+        let availT = s.availTop
+        let availW = s.availWidth > 0 ? s.availWidth : 1440
+        let availH = s.availHeight > 0 ? s.availHeight : 900
+        let offscreen = (
+          savedBoundsX + savedBoundsW <= availL
+          or savedBoundsX >= availL + availW
+          or savedBoundsY + savedBoundsH <= availT
+          or savedBoundsY >= availT + availH
+        )
+        let rw = offscreen ? min(savedBoundsW, availW) : savedBoundsW
+        let rh = offscreen ? min(savedBoundsH, availH) : savedBoundsH
+        let rx = offscreen ? min(max(savedBoundsX, availL), availL + availW - rw) : savedBoundsX
+        let ry = offscreen ? min(max(savedBoundsY, availT), availT + availH - rh) : savedBoundsY
+        hasSavedBounds = false
+        setBounds(DOMRect(x=rx, y=ry, width=rw, height=rh), true)
+      else
+        hasSavedBounds = false
+      if st.aspectLocked and lockedAspect > 0
+        setAspectRatio(lockedAspect)
+      send cmd = runFloatCommand("toggleExpand", "")
+    else
+      pendingBoundsOp = "expand"
+      send bounds = getWindowBounds()
+      send cmd = runFloatCommand("toggleExpand", "")
 
   action toggleAspectLock
-    send cmd = runFloatCommand("toggleAspectLock", "")
+    if st.aspectLocked
+      lockedAspect = 0
+      setAspectRatio(0)
+      send cmd = runFloatCommand("setAspectLocked", "false")
+    else
+      send videoAspect = queryVideoAspect()
 
   action toggleTop
+    setWindowAlwaysOnTop(not st.onTop)
     send cmd = runFloatCommand("toggleTop", "")
 
   action toggleClickThrough
+    let nextClickThrough = not st.clickThrough
+    setWindowIgnoreMouseEvents(nextClickThrough)
+    if nextClickThrough and st.alpha > 0.6
+      setWindowOpacity(st.peeking ? min(0.6, st.peekAlpha) : 0.6, 160)
     send cmd = runFloatCommand("toggleClickThrough", "")
 
   action fadeOut
+    let nextAlpha = round(max(0.15, st.alpha - 0.1) * 100) / 100
+    setWindowOpacity(st.peeking ? min(nextAlpha, st.peekAlpha) : nextAlpha, 160)
     send cmd = runFloatCommand("fadeOut", "")
 
   action fadeIn
+    let nextAlpha = round(min(1, st.alpha + 0.1) * 100) / 100
+    setWindowOpacity(st.peeking ? min(nextAlpha, st.peekAlpha) : nextAlpha, 160)
     send cmd = runFloatCommand("fadeIn", "")
 
   action playPause
     send cmd = runFloatCommand("playPause", "")
 
-  action dockPosition(pos: string)
-    send cmd = runFloatCommand("dock", pos)
+  action dockPosition(tag: number)
+    if st.expanded and hasSavedBounds and savedBoundsW > 0 and savedBoundsH > 0
+      let s = screens.currentScreen
+      let availL = s.availLeft
+      let availT = s.availTop
+      let availW = s.availWidth > 0 ? s.availWidth : 1440
+      let availH = s.availHeight > 0 ? s.availHeight : 900
+      let m = 12
+      let w = min(savedBoundsW, max(160, availW - m * 2))
+      let h = min(savedBoundsH, max(90, availH - m * 2))
+      let col = tag - floor(tag / 3) * 3
+      let x = col == 0 ? availL + m : (col == 1 ? round(availL + (availW - w) / 2) : availL + availW - w - m)
+      let y = tag < 3 ? availT + m : availT + availH - h - m
+      hasSavedBounds = false
+      pendingBoundsOp = ""
+      setBounds(DOMRect(x=x, y=y, width=w, height=h), true)
+      if st.aspectLocked and lockedAspect > 0
+        setAspectRatio(lockedAspect)
+      send cmd = runFloatCommand("dock", `${tag}`)
+    else
+      pendingDockTag = tag
+      pendingBoundsOp = "dock"
+      send bounds = getWindowBounds()
+      send cmd = runFloatCommand("dock", `${tag}`)
 
   action recordHotKey
     send cmd = runFloatCommand("recordHotKey", "")
@@ -580,14 +724,20 @@ component Float
                         text "×"
 
       // Top-edge 18px drag strip: hover reveals, drag moves window, double-click locks video aspect
-      float-drag-strip id="drag-strip"
+      view id="drag-strip"
         testId="drag-strip"
+        app-region="drag"
+        dblclick=toggleAspectLock
+        hover=hoverDragStrip
         position="absolute"
         top=0
         left=0
         right=0
         height=18
         z-index=20
+        background-color="light-dark(rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.45))"
+        opacity=(dragStripHovered ? 1 : 0)
+        transition=(vp.prefersReducedMotion ? "none" : "opacity 160ms ease")
 
       // Floating URL / search bar overlay (⌘L)
       if urlOpen
@@ -843,7 +993,7 @@ component Float
           width=4
           height=4
           overflow="hidden"
-          press=dockPosition("0")
+          press=dockPosition(0)
           -exact-menu="window"
           aria-keyshortcuts="Control+Meta+1"
           aria-label="Top Left"
@@ -852,7 +1002,7 @@ component Float
           width=4
           height=4
           overflow="hidden"
-          press=dockPosition("1")
+          press=dockPosition(1)
           -exact-menu="window"
           aria-keyshortcuts="Control+Meta+2"
           aria-label="Top Center"
@@ -861,7 +1011,7 @@ component Float
           width=4
           height=4
           overflow="hidden"
-          press=dockPosition("2")
+          press=dockPosition(2)
           -exact-menu="window"
           aria-keyshortcuts="Control+Meta+3"
           aria-label="Top Right"
@@ -870,7 +1020,7 @@ component Float
           width=4
           height=4
           overflow="hidden"
-          press=dockPosition("3")
+          press=dockPosition(3)
           -exact-menu="window"
           aria-keyshortcuts="Control+Meta+4"
           aria-label="Bottom Left"
@@ -879,7 +1029,7 @@ component Float
           width=4
           height=4
           overflow="hidden"
-          press=dockPosition("4")
+          press=dockPosition(4)
           -exact-menu="window"
           aria-keyshortcuts="Control+Meta+5"
           aria-label="Bottom Center"
@@ -888,7 +1038,7 @@ component Float
           width=4
           height=4
           overflow="hidden"
-          press=dockPosition("5")
+          press=dockPosition(5)
           -exact-menu="window"
           aria-keyshortcuts="Control+Meta+6"
           aria-label="Bottom Right"

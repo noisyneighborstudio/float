@@ -59,7 +59,7 @@ cat > $pub/appcast.xml <<XML
 <channel><title>Float Updates</title><item>
 <title>Float $version</title><pubDate>$published</pubDate>
 <link>https://github.com/$FLOAT_UPDATES_REPO/releases/latest</link>
-<sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+<sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
 <enclosure url="$url" sparkle:version="$build" sparkle:shortVersionString="$version" length="$size" type="application/octet-stream" sparkle:edSignature="$signature"/>
 </item></channel></rss>
 XML
