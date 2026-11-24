@@ -1,12 +1,12 @@
 {
-  "version": "1.6.0",
-  "tag": "v1.6.0",
-  "build": 18,
-  "url": "https://github.com/noisyneighborstudio/float/releases/download/v1.6.0/Float-1.6.0.zip",
-  "releaseUrl": "https://github.com/noisyneighborstudio/float/releases/tag/v1.6.0",
-  "sizeBytes": 14957657,
-  "sizeLabel": "14.3 MB",
+  "version": "1.7.0",
+  "tag": "v1.7.0",
+  "build": 21,
+  "url": "https://github.com/noisyneighborstudio/float/releases/download/v1.7.0/Float-1.7.0.zip",
+  "releaseUrl": "https://github.com/noisyneighborstudio/float/releases/tag/v1.7.0",
+  "sizeBytes": 15819323,
+  "sizeLabel": "15.1 MB",
   "minMacOS": "13.0",
-  "publishedAt": "Sun, 22 Nov 2026 20:48:25 +0000",
-  "edSignature": "HW7FyvfmjqygMJ5/lSmpVZhP1gCT0ujQg4gCHgRdnSpOTu/+9bsrPLEo1PI4Zexpzaz5+JGlcZH5YmEuDxEcCw=="
+  "publishedAt": "Tue, 24 Nov 2026 16:55:21 +0000",
+  "edSignature": "oH9oFRTEjR7m5Y/z2qDM28RmMcLUyNm2vFV/FOrSXnSBiiNwO1XW3dkns34qq8s+6NQVLEdiZ1tUo0HJDk2KBw=="
 }
