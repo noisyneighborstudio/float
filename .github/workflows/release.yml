@@ -70,8 +70,11 @@ jobs:
           security import "$cert" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
           # Isolate the unlocked temporary build keychain during release signing so codesign
-          # does not hit an ambiguous-identity conflict with the runner's login keychain.
+          # does not hit an ambiguous-identity conflict with the runner's login keychain,
+          # and set it as default so `xcrun notarytool` reads `exact-notary` without hitting
+          # a locked login keychain in headless LaunchAgent sessions.
           security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
           xcrun notarytool store-credentials exact-notary \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
@@ -100,4 +103,5 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary.p8"
           security delete-keychain "$RUNNER_TEMP/float.keychain-db" 2>/dev/null || true
+          security default-keychain -d user -s "$HOME/Library/Keychains/login.keychain-db" || true
           security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db" || true
