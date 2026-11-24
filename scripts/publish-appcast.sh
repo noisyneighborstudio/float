@@ -13,8 +13,18 @@ source ./updates.env
 artifact=dist/Float-$version.zip
 [[ -f $artifact ]] || { echo "✗ missing $artifact; prepare did not run" >&2; exit 1; }
 
+# Fetch Sparkle's sign_update CLI on cache miss (app bundle itself embeds Sparkle via Exact swiftPackages)
+SPARKLE=.vendor/Sparkle-$SPARKLE_VERSION
+if [[ ! -x $SPARKLE/bin/sign_update ]]; then
+  mkdir -p "$SPARKLE"
+  curl -fsSL --retry 30 --retry-all-errors --retry-delay 20 -o "$SPARKLE.tar.xz" \
+    "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz"
+  echo "$SPARKLE_SHA256  $SPARKLE.tar.xz" | shasum -a 256 -c - >/dev/null
+  tar -xJf "$SPARKLE.tar.xz" -C "$SPARKLE" bin/sign_update && rm "$SPARKLE.tar.xz"
+fi
+
 # key via stdin: never on disk, never in argv
-signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | .vendor/Sparkle-$SPARKLE_VERSION/bin/sign_update -f - -p $artifact)
+signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE/bin/sign_update" -f - -p "$artifact")
 [[ ${#signature} -eq 88 ]] || { echo "✗ unexpected signature from sign_update" >&2; exit 1; }
 # a key that doesn't match the app's SUPublicEDKey makes every client reject the update
 public_key=$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' build/Float.app/Contents/Info.plist)
@@ -49,7 +59,7 @@ cat > $pub/appcast.xml <<XML
 <channel><title>Float Updates</title><item>
 <title>Float $version</title><pubDate>$published</pubDate>
 <link>https://github.com/$FLOAT_UPDATES_REPO/releases/latest</link>
-<sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+<sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
 <enclosure url="$url" sparkle:version="$build" sparkle:shortVersionString="$version" length="$size" type="application/octet-stream" sparkle:edSignature="$signature"/>
 </item></channel></rss>
 XML

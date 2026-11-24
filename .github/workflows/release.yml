@@ -53,9 +53,11 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
           NOTARY_KEY: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_KEY_ISSUER: ${{ secrets.NOTARY_KEY_ISSUER }}
         run: |
           set -euo pipefail
-          for name in CERTIFICATE CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD NOTARY_KEY; do
+          for name in CERTIFICATE CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD NOTARY_KEY NOTARY_KEY_ID NOTARY_KEY_ISSUER; do
             [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
           done
           cert="$RUNNER_TEMP/developer-id.p12"; keychain="$RUNNER_TEMP/float.keychain-db"
@@ -70,6 +72,11 @@ jobs:
           # Isolate the unlocked temporary build keychain during release signing so codesign
           # does not hit an ambiguous-identity conflict with the runner's login keychain.
           security list-keychains -d user -s "$keychain"
+          xcrun notarytool store-credentials exact-notary \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_KEY_ISSUER" \
+            --keychain "$keychain"
       - name: Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -77,15 +84,15 @@ jobs:
           FLOAT_BUILD_NUMBER: ${{ github.run_number }}
           SIGN: ${{ secrets.DEVELOPER_ID_APPLICATION }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-          NOTARY_KEY_PATH: ${{ runner.temp }}/notary.p8
-          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
-          NOTARY_KEY_ISSUER: ${{ secrets.NOTARY_KEY_ISSUER }}
+          EXACT_NOTARY_PROFILE: exact-notary
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-          for name in SIGN SPARKLE_PRIVATE_KEY NOTARY_KEY_ID NOTARY_KEY_ISSUER; do
+          for name in SIGN SPARKLE_PRIVATE_KEY; do
             [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
           done
+          mkdir -p .exact
+          ln -sfn "$EXACT" .exact/checkout
           npm ci --no-audit --no-fund
           npx semantic-release
       - name: Remove temporary credentials
