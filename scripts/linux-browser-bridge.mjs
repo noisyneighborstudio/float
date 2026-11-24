@@ -226,6 +226,18 @@ function fillScript(on) {
   })();`;
 }
 
+function videoFilterScript(brightness, contrast) {
+  const b = Number(brightness || 1).toFixed(2);
+  const c = Number(contrast || 1).toFixed(2);
+  return `(() => {
+    const ID = '__fp_video_filter', B = ${b}, C = ${c};
+    let s = document.getElementById(ID);
+    if (Math.abs(B - 1) < 0.005 && Math.abs(C - 1) < 0.005) { if (s) s.remove(); return; }
+    if (!s) { s = document.createElement('style'); s.id = ID; (document.head || document.documentElement).appendChild(s); }
+    s.textContent = \`video { filter: brightness(\${B}) contrast(\${C}) !important; }\`;
+  })();`;
+}
+
 const DEFAULT_STATE = {
   mode: 'home',
   currentUrl: '',
@@ -237,6 +249,8 @@ const DEFAULT_STATE = {
   aspectLocked: false,
   clickThrough: false,
   alpha: 1,
+  videoBrightness: 1,
+  videoContrast: 1,
   hotkeyLabel: '⌃⌥⌘F',
   peekTrigger: 'rightCommand',
   peekAlpha: 0.5,
@@ -322,6 +336,8 @@ function buildFloatState() {
     aspectLocked: data.aspectLocked,
     clickThrough: data.clickThrough,
     alpha: data.alpha,
+    videoBrightness: data.videoBrightness,
+    videoContrast: data.videoContrast,
     hotkeyLabel: data.hotkeyLabel,
     peekTrigger: data.peekTrigger,
     peekAlpha: data.peekAlpha,
@@ -725,6 +741,30 @@ async function handleCommand(op, arg) {
       data.peekHold = arg === 'true';
       data.peeking = false;
       saveState(data);
+      break;
+    case 'setVideoBrightness': {
+      const n = Number(arg);
+      if (Number.isFinite(n)) {
+        data.videoBrightness = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
+        saveState(data);
+        page.evaluate(videoFilterScript(data.videoBrightness, data.videoContrast)).then(() => captureNow(true)).catch(() => {});
+      }
+      break;
+    }
+    case 'setVideoContrast': {
+      const n = Number(arg);
+      if (Number.isFinite(n)) {
+        data.videoContrast = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
+        saveState(data);
+        page.evaluate(videoFilterScript(data.videoBrightness, data.videoContrast)).then(() => captureNow(true)).catch(() => {});
+      }
+      break;
+    }
+    case 'resetVideoFilters':
+      data.videoBrightness = 1;
+      data.videoContrast = 1;
+      saveState(data);
+      page.evaluate(videoFilterScript(1, 1)).then(() => captureNow(true)).catch(() => {});
       break;
     case 'openSettings':
       data.settingsOpen = true;

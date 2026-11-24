@@ -28,6 +28,8 @@ shape FloatState
   aspectLocked: bool
   clickThrough: bool
   alpha: number
+  videoBrightness: number
+  videoContrast: number
   hotkeyLabel: string
   peekTrigger: string
   peekAlpha: number
@@ -175,7 +177,7 @@ component Float
 
   resource vp = exactViewport() as shape Viewport
   resource screens = getScreenDetails() as shape ScreenDetails else empty()
-  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, shortcutsOpen=false, peekPermissionGranted=true)
+  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, videoContrast=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, shortcutsOpen=false, peekPermissionGranted=true)
   mutation cmd as shape Reply queue refreshes st
   mutation bounds as shape WindowBounds then applyWindowBounds
   mutation videoAspect as shape AspectReply then applyVideoAspect
@@ -197,6 +199,8 @@ component Float
   )
   derive hotkeyMenuTitle = `Show/Hide Hotkey: ${st.hotkeyLabel != "" ? st.hotkeyLabel : "None"}…`
   derive peekPercent = `${round(st.peekAlpha * 100)}%`
+  derive brightnessPercent = `${round(st.videoBrightness * 100)}%`
+  derive contrastPercent = `${round(st.videoContrast * 100)}%`
 
   task onLaunch mount
     after(1, checkInitialRoute)
@@ -303,6 +307,23 @@ component Float
 
   action setPeekHold(hold: string)
     send cmd = runFloatCommand("setPeekHold", hold)
+
+  action setVideoBrightness(val: string)
+    send cmd = runFloatCommand("setVideoBrightness", val)
+
+  action stepVideoBrightness(delta: number)
+    let next = round(min(2, max(0.5, st.videoBrightness + delta)) * 100) / 100
+    send cmd = runFloatCommand("setVideoBrightness", `${next}`)
+
+  action setVideoContrast(val: string)
+    send cmd = runFloatCommand("setVideoContrast", val)
+
+  action stepVideoContrast(delta: number)
+    let next = round(min(2, max(0.5, st.videoContrast + delta)) * 100) / 100
+    send cmd = runFloatCommand("setVideoContrast", `${next}`)
+
+  action resetVideoFilters
+    send cmd = runFloatCommand("resetVideoFilters", "")
 
   action editUrl(v: string)
     urlDraft = v
@@ -776,6 +797,25 @@ component Float
             text "Video Fill" color="-exact-secondary-label"
             button press=toggleFill
               text (st.fill ? "On" : "Off")
+          row align-items="center" justify-content="space-between" gap=12
+            text "Brightness" color="-exact-secondary-label"
+            row align-items="center" gap=6
+              button press=stepVideoBrightness(-0.05) aria-label="Decrease Brightness"
+                text "−"
+              text brightnessPercent font-weight=600
+              button press=stepVideoBrightness(0.05) aria-label="Increase Brightness"
+                text "+"
+          row align-items="center" justify-content="space-between" gap=12
+            text "Contrast" color="-exact-secondary-label"
+            row align-items="center" gap=6
+              button press=stepVideoContrast(-0.05) aria-label="Decrease Contrast"
+                text "−"
+              text contrastPercent font-weight=600
+              button press=stepVideoContrast(0.05) aria-label="Increase Contrast"
+                text "+"
+          row align-items="center" justify-content="flex-end"
+            button press=resetVideoFilters aria-label="Reset Video Picture"
+              text "Reset Picture"
 
       // Non-native Keyboard Shortcuts HUD (macOS uses its native Liquid Glass Shortcuts NSPanel)
       if st.shortcutsOpen and not st.nativeBackdrop
@@ -1091,3 +1131,27 @@ component Float
           -exact-menu="none"
           aria-label="Close Shortcuts"
           testId="cmd-shortcuts-close"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=setVideoBrightness("1.25")
+          -exact-menu="none"
+          aria-label="Brightness 125%"
+          testId="cmd-brightness-125"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=setVideoContrast("1.15")
+          -exact-menu="none"
+          aria-label="Contrast 115%"
+          testId="cmd-contrast-115"
+        button appearance="none"
+          width=4
+          height=4
+          overflow="hidden"
+          press=resetVideoFilters
+          -exact-menu="none"
+          aria-label="Reset Video Filters"
+          testId="cmd-filters-reset"
