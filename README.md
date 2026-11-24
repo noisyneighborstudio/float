@@ -147,7 +147,7 @@ bun exact.mjs test macos        # Run Contract tests on macOS
 ```
 
 > [!NOTE]
-> **Code signing & DRM:** `build.sh` signs with `Developer ID Application: Seth Webster (P8ZBH5878Q)` (override with `SIGN=`) and hardened runtime so macOS Keychain grants for streaming DRM survive local rebuilds. Local dev builds omit `Sparkle.framework` and the update feed so they never self-update.
+> **Code signing, Sparkle & DRM:** `app.json` links Sparkle `2.10.1` via `host.macos.swiftPackages` and sets `SUFeedURL`/`SUPublicEDKey`/`SUEnableAutomaticChecks` via `host.macos.infoPlist`. `NOTARIZE=1 ./build.sh` delegates directly to `exact release` to embed Sparkle, sign inside-out with hardened runtime (`Developer ID Application: Seth Webster (P8ZBH5878Q)`), notarize, staple, and assess with Gatekeeper.
 
 ---
 
@@ -157,9 +157,9 @@ bun exact.mjs test macos        # Run Contract tests on macOS
 | :--- | :--- |
 | [`app.contract`](app.contract) | Declarative Exact UI (Home mosaic, Resume card, URL bar, menu & shortcut bindings) |
 | [`app.ts`](app.ts) | State/command bridge and web fallback storage |
-| [`modules/apple/FloatModule.swift`](modules/apple/FloatModule.swift) | Native AppKit + `WKWebView` module (chromeless window, Liquid Glass backdrops, Video Fill script, isolated `WKContentWorld` playback tracking, Quick Fade, Carbon hotkeys, Settings & Shortcuts HUD, dynamic Sparkle bridge) |
+| [`macos/modules/FloatModule.swift`](macos/modules/FloatModule.swift) | Native AppKit + `WKWebView` + Sparkle module (chromeless window, Liquid Glass backdrops, Video Fill script, isolated `WKContentWorld` playback tracking, Quick Fade, Carbon hotkeys, Settings & Shortcuts HUD, `SPUStandardUpdaterController`) |
 | [`app.test.contract`](app.test.contract) | End-to-end Contract test suite (URL resolution, scheme hardening, toggles, Settings, HUD) |
-| [`build.sh`](build.sh) | Bundle assembly, Sparkle embedding, inside-out codesigning, notarization & stapling |
+| [`build.sh`](build.sh) | Thin wrapper over Exact macOS builds & `exact release` notarized packaging |
 | [`site/`](site/) | Zero-build static landing page & interactive desktop demo hosted on Cloudflare Pages |
 | [`scripts/`](scripts/) | Release preparation, Sparkle EdDSA signing/verification, appcast publishing & site version sync |
 | [`docs/offline-playback.md`](docs/offline-playback.md) | Architectural feasibility study on offline playback and DRM constraints |

@@ -844,7 +844,8 @@ component Float
           height=4
           overflow="hidden"
           press=dockPosition("0")
-          -exact-menu="none"
+          -exact-menu="window"
+          aria-keyshortcuts="Control+Meta+1"
           aria-label="Top Left"
           testId="cmd-dock-0"
         button appearance="none"
@@ -852,7 +853,8 @@ component Float
           height=4
           overflow="hidden"
           press=dockPosition("1")
-          -exact-menu="none"
+          -exact-menu="window"
+          aria-keyshortcuts="Control+Meta+2"
           aria-label="Top Center"
           testId="cmd-dock-1"
         button appearance="none"
@@ -860,7 +862,8 @@ component Float
           height=4
           overflow="hidden"
           press=dockPosition("2")
-          -exact-menu="none"
+          -exact-menu="window"
+          aria-keyshortcuts="Control+Meta+3"
           aria-label="Top Right"
           testId="cmd-dock-2"
         button appearance="none"
@@ -868,7 +871,8 @@ component Float
           height=4
           overflow="hidden"
           press=dockPosition("3")
-          -exact-menu="none"
+          -exact-menu="window"
+          aria-keyshortcuts="Control+Meta+4"
           aria-label="Bottom Left"
           testId="cmd-dock-3"
         button appearance="none"
@@ -876,7 +880,8 @@ component Float
           height=4
           overflow="hidden"
           press=dockPosition("4")
-          -exact-menu="none"
+          -exact-menu="window"
+          aria-keyshortcuts="Control+Meta+5"
           aria-label="Bottom Center"
           testId="cmd-dock-4"
         button appearance="none"
@@ -884,7 +889,8 @@ component Float
           height=4
           overflow="hidden"
           press=dockPosition("5")
-          -exact-menu="none"
+          -exact-menu="window"
+          aria-keyshortcuts="Control+Meta+6"
           aria-label="Bottom Right"
           testId="cmd-dock-5"
         button appearance="none"

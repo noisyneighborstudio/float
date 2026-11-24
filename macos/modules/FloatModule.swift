@@ -5,6 +5,7 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 import QuartzCore
+import Sparkle
 
 private let floatRightCommandMask: UInt = 0x0000_0010 // NX_DEVICERCMDKEYMASK
 private let floatRightOptionMask: UInt = 0x0000_0040  // NX_DEVICERALTKEYMASK
@@ -461,41 +462,27 @@ private final class FloatStore {
     }
 }
 
-/// Dynamic Sparkle loader: activates only when SUFeedURL is baked into Info.plist (release builds)
-/// and Sparkle.framework is present in Contents/Frameworks/. Dev builds never self-update and need
-/// no compile-time Sparkle dependency.
-private final class SparkleBridge {
-    private var controller: NSObject?
+/// Process-wide Sparkle 2 updater controller (linked via host.macos.swiftPackages).
+private final class FloatUpdater {
+    static let shared = FloatUpdater()
+    private lazy var controller = SPUStandardUpdaterController(
+        startingUpdater: true,
+        updaterDelegate: nil,
+        userDriverDelegate: nil
+    )
 
-    init() {
-        guard Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil else { return }
-        guard let fwURL = Bundle.main.privateFrameworksURL?.appendingPathComponent("Sparkle.framework"),
-              let bundle = Bundle(url: fwURL), bundle.load() else { return }
-        guard let cls = NSClassFromString("SPUStandardUpdaterController") as? NSObject.Type else { return }
-        let allocSel = NSSelectorFromString("alloc")
-        let initSel = NSSelectorFromString("initWithStartingUpdater:updaterDelegate:userDriverDelegate:")
-        guard let allocImp = cls.method(for: allocSel),
-              let initImp = cls.instanceMethod(for: initSel) else { return }
-        typealias AllocFn = @convention(c) (AnyClass, Selector) -> AnyObject
-        typealias InitFn = @convention(c) (AnyObject, Selector, Bool, AnyObject?, AnyObject?) -> AnyObject
-        let allocFn = unsafeBitCast(allocImp, to: AllocFn.self)
-        let initFn = unsafeBitCast(initImp, to: InitFn.self)
-        let instance = allocFn(cls, allocSel)
-        controller = initFn(instance, initSel, true, nil, nil) as? NSObject
+    func start() {
+        _ = controller
     }
 
     var canCheckForUpdates: Bool {
-        guard let controller,
-              let updater = controller.value(forKey: "updater") as? NSObject,
-              let value = updater.value(forKey: "canCheckForUpdates") as? Bool else { return false }
-        return value
+        controller.updater.canCheckForUpdates
     }
 
     func checkForUpdates() {
-        guard let controller else { return }
-        let sel = NSSelectorFromString("checkForUpdates:")
-        if controller.responds(to: sel) {
-            _ = controller.perform(sel, with: nil)
+        // Open Sparkle's window on the next main-queue turn, not inside native.call.
+        DispatchQueue.main.async { [self] in
+            controller.checkForUpdates(nil)
         }
     }
 }
@@ -1944,15 +1931,6 @@ private final class FloatOpeningMorphController: NSObject {
     }
 }
 
-/// Target for Float's dedicated Position menu (⌃⌘1–6).
-private final class FloatPositionMenuTarget: NSObject {
-    weak var module: FloatModule?
-
-    @objc func dock(_ sender: NSMenuItem) {
-        module?.dock(sender.tag)
-    }
-}
-
 final class FloatModule: ExactModule {
     override class var views: [String: ExactNativeFactory] {
         [
@@ -1966,7 +1944,6 @@ final class FloatModule: ExactModule {
     }
 
     private let store: FloatStore
-    private let sparkle: SparkleBridge
     private weak var hostWindow: NSWindow?
     private weak var browser: FloatBrowserInstance?
     private var homeBackdropView: NSView?
@@ -1981,9 +1958,7 @@ final class FloatModule: ExactModule {
     private var peekGlobalFlagsMonitor: Any?
     private var peekLocalFlagsMonitor: Any?
     private var activeObserver: NSObjectProtocol?
-    private var controlSpaceMonitor: Any?
-    private let positionTarget = FloatPositionMenuTarget()
-    private var positionMenuItem: NSMenuItem?
+    private var shortcutsKeyMonitor: Any?
     private var pendingUrlLoad: String?
     private var cliHandled = false
     private var lastSelectSeq: String?
@@ -2015,15 +1990,14 @@ final class FloatModule: ExactModule {
 
     required init(context: ExactModuleContext) {
         store = FloatStore(agent: context.agent, dataDir: context.data)
-        sparkle = SparkleBridge()
         fill = store.fill
         alpha = store.alpha
         peekTrigger = store.peekTrigger
         peekAlpha = min(0.95, max(0.15, store.peekAlpha))
         peekHold = store.peekHold
         super.init(context: context)
-        positionTarget.module = self
         if !context.agent {
+            FloatUpdater.shared.start()
             FloatHotKeyCenter.shared.active = self
             FloatHotKeyCenter.shared.installIfNeeded()
             registerHotKey()
@@ -2056,13 +2030,9 @@ final class FloatModule: ExactModule {
             NotificationCenter.default.removeObserver(obs)
             activeObserver = nil
         }
-        if let mon = controlSpaceMonitor {
+        if let mon = shortcutsKeyMonitor {
             NSEvent.removeMonitor(mon)
-            controlSpaceMonitor = nil
-        }
-        if let item = positionMenuItem {
-            item.menu?.removeItem(item)
-            positionMenuItem = nil
+            shortcutsKeyMonitor = nil
         }
         if FloatHotKeyCenter.shared.active === self {
             FloatHotKeyCenter.shared.active = nil
@@ -2140,8 +2110,7 @@ final class FloatModule: ExactModule {
         if exactWindow.isNew {
             let willMorph = !openingPlayed && shouldAnimateOpening
             configureChromelessWindow(w, deferVisibility: willMorph)
-            installPositionMenu()
-            installControlSpaceMonitor()
+            installShortcutsKeyMonitor()
             if !cliHandled, !context.agent, ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1" {
                 cliHandled = true
                 if let arg = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
@@ -2257,44 +2226,14 @@ final class FloatModule: ExactModule {
         }
     }
 
-    private func installPositionMenu() {
-        guard let mainMenu = NSApp.mainMenu else { return }
-        // Display ⌃Space beside View › Play / Pause (ShortcutHost only populates Command equivalents)
-        if let viewMenu = mainMenu.items.first(where: { $0.submenu?.title == "View" })?.submenu,
-           let playItem = viewMenu.items.first(where: { $0.title == "Play / Pause" }) {
-            playItem.keyEquivalent = " "
-            playItem.keyEquivalentModifierMask = .control
-        }
-        if let existing = positionMenuItem, existing.menu === mainMenu { return }
-        let posMenu = NSMenu(title: "Position")
-        let titles = ["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"]
-        for (i, title) in titles.enumerated() {
-            let item = NSMenuItem(title: title, action: #selector(FloatPositionMenuTarget.dock(_:)), keyEquivalent: "\(i + 1)")
-            item.keyEquivalentModifierMask = [.control, .command]
-            item.tag = i
-            item.target = positionTarget
-            posMenu.addItem(item)
-        }
-        let host = NSMenuItem(title: "Position", action: nil, keyEquivalent: "")
-        host.submenu = posMenu
-        let viewIndex = mainMenu.items.firstIndex { $0.submenu?.title == "View" }
-        let insertAt = viewIndex.map { $0 + 1 } ?? mainMenu.numberOfItems
-        mainMenu.insertItem(host, at: min(insertAt, mainMenu.numberOfItems))
-        positionMenuItem = host
-    }
-
-    private func installControlSpaceMonitor() {
-        guard controlSpaceMonitor == nil else { return }
-        controlSpaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+    private func installShortcutsKeyMonitor() {
+        guard shortcutsKeyMonitor == nil else { return }
+        shortcutsKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             let isHost = self.hostWindow != nil && event.window === self.hostWindow
             let isShortcuts = self.shortcutsWindow?.window != nil && event.window === self.shortcutsWindow?.window
             guard isHost || isShortcuts else { return event }
             let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
-            if isHost, mods == .control, event.keyCode == UInt16(kVK_Space) {
-                self.playPause()
-                return nil
-            }
             if self.shortcutsOpen, event.keyCode == UInt16(kVK_Escape), mods.isEmpty {
                 self.setShortcutsOpen(false)
                 return nil
@@ -2350,7 +2289,8 @@ final class FloatModule: ExactModule {
         case "setPeeking": setPeeking(arg == "true")
         case "recordPeekHotKey": recordPeekHotKey()
         case "requestPeekPermission": requestPeekPermission()
-        case "checkForUpdates": sparkle.checkForUpdates()
+        case "checkForUpdates":
+            if !context.agent { FloatUpdater.shared.checkForUpdates() }
         case "focusWeb": focusWeb()
         case "recordPlayback": recordPlaybackFromTest(arg)
         default: throw ExactNativeRefusal("unknown op \(op)")
@@ -2407,7 +2347,7 @@ final class FloatModule: ExactModule {
             "settingsOpen": settingsOpen,
             "shortcutsOpen": shortcutsOpen,
             "peekPermissionGranted": peekPermissionGranted,
-            "canCheckUpdates": sparkle.canCheckForUpdates,
+            "canCheckUpdates": context.agent ? false : FloatUpdater.shared.canCheckForUpdates,
             "nativeBackdrop": true,
             "browserFrame": "",
             "hasResume": hasResume,

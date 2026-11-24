@@ -45,6 +45,20 @@
       "appTransportSecurity": {
         "allowsArbitraryLoadsInWebContent": true
       },
+      "swiftPackages": [
+        {
+          "url": "https://github.com/sparkle-project/Sparkle",
+          "exactVersion": "2.10.1",
+          "products": [
+            "Sparkle"
+          ]
+        }
+      ],
+      "infoPlist": {
+        "SUFeedURL": "https://raw.githubusercontent.com/noisyneighborstudio/float/appcasts/appcast.xml",
+        "SUPublicEDKey": "3mx8nIaYQAAgn78Bue6cWKssBown3v3I5Z0O1660aM0=",
+        "SUEnableAutomaticChecks": true
+      },
       "window": {
         "width": 640,
         "height": 360,
