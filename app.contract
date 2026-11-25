@@ -269,6 +269,7 @@ component Float
   resource shortcutStatus = globalShortcutStatus() as shape GlobalShortcutStatus else empty()
 
   derive isMainWindow = page.name == "main"
+  derive isSettingsWindow = page.name == "settings"
   derive isMac = page.platform == "macos"
   derive peekKeys = (
     st.peekTrigger == "rightCommand" ? "MetaRight" :
@@ -960,7 +961,7 @@ component Float
 
   view
     main testId="float-root"
-      viewport-fit="cover"
+      viewport-fit=(isSettingsWindow ? "auto" : "cover")
       color-scheme="dark"
       accent-color="light-dark(#0f766e, #3fd0d0)"
       navigationKey=`${top(nav).id}`
@@ -1252,6 +1253,7 @@ component Float
         // Dedicated Settings window (macOS: named `settings` window via ⌘,; web/Linux: in-place route)
         if e.name == "settings"
           column navigationKey=`${e.id}`
+            navigationBar="none"
             testId="settings-view"
             position="absolute"
             inset=0
@@ -1261,14 +1263,16 @@ component Float
             background-color="-exact-background"
             box-sizing="border-box"
 
-            header display="flex" align-items="center" justify-content="space-between" width="100%" padding-top=16 padding-left=20 padding-right=20 padding-bottom=10 box-sizing="border-box"
-              text "Settings" role="heading" aria-level=1 font-size=16 font-weight=600
-              if isMainWindow
+            head title="Settings"
+
+            if isMainWindow
+              header display="flex" align-items="center" justify-content="space-between" width="100%" padding-top=16 padding-left=20 padding-right=20 padding-bottom=10 box-sizing="border-box"
+                text "Settings" role="heading" aria-level=1 font-size=16 font-weight=600
                 button press=closeSubRoute aria-label="Done" testId="settings-done"
                   text "Done"
 
-            scroll flex=1 width="100%" padding-top=6 padding-left=20 padding-right=20 padding-bottom=20 box-sizing="border-box"
-              column width="100%" gap=14
+            scroll flex=1 min-height=0 width="100%"
+              column width="100%" gap=14 padding-top=(isMainWindow ? 6 : 16) padding-left=20 padding-right=20 padding-bottom=20 box-sizing="border-box"
                 // Section 1: Quick Fade (Global)
                 column width="100%" gap=8
                   column gap=2
