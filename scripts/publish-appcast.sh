@@ -27,7 +27,7 @@ fi
 signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE/bin/sign_update" -f - -p "$artifact")
 [[ ${#signature} -eq 88 ]] || { echo "✗ unexpected signature from sign_update" >&2; exit 1; }
 # a key that doesn't match the app's SUPublicEDKey makes every client reject the update
-public_key=$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' build/Float.app/Contents/Info.plist)
+public_key=$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' dist/Float.app/Contents/Info.plist)
 swift scripts/verify-signature.swift "$public_key" "$signature" $artifact \
   || { echo "✗ SPARKLE_PRIVATE_KEY does not match SUPublicEDKey" >&2; exit 1; }
 
