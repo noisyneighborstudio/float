@@ -986,15 +986,30 @@ private func floatSameLoadTarget(_ a: URL, _ b: URL) -> Bool {
     return pa == pb
 }
 
-/// WKWebView subclass that suppresses initial opaque backing-store flash before the GPU morph presents.
+/// WKWebView subclass that suppresses initial opaque backing-store flash before the GPU morph presents
+/// and balances WebKit's reference-counted media suspension API.
 private final class FloatWebView: WKWebView {
     weak var module: FloatModule?
     var triggersMorphPrepare = false
+    private(set) var isMediaSuspended = false
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if triggersMorphPrepare, let win = window {
             module?.prepareWindowForMorph(win)
+        }
+    }
+
+    /// Balances WebKit's reference-counted `setAllMediaPlaybackSuspended(_:)` calls so
+    /// repeated suspends on warm/hidden views never stack past 1 and lock playback.
+    func setMediaSuspended(_ suspended: Bool, completion: (() -> Void)? = nil) {
+        guard isMediaSuspended != suspended else {
+            completion?()
+            return
+        }
+        isMediaSuspended = suspended
+        setAllMediaPlaybackSuspended(suspended) {
+            completion?()
         }
     }
 }
@@ -1241,7 +1256,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         w.navigationDelegate = nil
         w.uiDelegate = nil
         w.stopLoading()
-        w.setAllMediaPlaybackSuspended(true)
+        w.setMediaSuspended(true)
         w.removeFromSuperview()
     }
 
@@ -1255,14 +1270,13 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     }
 
     func handleWarmSlotCommitted(_ w: WKWebView) {
-        // Re-assert media suspension across cross-origin process swaps so preloaded views never leak audio.
-        w.setAllMediaPlaybackSuspended(true)
+        (w as? FloatWebView)?.setMediaSuspended(true)
         guard let slot = warmSlot(for: w) else { return }
         slot.committed = true
     }
 
     func handleWarmSlotFinished(_ w: WKWebView) {
-        w.setAllMediaPlaybackSuspended(true)
+        (w as? FloatWebView)?.setMediaSuspended(true)
         guard let slot = warmSlot(for: w) else { return }
         slot.committed = true
         slot.probeToken += 1
@@ -1271,7 +1285,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
 
     private func probeWarmSlotReadiness(_ slot: FloatWarmSlot, token: Int, attemptsLeft: Int) {
         guard slot.probeToken == token, warmPool[slot.hostKey] === slot, !slot.contentReady else { return }
-        slot.web.setAllMediaPlaybackSuspended(true)
+        slot.web.setMediaSuspended(true)
         slot.web.evaluateJavaScript(floatContentReadyScript) { [weak self, weak slot] res, _ in
             guard let self, let slot, slot.probeToken == token, self.warmPool[slot.hostKey] === slot else { return }
             let ready = (res as? Bool) ?? false
@@ -1279,7 +1293,6 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
                 slot.contentReady = true
                 // Pause any media that bootstrapped during hydration
                 slot.web.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
-                slot.web.setAllMediaPlaybackSuspended(true)
                 self.module?.notifyChanged()
             } else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self, weak slot] in
@@ -1401,7 +1414,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         w.frame = container.bounds
         w.autoresizingMask = [.width, .height]
         w.isHidden = true
-        w.setAllMediaPlaybackSuspended(true)
+        w.setMediaSuspended(true)
         container.addSubview(w, positioned: .below, relativeTo: web)
         processWarmupWeb = w
         w.loadHTMLString("<!doctype html><html><body></body></html>", baseURL: nil)
@@ -1424,7 +1437,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             existing.committed = false
             existing.contentReady = false
             existing.probeToken += 1
-            existing.web.setAllMediaPlaybackSuspended(true)
+            existing.web.setMediaSuspended(true)
             existing.web.load(URLRequest(url: url))
             return
         }
@@ -1468,7 +1481,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
 
         let slot = FloatWarmSlot(hostKey: key, web: w, requestedUrl: url)
         warmPool[key] = slot
-        w.setAllMediaPlaybackSuspended(true)
+        w.setMediaSuspended(true)
         w.load(URLRequest(url: url))
     }
 
@@ -1508,7 +1521,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         pausedRequestedUrl = nil
         activeNavigationToken += 1
         activeContentReady = false
-        web.setAllMediaPlaybackSuspended(true)
+        web.setMediaSuspended(true)
         web.load(URLRequest(url: url))
         module?.notifyChanged()
     }
@@ -1531,9 +1544,10 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             activeNavigationToken += 1
             activeContentReady = true
             web.isHidden = false
-            web.setAllMediaPlaybackSuspended(false)
-            if resumeIfPaused {
-                web.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v && v.paused){ v.play().catch(()=>{}); } })()")
+            let activeWeb = web
+            activeWeb.setMediaSuspended(false) { [weak self] in
+                guard let self, self.web === activeWeb, resumeIfPaused else { return }
+                activeWeb.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v && v.paused){ v.play().catch(()=>{}); } })()")
             }
             return
         }
@@ -1548,7 +1562,22 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         pausedHomeUrl = nil
         pausedRequestedUrl = nil
         web.isHidden = false
-        web.setAllMediaPlaybackSuspended(false)
+        let activeWeb = web
+        activeWeb.setMediaSuspended(false) { [weak self] in
+            guard let self, self.web === activeWeb, resumeIfPaused else { return }
+            activeWeb.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v && v.paused){ v.play().catch(()=>{}); } })()")
+        }
+        if wasPrepared, let mod = module {
+            web.evaluateJavaScript(floatMediaHookScript(preferSdr: mod.preferSdr))
+            web.evaluateJavaScript(floatFillScript(mod.fill))
+            web.evaluateJavaScript(floatVideoFilterScript(
+                brightness: mod.videoBrightness,
+                hdrBrightness: mod.hdrVideoBrightness,
+                contrast: mod.videoContrast,
+                streamBrightness: mod.streamBrightness,
+                preferSdr: mod.preferSdr
+            ))
+        }
         if !wasPrepared {
             activeNavigationToken += 1
             activeContentReady = false
@@ -1595,8 +1624,9 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             let oldKey = oldHost.lowercased()
             let isCleanHome = oldUrl.path.isEmpty || oldUrl.path == "/" || oldUrl.path == "/browse" || oldUrl.path == "/home"
             if oldKey != slot.hostKey, isCleanHome, warmPool[oldKey] == nil, warmPool.count < FloatBrowserInstance.maxWarmPoolSize {
+                oldWeb.triggersMorphPrepare = false
                 oldWeb.isHidden = true
-                oldWeb.setAllMediaPlaybackSuspended(true)
+                oldWeb.setMediaSuspended(true)
                 let parked = FloatWarmSlot(hostKey: oldKey, web: oldWeb, requestedUrl: URL(string: "\(oldUrl.scheme ?? "https")://\(oldHost)") ?? oldUrl)
                 parked.committed = true
                 parked.contentReady = oldWasReady
@@ -1610,7 +1640,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         }
 
         if reveal {
-            web.setAllMediaPlaybackSuspended(false)
+            web.setMediaSuspended(false)
             if let mod = module {
                 web.evaluateJavaScript(floatMediaHookScript(preferSdr: mod.preferSdr))
                 web.evaluateJavaScript(floatFillScript(mod.fill))
@@ -1646,7 +1676,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             pausedHomeUrl = cur
             pausedRequestedUrl = cur
             web.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
-            web.setAllMediaPlaybackSuspended(true)
+            web.setMediaSuspended(true)
             web.isHidden = true
 
             // Release memory if user stays on Home idle for 3 minutes
@@ -1670,7 +1700,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         activeNavigationToken += 1
         activeContentReady = true
         web.isHidden = true
-        web.setAllMediaPlaybackSuspended(true)
+        web.setMediaSuspended(true)
         web.load(URLRequest(url: URL(string: "about:blank")!))
     }
 }
