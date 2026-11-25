@@ -8,6 +8,9 @@
     "@semantic-release/exec": "^7.0.3"
   },
   "dependencies": {
-    "@exact/window-management": "file:.exact/checkout/packages/window-management"
+    "@exact/window-management": "file:.exact/checkout/packages/window-management",
+    "@exact/clipboard": "file:.exact/checkout/packages/clipboard",
+    "@exact/global-shortcuts": "file:.exact/checkout/packages/global-shortcuts",
+    "@exact/shader": "file:.exact/checkout/packages/shader"
   }
 }

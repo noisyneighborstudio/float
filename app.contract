@@ -1,9 +1,20 @@
 // Float: chromeless, always-on-top video browser built with Exact.
 use getScreenDetails, getWindowBounds, ScreenDetails, WindowBounds from "@exact/window-management"
+use globalShortcut, checkGlobalShortcut, globalShortcutStatus, globalshortcut, globalshortcutup, GlobalShortcut, GlobalShortcutCheck, GlobalShortcutStatus from "@exact/global-shortcuts"
+use ShaderState from "@exact/shader"
 
 routes nav
   home "/"
+    settings "/settings"
+    shortcuts "/shortcuts"
   open "/open"
+
+shape Page
+  name: string
+  platform: string
+  visibilityState: string
+  persisted: bool
+  restores: number
 
 shape Viewport
   width: number
@@ -30,15 +41,13 @@ shape FloatState
   alpha: number
   videoBrightness: number
   videoContrast: number
+  hotkeyKeys: string
   hotkeyLabel: string
   peekTrigger: string
   peekAlpha: number
+  peekHotkeyKeys: string
   peekHotkeyLabel: string
   peekHold: bool
-  peeking: bool
-  settingsOpen: bool
-  shortcutsOpen: bool
-  peekPermissionGranted: bool
   canCheckUpdates: bool
   nativeBackdrop: bool
   browserFrame: string
@@ -129,33 +138,75 @@ style RemoveBtn
   :hover
     background-color="-exact-tertiary-background"
 
-style OverlaySheet
-  position="absolute"
-  top=36
-  left=24
-  right=24
-  z-index=35
-  padding=16
-  border-radius=14
-  background-color="-exact-secondary-background"
-  border-width=1
-  border-style="solid"
-  border-color="-exact-separator"
-  box-sizing="border-box"
-  display="flex"
-  flex-direction="column"
-  gap=12
-
 style KeyBadge
   padding-top=2
   padding-bottom=2
-  padding-left=6
-  padding-right=6
-  border-radius=5
+  padding-left=7
+  padding-right=7
+  border-radius=6
   background-color="-exact-secondary-fill"
   border-width=1
   border-style="solid"
   border-color="-exact-separator"
+
+style ShortcutGroup
+  flex=1
+  min-width=0
+  padding=12
+  border-radius=12
+  background-color="-exact-tertiary-fill"
+  border-width=1
+  border-style="solid"
+  border-color="-exact-separator"
+  display="flex"
+  flex-direction="column"
+  gap=7
+  box-sizing="border-box"
+
+style SegmentedWrap
+  display="flex"
+  flex-direction="row"
+  width="100%"
+  padding=3
+  gap=3
+  border-radius=9
+  background-color="-exact-tertiary-fill"
+  border-width=1
+  border-style="solid"
+  border-color="-exact-separator"
+  box-sizing="border-box"
+
+style SegmentedBtn
+  flex=1
+  min-width=0
+  padding-top=5
+  padding-bottom=5
+  padding-left=8
+  padding-right=8
+  border-radius=6
+  display="flex"
+  align-items="center"
+  justify-content="center"
+  font-size=12
+  font-weight=500
+  color="-exact-secondary-label"
+  background-color="transparent"
+
+style SegmentedBtnActive
+  flex=1
+  min-width=0
+  padding-top=5
+  padding-bottom=5
+  padding-left=8
+  padding-right=8
+  border-radius=6
+  display="flex"
+  align-items="center"
+  justify-content="center"
+  font-size=12
+  font-weight=600
+  color="AccentColorText"
+  background-color="AccentColor"
 
 component Float
   state urlOpen = false
@@ -174,13 +225,38 @@ component Float
   state lockedAspect = 0
   state pendingBoundsOp = ""
   state pendingDockTag = 0
+  state peeking = false
+  state windowHidden = false
+  state morphActive = true
+  state morphShown = false
+  state morphRevealing = false
+  state recordingTarget = ""
+  state recordingNote = ""
+  state pendingHotKeyTarget = ""
+  state pendingHotKeyChord = ""
 
+  resource page = exactPage() as shape Page
   resource vp = exactViewport() as shape Viewport
+  resource morphFx = exactSurface("shader") as shape ShaderState
   resource screens = getScreenDetails() as shape ScreenDetails else empty()
-  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, videoContrast=1, hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyLabel="⌃⌥⌘D", peekHold=true, settingsOpen=false, shortcutsOpen=false, peekPermissionGranted=true)
+  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, videoContrast=1, hotkeyKeys="Control+Alt+Meta+F", hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyKeys="Control+Alt+Meta+D", peekHotkeyLabel="⌃⌥⌘D", peekHold=true)
+  resource shortcutStatus = globalShortcutStatus() as shape GlobalShortcutStatus else empty()
+
+  derive isMainWindow = page.name == "main"
+  derive isMac = page.platform == "macos"
+  derive peekKeys = (
+    st.peekTrigger == "rightCommand" ? "MetaRight" :
+    st.peekTrigger == "rightOption" ? "AltRight" :
+    st.peekTrigger == "hotkey" ? st.peekHotkeyKeys : ""
+  )
+
+  resource showHideReg = globalShortcut(id="show-hide", keys=st.hotkeyKeys) when isMainWindow and st.hotkeyKeys != "" as shape GlobalShortcut else empty()
+  resource peekReg = globalShortcut(id="peek", keys=peekKeys) when isMainWindow and peekKeys != "" as shape GlobalShortcut else empty()
+
   mutation cmd as shape Reply queue refreshes st
   mutation bounds as shape WindowBounds then applyWindowBounds
   mutation videoAspect as shape AspectReply then applyVideoAspect
+  mutation shortcutCheck as shape GlobalShortcutCheck then finishHotKeyCheck
 
   derive isHome = st.mode == "home"
   derive hasSites = st.sites.length > 0
@@ -197,15 +273,43 @@ component Float
     ? `${fmtTime(st.resumeTime)} of ${fmtTime(st.resumeDuration)} · ${st.resumeHost}`
     : st.resumeHost
   )
-  derive hotkeyMenuTitle = `Show/Hide Hotkey: ${st.hotkeyLabel != "" ? st.hotkeyLabel : "None"}…`
   derive peekPercent = `${round(st.peekAlpha * 100)}%`
   derive brightnessPercent = `${round(st.videoBrightness * 100)}%`
   derive contrastPercent = `${round(st.videoContrast * 100)}%`
+  derive isPictureDefault = round(st.videoBrightness * 100) == 100 and round(st.videoContrast * 100) == 100
+  derive peekIsModifier = st.peekTrigger == "rightCommand" or st.peekTrigger == "rightOption"
+  derive accessibilityTrusted = match shortcutStatus.apple { case some(a) => a.accessibilityTrusted, case none => true }
+  derive needsAccessibility = isMac and peekIsModifier and not accessibilityTrusted
+  derive peekHudDesc = st.peekTrigger == "none" ? "Quick Fade (Off)" : `Quick Fade (${peekPercent})`
+  derive peekHudKey = (
+    st.peekTrigger == "rightCommand" ? "Right ⌘" :
+    st.peekTrigger == "rightOption" ? "Right ⌥" :
+    st.peekTrigger == "hotkey" ? (st.peekHotkeyLabel != "" ? st.peekHotkeyLabel : "None") : "Off"
+  )
+  derive showHideHudKey = st.hotkeyLabel != "" ? st.hotkeyLabel : "None"
+  derive hotkeyMenuTitle = `Show/Hide Hotkey: ${showHideHudKey}…`
+  derive isShortcutsPanel = page.name == "shortcuts"
+  derive showOpeningMorph = isMainWindow and morphActive and not vp.prefersReducedMotion and morphFx.error == ""
 
-  task onLaunch mount
+  task onLaunch when isMainWindow
     after(1, checkInitialRoute)
 
-  task onBrowserTick mount
+  task onMorphShow when showOpeningMorph and morphFx.presented and not morphShown
+    after(1, showMorphWindow)
+
+  task onMorphReveal when showOpeningMorph and morphFx.presented and not morphRevealing
+    after(380, revealAfterMorph)
+
+  task onMorphEnd when showOpeningMorph and morphFx.presented
+    after(700, finishOpeningMorph)
+
+  task onMorphFallback when showOpeningMorph
+    after(1600, finishOpeningMorph)
+
+  task onRestore when isMainWindow and page.restores > 0 key=page.restores
+    after(1, clearWindowHidden)
+
+  task onBrowserTick when isMainWindow
     every(120, pollBrowserFrame)
 
   action pollBrowserFrame
@@ -261,6 +365,53 @@ component Float
     else
       nav = next
 
+  action closeSubRoute
+    if isMainWindow
+      nav = back(nav)
+    else
+      close()
+
+  action clearWindowHidden
+    windowHidden = false
+
+  action showMorphWindow
+    morphShown = true
+    send cmd = runFloatCommand("showMorphWindow", "")
+
+  action revealAfterMorph
+    morphShown = true
+    morphRevealing = true
+    send cmd = runFloatCommand("revealGlass", "")
+
+  action finishOpeningMorph
+    if not morphRevealing
+      send cmd = runFloatCommand("revealGlass", "")
+    morphShown = true
+    morphRevealing = true
+    morphActive = false
+
+  action onGlobalShortcut(id: string)
+    if id == "show-hide"
+      if page.visibilityState == "hidden" or page.persisted or windowHidden
+        windowHidden = false
+        focus()
+      else
+        windowHidden = true
+        hideWindow()
+    else if id == "peek"
+      if st.peekTrigger == "hotkey" and not st.peekHold
+        let nextPeeking = not peeking
+        peeking = nextPeeking
+        setWindowOpacity(nextPeeking ? min(st.alpha, st.peekAlpha) : st.alpha, 160)
+      else
+        peeking = true
+        setWindowOpacity(min(st.alpha, st.peekAlpha), 160)
+
+  action onGlobalShortcutUp(id: string)
+    if id == "peek" and (st.peekTrigger != "hotkey" or st.peekHold)
+      peeking = false
+      setWindowOpacity(st.alpha, 160)
+
   action showHome
     urlOpen = false
     browserDragging = false
@@ -273,8 +424,6 @@ component Float
     send cmd = runFloatCommand("resumeLast", "")
 
   action openUrlBar
-    if st.shortcutsOpen
-      send cmd = runFloatCommand("closeShortcuts", "")
     let nextDraft = st.mode == "web" ? st.currentUrl : ""
     urlDraft = nextDraft
     urlOpen = true
@@ -282,34 +431,33 @@ component Float
     focus("url-input")
     setSelectionRange("url-input", 0, nextDraft.length)
 
-  action toggleShortcuts
-    urlOpen = false
-    send cmd = runFloatCommand("toggleShortcuts", "")
-
-  action closeShortcuts
-    send cmd = runFloatCommand("closeShortcuts", "")
-
-  action openSettings
-    send cmd = runFloatCommand("openSettings", "")
-
-  action closeSettings
-    send cmd = runFloatCommand("closeSettings", "")
-
   action setPeekTrigger(trigger: string)
+    peeking = false
+    recordingTarget = ""
+    recordingNote = ""
     send cmd = runFloatCommand("setPeekTrigger", trigger)
 
   action setPeekAlpha(val: string)
     send cmd = runFloatCommand("setPeekAlpha", val)
 
+  action onPeekAlphaRange(v: number)
+    let stepped = round(min(0.95, max(0.15, v)) * 20) / 20
+    send cmd = runFloatCommand("setPeekAlpha", `${stepped}`)
+
   action stepPeekAlpha(delta: number)
-    let next = min(0.95, max(0.15, st.peekAlpha + delta))
+    let next = round(min(0.95, max(0.15, st.peekAlpha + delta)) * 100) / 100
     send cmd = runFloatCommand("setPeekAlpha", `${next}`)
 
   action setPeekHold(hold: string)
+    peeking = false
     send cmd = runFloatCommand("setPeekHold", hold)
 
   action setVideoBrightness(val: string)
     send cmd = runFloatCommand("setVideoBrightness", val)
+
+  action onBrightnessRange(v: number)
+    let stepped = round(min(2, max(0.5, v)) * 20) / 20
+    send cmd = runFloatCommand("setVideoBrightness", `${stepped}`)
 
   action stepVideoBrightness(delta: number)
     let next = round(min(2, max(0.5, st.videoBrightness + delta)) * 100) / 100
@@ -318,12 +466,75 @@ component Float
   action setVideoContrast(val: string)
     send cmd = runFloatCommand("setVideoContrast", val)
 
+  action onContrastRange(v: number)
+    let stepped = round(min(2, max(0.5, v)) * 20) / 20
+    send cmd = runFloatCommand("setVideoContrast", `${stepped}`)
+
   action stepVideoContrast(delta: number)
     let next = round(min(2, max(0.5, st.videoContrast + delta)) * 100) / 100
     send cmd = runFloatCommand("setVideoContrast", `${next}`)
 
   action resetVideoFilters
     send cmd = runFloatCommand("resetVideoFilters", "")
+
+  action requestPeekPermission
+    send cmd = runFloatCommand("requestPeekPermission", "")
+
+  action startRecording(which: string)
+    recordingTarget = which
+    recordingNote = ""
+    focus("hotkey-capture")
+
+  action cancelRecording
+    recordingTarget = ""
+    recordingNote = ""
+
+  action captureHotKey(k: string, e: KeyboardEvent)
+    if recordingTarget != ""
+      if k == "Escape"
+        recordingTarget = ""
+        recordingNote = ""
+      else if k != "Shift" and k != "Control" and k != "Meta" and k != "Alt" and k != "AltGraph" and k != "CapsLock"
+        if k == "Backspace" and not e.metaKey and not e.ctrlKey and not e.altKey and not e.shiftKey
+          let op = recordingTarget == "show-hide" ? "setHotkeyKeys" : "setPeekHotkeyKeys"
+          recordingTarget = ""
+          recordingNote = ""
+          send cmd = runFloatCommand(op, "")
+        else if not e.metaKey and not e.ctrlKey and not e.altKey
+          recordingNote = "Include ⌘, ⌃, or ⌥ in the shortcut."
+        else
+          let keyName = k == " " ? "Space" : (k.length == 1 ? k.toUpperCase() : k)
+          let chord = `${e.ctrlKey ? "Control+" : ""}${e.altKey ? "Alt+" : ""}${e.shiftKey ? "Shift+" : ""}${e.metaKey ? "Meta+" : ""}${keyName}`
+          pendingHotKeyTarget = recordingTarget
+          pendingHotKeyChord = chord
+          if isMac
+            send shortcutCheck = checkGlobalShortcut(keys=chord)
+          else
+            let op = recordingTarget == "show-hide" ? "setHotkeyKeys" : "setPeekHotkeyKeys"
+            recordingTarget = ""
+            recordingNote = ""
+            send cmd = runFloatCommand(op, chord)
+
+  action finishHotKeyCheck
+    let target = pendingHotKeyTarget
+    let chord = pendingHotKeyChord
+    pendingHotKeyTarget = ""
+    pendingHotKeyChord = ""
+    if target != "" and chord != ""
+      match shortcutCheck
+        case some(res)
+          if res.registered
+            let op = target == "show-hide" ? "setHotkeyKeys" : "setPeekHotkeyKeys"
+            recordingTarget = ""
+            recordingNote = ""
+            send cmd = runFloatCommand(op, chord)
+          else
+            recordingNote = "That shortcut is unavailable or already in use."
+        case none
+          let op = target == "show-hide" ? "setHotkeyKeys" : "setPeekHotkeyKeys"
+          recordingTarget = ""
+          recordingNote = ""
+          send cmd = runFloatCommand(op, chord)
 
   action editUrl(v: string)
     urlDraft = v
@@ -376,7 +587,7 @@ component Float
 
   action openClipboard
     urlOpen = false
-    send cmd = runFloatCommand("openClipboard", "")
+    send cmd = readClipboardUrl()
 
   action reloadPage
     send cmd = runFloatCommand("reloadPage", "")
@@ -494,17 +705,17 @@ component Float
     let nextClickThrough = not st.clickThrough
     setWindowIgnoreMouseEvents(nextClickThrough)
     if nextClickThrough and st.alpha > 0.6
-      setWindowOpacity(st.peeking ? min(0.6, st.peekAlpha) : 0.6, 160)
+      setWindowOpacity(peeking ? min(0.6, st.peekAlpha) : 0.6, 160)
     send cmd = runFloatCommand("toggleClickThrough", "")
 
   action fadeOut
     let nextAlpha = round(max(0.15, st.alpha - 0.1) * 100) / 100
-    setWindowOpacity(st.peeking ? min(nextAlpha, st.peekAlpha) : nextAlpha, 160)
+    setWindowOpacity(peeking ? min(nextAlpha, st.peekAlpha) : nextAlpha, 160)
     send cmd = runFloatCommand("fadeOut", "")
 
   action fadeIn
     let nextAlpha = round(min(1, st.alpha + 0.1) * 100) / 100
-    setWindowOpacity(st.peeking ? min(nextAlpha, st.peekAlpha) : nextAlpha, 160)
+    setWindowOpacity(peeking ? min(nextAlpha, st.peekAlpha) : nextAlpha, 160)
     send cmd = runFloatCommand("fadeIn", "")
 
   action playPause
@@ -535,9 +746,6 @@ component Float
       send bounds = getWindowBounds()
       send cmd = runFloatCommand("dock", `${tag}`)
 
-  action recordHotKey
-    send cmd = runFloatCommand("recordHotKey", "")
-
   action checkForUpdates
     send cmd = runFloatCommand("checkForUpdates", "")
 
@@ -552,606 +760,877 @@ component Float
       accent-color="light-dark(#0f766e, #3fd0d0)"
       navigationKey=`${top(nav).id}`
       navigate=handleNavigate
+      globalshortcut=onGlobalShortcut
+      globalshortcutup=onGlobalShortcutUp
       -exact-menu-remove="close-all show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows paste-and-match-style find spelling-and-grammar substitutions transformations app-help actual-size zoom-in zoom-out back forward develop"
       position="relative"
       width="100%"
       height="100%"
       overflow="hidden"
-      background-color=(isHome and st.nativeBackdrop ? "transparent" : "-exact-background")
+      background-color=((isHome and st.nativeBackdrop and isMainWindow) or isShortcutsPanel ? "transparent" : "-exact-background")
       color="-exact-label"
       font-size=13
       user-select="none"
 
-      // Native WKWebView: always mounted to preserve back/forward history and media session
-      float-browser id="browser"
-        testId="browser"
-        mode=st.mode
-        message=onBrowserMessage
-        position="absolute"
-        inset=0
-        width="100%"
-        height="100%"
-        z-index=1
+      for e in stack(nav) key=e.id
+        if e.name == "home"
+          view navigationKey=`${e.id}` navigationBar="none" position="absolute" inset=0 width="100%" height="100%"
+            // Native WKWebView: always mounted to preserve back/forward history and media session
+            float-browser id="browser"
+              testId="browser"
+              mode=st.mode
+              message=onBrowserMessage
+              position="absolute"
+              inset=0
+              width="100%"
+              height="100%"
+              z-index=1
 
-      // Linux / non-native live browser bridge surface (when running with linux-browser-bridge)
-      if not isHome and not st.nativeBackdrop
-        if st.browserFrame != ""
-          view id="linux-browser"
-            testId="linux-browser"
+            // Linux / non-native live browser bridge surface (when running with linux-browser-bridge)
+            if not isHome and not st.nativeBackdrop
+              if st.browserFrame != ""
+                view id="linux-browser"
+                  testId="linux-browser"
+                  position="absolute"
+                  inset=0
+                  width="100%"
+                  height="100%"
+                  z-index=5
+                  tabindex=0
+                  pointerdown=browserDown
+                  pointermove=browserMove
+                  pointerup=browserUp
+                  key=browserKey
+                  opacity=st.alpha
+                  background-color="-exact-background"
+                  if prevFrame != ""
+                    image prevFrame position="absolute"
+                      inset=0
+                      width="100%"
+                      height="100%"
+                      object-fit="fill"
+                  image st.browserFrame position="absolute"
+                    inset=0
+                    width="100%"
+                    height="100%"
+                    object-fit="fill"
+              else
+                column testId="linux-web-placeholder"
+                  position="absolute"
+                  inset=0
+                  z-index=5
+                  align-items="center"
+                  justify-content="center"
+                  gap=6
+                  padding=24
+                  background-color="-exact-background"
+                  text st.currentUrl color="-exact-label" font-size=14 text-align="center"
+                  text "Press ⌘⇧H for Home · ⌘L to open another URL" color="-exact-secondary-label"
+                    font-size=12
+                    text-align="center"
+
+            // Home screen: Resume card + Site mosaic grid + Empty state (over native macOS Liquid Glass backdrop)
+            if isHome
+              scroll testId="home-screen"
+                position="absolute"
+                inset=0
+                width="100%"
+                height="100%"
+                z-index=10
+                scrollbar-width="none"
+                opacity=(showOpeningMorph and not morphRevealing ? 0 : 1)
+                transition=(vp.prefersReducedMotion ? "none" : "opacity 240ms ease-out")
+                background-color=(st.nativeBackdrop ? "transparent" : "-exact-background")
+                background-image=(st.nativeBackdrop ? "none" : "linear-gradient(180deg, #1c1d22 0%, #0b0b0d 70%)")
+                padding-top=30
+                padding-left=16
+                padding-right=16
+                padding-bottom=16
+                box-sizing="border-box"
+
+                if isEmpty
+                  column testId="empty-state"
+                    position="absolute"
+                    inset=0
+                    align-items="center"
+                    justify-content="center"
+                    gap=4
+                    padding=16
+                    text "Video sites you watch will show up here." color="-exact-secondary-label"
+                      font-size=13
+                      text-align="center"
+                    row align-items="center" justify-content="center" gap=4
+                      text "Press" color="-exact-secondary-label" font-size=13
+                      view class=KeyBadge
+                        text "⌘L" color="-exact-label" font-size=13 testId="empty-shortcut"
+                      text "to open a URL." color="-exact-secondary-label" font-size=13
+                else
+                  column width="100%"
+                    if st.hasResume
+                      button appearance="none"
+                        class=ResumeCard
+                        press=resumeLast
+                        testId="resume-card"
+                        aria-label=`Resume ${st.resumeTitle}`
+                        if st.resumeIcon != ""
+                          image st.resumeIcon width=40
+                            height=40
+                            border-radius=9
+                            object-fit="contain"
+                            flex-shrink=0
+                        column flex=1 min-width=0 gap=2 align-items="flex-start"
+                          text "RESUME" font-size=11
+                            letter-spacing=0.88
+                            color="-exact-system-teal"
+                            font-weight=500
+                          text st.resumeTitle font-size=15
+                            font-weight=600
+                            color="-exact-label"
+                            line-clamp=1
+                            testId="resume-title"
+                          text resumeSubtitle font-size=12
+                            color="-exact-secondary-label"
+                            line-clamp=1
+                            testId="resume-sub"
+                          if st.resumeDuration > 0
+                            view width="100%"
+                              height=3
+                              border-radius=2
+                              background-color="-exact-secondary-fill"
+                              margin-top=6
+                              overflow="hidden"
+                              view height="100%"
+                                width=`${resumeProgress}%`
+                                background-color="AccentColor"
+                                testId="resume-progress"
+                        view width=34
+                          height=34
+                          border-radius=17
+                          background-color="AccentColor"
+                          flex-shrink=0
+                          display="flex"
+                          align-items="center"
+                          justify-content="center"
+                          padding-left=3
+                          box-sizing="border-box"
+                          text "▶" font-size=14 color="AccentColorText"
+
+                    if hasSites
+                      view testId="site-grid" position="relative" width="100%" height=gridHeight
+                        for site, idx in st.sites key=site.host
+                          view position="absolute"
+                            top=0
+                            left=0
+                            width=128
+                            height=80
+                            translate=`${tileX(idx, gridCols)}px ${tileY(idx, gridCols)}px`
+                            transition=(vp.prefersReducedMotion ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
+                            hover=hoverTile(site.host)
+                            testId=`tile-wrap-${site.host}`
+                            button appearance="none"
+                              class=TileButton
+                              press=openSite(site.url)
+                              scale=(hoveredHost == site.host ? 1.03 : 1)
+                              title=site.host
+                              aria-label=site.name
+                              testId=`tile-${site.host}`
+                              if site.icon != ""
+                                image site.icon width=40 height=40 border-radius=9 object-fit="contain"
+                              else
+                                view width=40
+                                  height=40
+                                  border-radius=9
+                                  background-color="-exact-secondary-fill"
+                                  display="flex"
+                                  align-items="center"
+                                  justify-content="center"
+                                  text site.initial font-size=20 font-weight=600 color="-exact-label"
+                              text site.name font-weight=500
+                                font-size=13
+                                color="-exact-label"
+                                max-width="90%"
+                                line-clamp=1
+                                testId=`tile-name-${site.host}`
+                            button appearance="none"
+                              class=RemoveBtn
+                              press=removeSite(site.host)
+                              opacity=(hoveredHost == site.host ? 1 : 0)
+                              aria-label=`Remove ${site.name}`
+                              title="Remove"
+                              testId=`remove-${site.host}`
+                              text "×"
+
+            // Top-edge 18px drag strip: hover reveals, drag moves window, double-click locks video aspect
+            view id="drag-strip"
+              testId="drag-strip"
+              app-region="drag"
+              dblclick=toggleAspectLock
+              hover=hoverDragStrip
+              position="absolute"
+              top=0
+              left=0
+              right=0
+              height=18
+              z-index=20
+              background-color="light-dark(rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.45))"
+              opacity=(dragStripHovered ? 1 : 0)
+              transition=(vp.prefersReducedMotion ? "none" : "opacity 160ms ease")
+
+            // Floating URL / search bar overlay (⌘L)
+            if urlOpen
+              view testId="url-bar" position="absolute" top=24 left=10 right=10 z-index=30
+                input id="url-input"
+                  testId="url-input"
+                  hatch="url-input"
+                  data-select-seq=`${selectSeq}`
+                  value=urlDraft
+                  input=editUrl
+                  submit=submitUrl
+                  key=urlKeyDown
+                  placeholder="URL or search — Enter to go, Esc to cancel"
+                  aria-label="Location"
+                  autofocus=true
+                  width="100%"
+                  font-size=13
+                  box-sizing="border-box"
+
+            // GPU WGSL opening morph shader: seamlessly hands off into true native Liquid Glass
+            if showOpeningMorph
+              canvas surface=shader(src="assets/opening-morph.wgsl", alphaMode="premultiplied", isHome=(isHome ? 1 : 0))
+                position="absolute"
+                inset=0
+                width="100%"
+                height="100%"
+                z-index=50
+                pointer-events="none"
+                aria-hidden=true
+                testId="opening-morph"
+
+        // Dedicated Settings window (macOS: named `settings` window via ⌘,; web/Linux: in-place route)
+        if e.name == "settings"
+          column navigationKey=`${e.id}`
+            testId="settings-view"
             position="absolute"
             inset=0
             width="100%"
             height="100%"
-            z-index=5
-            tabindex=0
-            pointerdown=browserDown
-            pointermove=browserMove
-            pointerup=browserUp
-            key=browserKey
-            opacity=st.alpha
+            z-index=40
             background-color="-exact-background"
-            if prevFrame != ""
-              image prevFrame position="absolute"
-                inset=0
-                width="100%"
-                height="100%"
-                object-fit="fill"
-            image st.browserFrame position="absolute"
-              inset=0
-              width="100%"
-              height="100%"
-              object-fit="fill"
-        else
-          column testId="linux-web-placeholder"
-            position="absolute"
-            inset=0
-            z-index=5
-            align-items="center"
-            justify-content="center"
-            gap=6
-            padding=24
-            background-color="-exact-background"
-            text st.currentUrl color="-exact-label" font-size=14 text-align="center"
-            text "Press ⌘⇧H for Home · ⌘L to open another URL" color="-exact-secondary-label"
-              font-size=12
-              text-align="center"
-
-      // Home screen: Resume card + Site mosaic grid + Empty state (over native macOS Liquid Glass backdrop)
-      if isHome
-        scroll testId="home-screen"
-          position="absolute"
-          inset=0
-          width="100%"
-          height="100%"
-          z-index=10
-          background-color=(st.nativeBackdrop ? "transparent" : "-exact-background")
-          background-image=(st.nativeBackdrop ? "none" : "linear-gradient(180deg, #1c1d22 0%, #0b0b0d 70%)")
-          padding-top=30
-          padding-left=16
-          padding-right=16
-          padding-bottom=16
-          box-sizing="border-box"
-
-          if isEmpty
-            column testId="empty-state"
-              position="absolute"
-              inset=0
-              align-items="center"
-              justify-content="center"
-              gap=4
-              padding=16
-              text "Video sites you watch will show up here." color="-exact-secondary-label"
-                font-size=13
-                text-align="center"
-              row align-items="center" justify-content="center" gap=4
-                text "Press" color="-exact-secondary-label" font-size=13
-                view class=KeyBadge
-                  text "⌘L" color="-exact-label" font-size=13 testId="empty-shortcut"
-                text "to open a URL." color="-exact-secondary-label" font-size=13
-          else
-            column width="100%"
-              if st.hasResume
-                button appearance="none"
-                  class=ResumeCard
-                  press=resumeLast
-                  testId="resume-card"
-                  aria-label=`Resume ${st.resumeTitle}`
-                  if st.resumeIcon != ""
-                    image st.resumeIcon width=40
-                      height=40
-                      border-radius=9
-                      object-fit="contain"
-                      flex-shrink=0
-                  column flex=1 min-width=0 gap=2 align-items="flex-start"
-                    text "RESUME" font-size=11
-                      letter-spacing=0.88
-                      color="-exact-system-teal"
-                      font-weight=500
-                    text st.resumeTitle font-size=15
-                      font-weight=600
-                      color="-exact-label"
-                      line-clamp=1
-                      testId="resume-title"
-                    text resumeSubtitle font-size=12
-                      color="-exact-secondary-label"
-                      line-clamp=1
-                      testId="resume-sub"
-                    if st.resumeDuration > 0
-                      view width="100%"
-                        height=3
-                        border-radius=2
-                        background-color="-exact-secondary-fill"
-                        margin-top=6
-                        overflow="hidden"
-                        view height="100%"
-                          width=`${resumeProgress}%`
-                          background-color="AccentColor"
-                          testId="resume-progress"
-                  view width=34
-                    height=34
-                    border-radius=17
-                    background-color="AccentColor"
-                    flex-shrink=0
-                    display="flex"
-                    align-items="center"
-                    justify-content="center"
-                    padding-left=3
-                    box-sizing="border-box"
-                    text "▶" font-size=14 color="AccentColorText"
-
-              if hasSites
-                view testId="site-grid" position="relative" width="100%" height=gridHeight
-                  for site, idx in st.sites key=site.host
-                    view position="absolute"
-                      top=0
-                      left=0
-                      width=128
-                      height=80
-                      translate=`${tileX(idx, gridCols)}px ${tileY(idx, gridCols)}px`
-                      transition=(vp.prefersReducedMotion ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
-                      hover=hoverTile(site.host)
-                      testId=`tile-wrap-${site.host}`
-                      button appearance="none"
-                        class=TileButton
-                        press=openSite(site.url)
-                        scale=(hoveredHost == site.host ? 1.03 : 1)
-                        title=site.host
-                        aria-label=site.name
-                        testId=`tile-${site.host}`
-                        if site.icon != ""
-                          image site.icon width=40 height=40 border-radius=9 object-fit="contain"
-                        else
-                          view width=40
-                            height=40
-                            border-radius=9
-                            background-color="-exact-secondary-fill"
-                            display="flex"
-                            align-items="center"
-                            justify-content="center"
-                            text site.initial font-size=20 font-weight=600 color="-exact-label"
-                        text site.name font-weight=500
-                          font-size=13
-                          color="-exact-label"
-                          max-width="90%"
-                          line-clamp=1
-                          testId=`tile-name-${site.host}`
-                      button appearance="none"
-                        class=RemoveBtn
-                        press=removeSite(site.host)
-                        opacity=(hoveredHost == site.host ? 1 : 0)
-                        aria-label=`Remove ${site.name}`
-                        title="Remove"
-                        testId=`remove-${site.host}`
-                        text "×"
-
-      // Top-edge 18px drag strip: hover reveals, drag moves window, double-click locks video aspect
-      view id="drag-strip"
-        testId="drag-strip"
-        app-region="drag"
-        dblclick=toggleAspectLock
-        hover=hoverDragStrip
-        position="absolute"
-        top=0
-        left=0
-        right=0
-        height=18
-        z-index=20
-        background-color="light-dark(rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.45))"
-        opacity=(dragStripHovered ? 1 : 0)
-        transition=(vp.prefersReducedMotion ? "none" : "opacity 160ms ease")
-
-      // Floating URL / search bar overlay (⌘L)
-      if urlOpen
-        view testId="url-bar" position="absolute" top=24 left=10 right=10 z-index=30
-          input id="url-input"
-            testId="url-input"
-            hatch="url-input"
-            data-select-seq=`${selectSeq}`
-            value=urlDraft
-            input=editUrl
-            submit=submitUrl
-            key=urlKeyDown
-            placeholder="URL or search — Enter to go, Esc to cancel"
-            aria-label="Location"
-            autofocus=true
-            width="100%"
-            font-size=13
             box-sizing="border-box"
 
-      // Non-native Settings sheet (macOS uses its native Liquid Glass Settings NSPanel)
-      if st.settingsOpen and not st.nativeBackdrop
-        column class=OverlaySheet testId="linux-settings"
-          row align-items="center" justify-content="space-between"
-            text "Settings" role="heading" aria-level=3
-            button press=closeSettings aria-label="Close Settings"
-              text "Done"
-          row align-items="center" justify-content="space-between" gap=12
-            text "Quick Fade Opacity" color="-exact-secondary-label"
-            row align-items="center" gap=6
-              button press=stepPeekAlpha(-0.05) aria-label="Decrease Quick Fade Opacity"
-                text "−"
-              text peekPercent font-weight=600
-              button press=stepPeekAlpha(0.05) aria-label="Increase Quick Fade Opacity"
-                text "+"
-          row align-items="center" justify-content="space-between" gap=12
-            text "Video Fill" color="-exact-secondary-label"
-            button press=toggleFill
-              text (st.fill ? "On" : "Off")
-          row align-items="center" justify-content="space-between" gap=12
-            text "Brightness" color="-exact-secondary-label"
-            row align-items="center" gap=6
-              button press=stepVideoBrightness(-0.05) aria-label="Decrease Brightness"
-                text "−"
-              text brightnessPercent font-weight=600
-              button press=stepVideoBrightness(0.05) aria-label="Increase Brightness"
-                text "+"
-          row align-items="center" justify-content="space-between" gap=12
-            text "Contrast" color="-exact-secondary-label"
-            row align-items="center" gap=6
-              button press=stepVideoContrast(-0.05) aria-label="Decrease Contrast"
-                text "−"
-              text contrastPercent font-weight=600
-              button press=stepVideoContrast(0.05) aria-label="Increase Contrast"
-                text "+"
-          row align-items="center" justify-content="flex-end"
-            button press=resetVideoFilters aria-label="Reset Video Picture"
-              text "Reset Picture"
+            header display="flex" align-items="center" justify-content="space-between" width="100%" padding-top=16 padding-left=20 padding-right=20 padding-bottom=10 box-sizing="border-box"
+              text "Settings" role="heading" aria-level=1 font-size=16 font-weight=600
+              if isMainWindow
+                button press=closeSubRoute aria-label="Done" testId="settings-done"
+                  text "Done"
 
-      // Non-native Keyboard Shortcuts HUD (macOS uses its native Liquid Glass Shortcuts NSPanel)
-      if st.shortcutsOpen and not st.nativeBackdrop
-        column class=OverlaySheet testId="linux-shortcuts"
-          row align-items="center" justify-content="space-between"
-            text "Keyboard Shortcuts" role="heading" aria-level=3
-            button press=closeShortcuts aria-label="Close Shortcuts"
-              text "Done"
-          row align-items="center" justify-content="space-between"
-            text "Open URL / Search" color="-exact-secondary-label"
-            view class=KeyBadge
-              text "⌘L"
-          row align-items="center" justify-content="space-between"
-            text "Open URL from Clipboard" color="-exact-secondary-label"
-            view class=KeyBadge
-              text "⇧⌘V"
-          row align-items="center" justify-content="space-between"
-            text "Home / Resume Last" color="-exact-secondary-label"
-            view class=KeyBadge
-              text "⇧⌘H · ⇧⌘R"
-          row align-items="center" justify-content="space-between"
-            text "Toggle Video Fill" color="-exact-secondary-label"
-            view class=KeyBadge
-              text "⇧⌘F"
-          row align-items="center" justify-content="space-between"
-            text "Expand Window" color="-exact-secondary-label"
-            view class=KeyBadge
-              text "⇧⌘E"
-          row align-items="center" justify-content="space-between"
-            text "Play / Pause" color="-exact-secondary-label"
-            view class=KeyBadge
-              text "⌃Space"
-          row align-items="center" justify-content="space-between"
-            text "Opacity" color="-exact-secondary-label"
-            view class=KeyBadge
-              text "⌘- · ⌘="
+            scroll flex=1 width="100%" padding-top=6 padding-left=20 padding-right=20 padding-bottom=20 box-sizing="border-box"
+              column width="100%" gap=14
+                // Section 1: Quick Fade (Global)
+                column width="100%" gap=8
+                  column gap=2
+                    text "Quick Fade (Global)" font-size=13 font-weight=600
+                    text "Temporarily fade Float from any app to see what is behind it." font-size=11 color="-exact-secondary-label"
 
-      // Menu bar & keyboard shortcut declarations (invisible strip clear of window edges; active across Home and Web)
-      row position="absolute" bottom=12 left=24 height=4 opacity=0 z-index=25
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=checkForUpdates
-          -exact-menu="about"
-          disabled=(not st.canCheckUpdates)
-          aria-label="Check for Updates…"
-          testId="cmd-updates"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=openSettings
-          -exact-menu="app"
-          aria-keyshortcuts="Meta+,"
-          aria-label="Settings…"
-          testId="cmd-settings"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=recordHotKey
-          -exact-menu="app"
-          aria-label=hotkeyMenuTitle
-          testId="cmd-hotkey"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=showHome
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+Shift+H"
-          aria-label="Home"
-          testId="cmd-home"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=resumeLast
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+Shift+R"
-          aria-label="Resume Last"
-          testId="cmd-resume"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=openUrlBar
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+L"
-          aria-label="Open Location…"
-          testId="cmd-open-url"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=openClipboard
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+Shift+V"
-          aria-label="Open URL from Clipboard"
-          testId="cmd-clipboard"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=reloadPage
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+R"
-          aria-label="Reload"
-          testId="cmd-reload"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=goBack
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+["
-          aria-label="Back"
-          testId="cmd-back"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=goForward
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+]"
-          aria-label="Forward"
-          testId="cmd-forward"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=toggleFill
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+Shift+F"
-          aria-selected=st.fill
-          aria-label="Toggle Video Fill"
-          testId="cmd-fill"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=toggleExpand
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+Shift+E"
-          aria-selected=st.expanded
-          aria-label="Expand Window"
-          testId="cmd-expand"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=toggleAspectLock
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+Shift+A"
-          aria-selected=st.aspectLocked
-          aria-label="Lock to Video Aspect"
-          testId="cmd-aspect"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=toggleTop
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+T"
-          aria-selected=st.onTop
-          aria-label="Toggle Always on Top"
-          testId="cmd-top"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=toggleClickThrough
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+Shift+K"
-          aria-selected=st.clickThrough
-          aria-label="Toggle Click-Through"
-          testId="cmd-click-through"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=fadeOut
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+-"
-          aria-label="More Transparent"
-          testId="cmd-fade-out"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=fadeIn
-          -exact-menu="view"
-          aria-keyshortcuts="Meta+="
-          aria-label="Less Transparent"
-          testId="cmd-fade-in"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=playPause
-          -exact-menu="view"
-          aria-keyshortcuts="Control+Space"
-          aria-label="Play / Pause"
-          testId="cmd-play-pause"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=toggleShortcuts
-          -exact-menu="view"
-          aria-label="Keyboard Shortcuts"
-          testId="cmd-shortcuts"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=dockPosition(0)
-          -exact-menu="window"
-          aria-keyshortcuts="Control+Meta+1"
-          aria-label="Top Left"
-          testId="cmd-dock-0"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=dockPosition(1)
-          -exact-menu="window"
-          aria-keyshortcuts="Control+Meta+2"
-          aria-label="Top Center"
-          testId="cmd-dock-1"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=dockPosition(2)
-          -exact-menu="window"
-          aria-keyshortcuts="Control+Meta+3"
-          aria-label="Top Right"
-          testId="cmd-dock-2"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=dockPosition(3)
-          -exact-menu="window"
-          aria-keyshortcuts="Control+Meta+4"
-          aria-label="Bottom Left"
-          testId="cmd-dock-3"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=dockPosition(4)
-          -exact-menu="window"
-          aria-keyshortcuts="Control+Meta+5"
-          aria-label="Bottom Center"
-          testId="cmd-dock-4"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=dockPosition(5)
-          -exact-menu="window"
-          aria-keyshortcuts="Control+Meta+6"
-          aria-label="Bottom Right"
-          testId="cmd-dock-5"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=closeSettings
-          -exact-menu="none"
-          aria-label="Close Settings"
-          testId="cmd-settings-close"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=setPeekAlpha("0.25")
-          -exact-menu="none"
-          aria-label="Peek 25%"
-          testId="cmd-peek-25"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=stepPeekAlpha(0.05)
-          -exact-menu="none"
-          aria-label="Peek +5%"
-          testId="cmd-peek-inc"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=setPeekTrigger("hotkey")
-          -exact-menu="none"
-          aria-label="Peek Hotkey"
-          testId="cmd-peek-hotkey"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=setPeekHold("false")
-          -exact-menu="none"
-          aria-label="Peek Toggle"
-          testId="cmd-peek-toggle"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=closeShortcuts
-          -exact-menu="none"
-          aria-label="Close Shortcuts"
-          testId="cmd-shortcuts-close"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=setVideoBrightness("1.25")
-          -exact-menu="none"
-          aria-label="Brightness 125%"
-          testId="cmd-brightness-125"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=setVideoContrast("1.15")
-          -exact-menu="none"
-          aria-label="Contrast 115%"
-          testId="cmd-contrast-115"
-        button appearance="none"
-          width=4
-          height=4
-          overflow="hidden"
-          press=resetVideoFilters
-          -exact-menu="none"
-          aria-label="Reset Video Filters"
-          testId="cmd-filters-reset"
+                  row role="radiogroup" aria-label="Quick Fade Trigger" class=SegmentedWrap
+                    button appearance="none"
+                      role="radio"
+                      aria-checked=(st.peekTrigger == "rightCommand")
+                      class=(st.peekTrigger == "rightCommand" ? SegmentedBtnActive : SegmentedBtn)
+                      press=setPeekTrigger("rightCommand")
+                      testId="trigger-right-cmd"
+                      text "Hold Right ⌘"
+                    button appearance="none"
+                      role="radio"
+                      aria-checked=(st.peekTrigger == "rightOption")
+                      class=(st.peekTrigger == "rightOption" ? SegmentedBtnActive : SegmentedBtn)
+                      press=setPeekTrigger("rightOption")
+                      testId="trigger-right-opt"
+                      text "Hold Right ⌥"
+                    button appearance="none"
+                      role="radio"
+                      aria-checked=(st.peekTrigger == "hotkey")
+                      class=(st.peekTrigger == "hotkey" ? SegmentedBtnActive : SegmentedBtn)
+                      press=setPeekTrigger("hotkey")
+                      testId="trigger-hotkey"
+                      text "Custom Hotkey"
+                    button appearance="none"
+                      role="radio"
+                      aria-checked=(st.peekTrigger == "none")
+                      class=(st.peekTrigger == "none" ? SegmentedBtnActive : SegmentedBtn)
+                      press=setPeekTrigger("none")
+                      testId="trigger-none"
+                      text "Off"
+
+                  if st.peekTrigger == "hotkey"
+                    row width="100%" align-items="center" justify-content="space-between" gap=8
+                      row align-items="center" gap=8
+                        view class=KeyBadge
+                          text (st.peekHotkeyLabel != "" ? st.peekHotkeyLabel : "None") font-size=12 font-weight=500 testId="peek-hotkey-badge"
+                        button press=startRecording("peek") testId="record-peek-hotkey"
+                          text (recordingTarget == "peek" ? "Listening…" : "Record…")
+                      row role="radiogroup" aria-label="Custom Hotkey Mode" width=136 class=SegmentedWrap
+                        button appearance="none"
+                          role="radio"
+                          aria-checked=st.peekHold
+                          class=(st.peekHold ? SegmentedBtnActive : SegmentedBtn)
+                          press=setPeekHold("true")
+                          testId="peek-mode-hold"
+                          text "Hold"
+                        button appearance="none"
+                          role="radio"
+                          aria-checked=(not st.peekHold)
+                          class=(not st.peekHold ? SegmentedBtnActive : SegmentedBtn)
+                          press=setPeekHold("false")
+                          testId="peek-mode-toggle"
+                          text "Toggle"
+
+                  if needsAccessibility
+                    row width="100%"
+                      align-items="center"
+                      justify-content="space-between"
+                      gap=10
+                      padding=10
+                      border-radius=9
+                      background-color="-exact-tertiary-fill"
+                      border-width=1
+                      border-style="solid"
+                      border-color="-exact-system-orange"
+                      box-sizing="border-box"
+                      column flex=1 min-width=0 gap=2
+                        text `Enable Accessibility for ${st.peekTrigger == "rightCommand" ? "Right ⌘" : "Right ⌥"}` font-size=11 font-weight=600 color="-exact-system-orange"
+                        text "Required by macOS to detect bare modifier keys when other apps are focused. Custom Hotkey works without permission." font-size=11 color="-exact-secondary-label"
+                      button press=requestPeekPermission testId="grant-accessibility"
+                        text "Grant…"
+
+                  if st.peekTrigger != "none"
+                    column width="100%" gap=8
+                      row width="100%" align-items="center" justify-content="space-between"
+                        text "Fade Opacity" font-size=12 font-weight=500
+                        text peekPercent font-size=12 font-weight=600 color="-exact-system-teal" testId="settings-peek-pct"
+                      row role="radiogroup" aria-label="Fade Opacity Presets" class=SegmentedWrap
+                        button appearance="none"
+                          role="radio"
+                          aria-checked=(round(st.peekAlpha * 100) == 15)
+                          class=(round(st.peekAlpha * 100) == 15 ? SegmentedBtnActive : SegmentedBtn)
+                          press=setPeekAlpha("0.15")
+                          testId="peek-preset-15"
+                          text "15%"
+                        button appearance="none"
+                          role="radio"
+                          aria-checked=(round(st.peekAlpha * 100) == 25)
+                          class=(round(st.peekAlpha * 100) == 25 ? SegmentedBtnActive : SegmentedBtn)
+                          press=setPeekAlpha("0.25")
+                          testId="peek-preset-25"
+                          text "25%"
+                        button appearance="none"
+                          role="radio"
+                          aria-checked=(round(st.peekAlpha * 100) == 50)
+                          class=(round(st.peekAlpha * 100) == 50 ? SegmentedBtnActive : SegmentedBtn)
+                          press=setPeekAlpha("0.5")
+                          testId="peek-preset-50"
+                          text "50%"
+                        button appearance="none"
+                          role="radio"
+                          aria-checked=(round(st.peekAlpha * 100) == 75)
+                          class=(round(st.peekAlpha * 100) == 75 ? SegmentedBtnActive : SegmentedBtn)
+                          press=setPeekAlpha("0.75")
+                          testId="peek-preset-75"
+                          text "75%"
+                      input type="range"
+                        min=0.15
+                        max=0.95
+                        step=0.05
+                        value=st.peekAlpha
+                        input=onPeekAlphaRange
+                        aria-label="Fade Opacity"
+                        testId="settings-peek-slider"
+
+                hr width="100%"
+
+                // Section 2: Video Picture (Brightness & Contrast)
+                column width="100%" gap=10
+                  row width="100%" align-items="center" justify-content="space-between" gap=8
+                    column flex=1 min-width=0 gap=2
+                      text "Video Picture" font-size=13 font-weight=600
+                      text "Adjust brightness and contrast for dark scenes." font-size=11 color="-exact-secondary-label"
+                    button press=resetVideoFilters disabled=isPictureDefault testId="settings-reset-picture"
+                      text "Reset"
+
+                  column width="100%" gap=4
+                    row width="100%" align-items="center" justify-content="space-between"
+                      text "Brightness" font-size=12 font-weight=500
+                      text brightnessPercent font-size=12 font-weight=600 color="-exact-system-teal" testId="settings-brightness-pct"
+                    input type="range"
+                      min=0.5
+                      max=2
+                      step=0.05
+                      value=st.videoBrightness
+                      input=onBrightnessRange
+                      aria-label="Brightness"
+                      testId="settings-brightness-slider"
+
+                  column width="100%" gap=4
+                    row width="100%" align-items="center" justify-content="space-between"
+                      text "Contrast" font-size=12 font-weight=500
+                      text contrastPercent font-size=12 font-weight=600 color="-exact-system-teal" testId="settings-contrast-pct"
+                    input type="range"
+                      min=0.5
+                      max=2
+                      step=0.05
+                      value=st.videoContrast
+                      input=onContrastRange
+                      aria-label="Contrast"
+                      testId="settings-contrast-slider"
+
+                hr width="100%"
+
+                // Section 3: Show / Hide Window global shortcut
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  column flex=1 min-width=0 gap=2
+                    text "Show / Hide Window" font-size=13 font-weight=600
+                    text "Global shortcut to toggle Float visibility." font-size=11 color="-exact-secondary-label"
+                  row align-items="center" gap=8
+                    view class=KeyBadge
+                      text showHideHudKey font-size=12 font-weight=500 testId="show-hide-hotkey-badge"
+                    button press=startRecording("show-hide") testId="record-show-hide-hotkey"
+                      text (recordingTarget == "show-hide" ? "Listening…" : "Record…")
+
+                if recordingTarget != ""
+                  row id="hotkey-capture"
+                    testId="hotkey-capture"
+                    tabindex=0
+                    key=captureHotKey
+                    width="100%"
+                    align-items="center"
+                    justify-content="space-between"
+                    gap=10
+                    padding=10
+                    border-radius=9
+                    background-color="-exact-tertiary-fill"
+                    border-width=1
+                    border-style="solid"
+                    border-color="AccentColor"
+                    box-sizing="border-box"
+                    column flex=1 min-width=0 gap=2
+                      text `Press new ${recordingTarget == "show-hide" ? "Show / Hide" : "Quick Fade"} shortcut` font-size=12 font-weight=600
+                      text (recordingNote != "" ? recordingNote : "Use ⌘, ⌃, or ⌥. ⌫ clears, Esc cancels.") font-size=11 color="-exact-secondary-label"
+                    button press=cancelRecording testId="cancel-hotkey-record"
+                      text "Cancel"
+
+        // Floating HUD Keyboard Shortcuts Panel (macOS: windowKind="panel" nonactivating HUD; web/Linux: in-place route)
+        if e.name == "shortcuts"
+          column navigationKey=`${e.id}`
+            navigationBar="none"
+            testId="shortcuts-view"
+            position="absolute"
+            inset=0
+            width="100%"
+            height="100%"
+            z-index=45
+            padding=16
+            gap=12
+            box-sizing="border-box"
+            background-color=(isShortcutsPanel ? "transparent" : "-exact-background")
+
+            header display="flex" align-items="center" justify-content="space-between" width="100%" gap=8
+              row align-items="center" gap=8
+                text "Keyboard Shortcuts" role="heading" aria-level=1 font-size=14 font-weight=600
+                view role="status"
+                  padding-top=2
+                  padding-bottom=2
+                  padding-left=8
+                  padding-right=8
+                  border-radius=9
+                  background-color="-exact-secondary-fill"
+                  border-width=1
+                  border-style="solid"
+                  border-color="-exact-separator"
+                  text "⌘/ or Esc" font-size=10 font-weight=500 color="-exact-system-teal"
+              button press=closeSubRoute aria-label="Close Shortcuts" testId="shortcuts-close"
+                text (isMainWindow ? "Done" : "×")
+
+            hr width="100%"
+
+            row width="100%" gap=10 align-items="stretch"
+              column class=ShortcutGroup
+                text "NAVIGATION" font-size=10 font-weight=600 color="-exact-system-teal"
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Open URL or Search" font-size=12
+                  view class=KeyBadge
+                    text "⌘L" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Open Clipboard URL" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘V" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Home Mosaic" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘H" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Resume Last Video" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘R" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Back / Forward" font-size=12
+                  view class=KeyBadge
+                    text "⌘[  ⌘]" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Reload Page" font-size=12
+                  view class=KeyBadge
+                    text "⌘R" font-size=11
+
+              column class=ShortcutGroup
+                text "VIDEO & WINDOW" font-size=10 font-weight=600 color="-exact-system-teal"
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Play / Pause" font-size=12
+                  view class=KeyBadge
+                    text "⌃Space" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Toggle Video Fill" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘F" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Expand Window" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘E" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Lock Video Aspect" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘A" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Opacity − / +" font-size=12
+                  view class=KeyBadge
+                    text "⌘−  ⌘=" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Click-Through" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘K" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Always on Top" font-size=12
+                  view class=KeyBadge
+                    text "⌘T" font-size=11
+
+              column class=ShortcutGroup
+                text "POSITION & GLOBAL" font-size=10 font-weight=600 color="-exact-system-teal"
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Dock Top / Bottom" font-size=12
+                  view class=KeyBadge
+                    text "⌃⌘1–6" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text peekHudDesc font-size=12 testId="hud-peek-desc"
+                  view class=KeyBadge
+                    text peekHudKey font-size=11 testId="hud-peek-key"
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Show / Hide Float" font-size=12
+                  view class=KeyBadge
+                    text showHideHudKey font-size=11 testId="hud-show-hide-key"
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Settings" font-size=12
+                  view class=KeyBadge
+                    text "⌘," font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Drag / Aspect Lock" font-size=12
+                  view class=KeyBadge
+                    text "Top Strip" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Keyboard Shortcuts" font-size=12
+                  view class=KeyBadge
+                    text "⌘/" font-size=11
+
+      // Menu bar & keyboard shortcut declarations (invisible strip clear of window edges; active in main window)
+      if isMainWindow
+        row position="absolute" bottom=12 left=24 height=4 opacity=0 z-index=25
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=checkForUpdates
+            -exact-menu="about"
+            disabled=(not st.canCheckUpdates)
+            aria-label="Check for Updates…"
+            testId="cmd-updates"
+          link href="/settings"
+            width=4
+            height=4
+            overflow="hidden"
+            aria-keyshortcuts="Meta+,"
+            aria-label="Settings…"
+            testId="cmd-settings"
+          button appearance="none"
+            href="/settings"
+            target="settings"
+            width=4
+            height=4
+            overflow="hidden"
+            -exact-menu="app"
+            aria-label=hotkeyMenuTitle
+            testId="cmd-hotkey"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=showHome
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+H"
+            aria-label="Home"
+            testId="cmd-home"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=resumeLast
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+R"
+            aria-label="Resume Last"
+            testId="cmd-resume"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=openUrlBar
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+L"
+            aria-label="Open Location…"
+            testId="cmd-open-url"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=openClipboard
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+V"
+            aria-label="Open URL from Clipboard"
+            testId="cmd-clipboard"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=reloadPage
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+R"
+            aria-label="Reload"
+            testId="cmd-reload"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=goBack
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+["
+            aria-label="Back"
+            testId="cmd-back"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=goForward
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+]"
+            aria-label="Forward"
+            testId="cmd-forward"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=toggleFill
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+F"
+            aria-selected=st.fill
+            aria-label="Toggle Video Fill"
+            testId="cmd-fill"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=toggleExpand
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+E"
+            aria-selected=st.expanded
+            aria-label="Expand Window"
+            testId="cmd-expand"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=toggleAspectLock
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+A"
+            aria-selected=st.aspectLocked
+            aria-label="Lock to Video Aspect"
+            testId="cmd-aspect"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=toggleTop
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+T"
+            aria-selected=st.onTop
+            aria-label="Toggle Always on Top"
+            testId="cmd-top"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=toggleClickThrough
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+K"
+            aria-selected=st.clickThrough
+            aria-label="Toggle Click-Through"
+            testId="cmd-click-through"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=fadeOut
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+-"
+            aria-label="More Transparent"
+            testId="cmd-fade-out"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=fadeIn
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+="
+            aria-label="Less Transparent"
+            testId="cmd-fade-in"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=playPause
+            -exact-menu="view"
+            aria-keyshortcuts="Control+Space"
+            aria-label="Play / Pause"
+            testId="cmd-play-pause"
+          if isMac
+            link href="/shortcuts"
+              target="shortcuts"
+              windowKind="panel"
+              width=4
+              height=4
+              overflow="hidden"
+              aria-keyshortcuts="Meta+/"
+              aria-label="Keyboard Shortcuts"
+              testId="cmd-shortcuts"
+          else
+            link href="/shortcuts"
+              width=4
+              height=4
+              overflow="hidden"
+              aria-keyshortcuts="Meta+/"
+              aria-label="Keyboard Shortcuts"
+              testId="cmd-shortcuts"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=dockPosition(0)
+            -exact-menu="window"
+            aria-keyshortcuts="Control+Meta+1"
+            aria-label="Top Left"
+            testId="cmd-dock-0"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=dockPosition(1)
+            -exact-menu="window"
+            aria-keyshortcuts="Control+Meta+2"
+            aria-label="Top Center"
+            testId="cmd-dock-1"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=dockPosition(2)
+            -exact-menu="window"
+            aria-keyshortcuts="Control+Meta+3"
+            aria-label="Top Right"
+            testId="cmd-dock-2"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=dockPosition(3)
+            -exact-menu="window"
+            aria-keyshortcuts="Control+Meta+4"
+            aria-label="Bottom Left"
+            testId="cmd-dock-3"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=dockPosition(4)
+            -exact-menu="window"
+            aria-keyshortcuts="Control+Meta+5"
+            aria-label="Bottom Center"
+            testId="cmd-dock-4"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=dockPosition(5)
+            -exact-menu="window"
+            aria-keyshortcuts="Control+Meta+6"
+            aria-label="Bottom Right"
+            testId="cmd-dock-5"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setPeekAlpha("0.25")
+            -exact-menu="none"
+            aria-label="Peek 25%"
+            testId="cmd-peek-25"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=stepPeekAlpha(0.05)
+            -exact-menu="none"
+            aria-label="Peek +5%"
+            testId="cmd-peek-inc"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setPeekTrigger("hotkey")
+            -exact-menu="none"
+            aria-label="Peek Hotkey"
+            testId="cmd-peek-hotkey"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setPeekHold("false")
+            -exact-menu="none"
+            aria-label="Peek Toggle"
+            testId="cmd-peek-toggle"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setVideoBrightness("1.25")
+            -exact-menu="none"
+            aria-label="Brightness 125%"
+            testId="cmd-brightness-125"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setVideoContrast("1.15")
+            -exact-menu="none"
+            aria-label="Contrast 115%"
+            testId="cmd-contrast-115"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=resetVideoFilters
+            -exact-menu="none"
+            aria-label="Reset Video Filters"
+            testId="cmd-filters-reset"
