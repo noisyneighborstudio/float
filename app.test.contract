@@ -143,13 +143,23 @@ test "settings route renders native Contract controls"
   at "/settings"
   clock data
   expect tree has "settings-view"
+  expect tree has "hdr-mode-allow"
+  expect tree has "hdr-mode-sdr"
+  expect tree has "brightness-mode-single"
+  expect tree has "brightness-mode-stream"
   expect tree has "settings-brightness-slider"
+  expect tree missing "settings-hdr-brightness-slider"
   expect tree has "settings-contrast-slider"
   expect tree has "settings-peek-slider"
   expect tree has "reveal-style-wave"
   expect tree has "reveal-style-curtain"
   expect tree has "open-style-lens"
   expect tree has "open-style-diagonal"
+
+  tap "brightness-mode-stream"
+  clock data
+  expect state st.streamBrightness == true
+  expect tree has "settings-hdr-brightness-slider"
 
 test "shortcuts route renders native Contract HUD with live global shortcuts"
   at "/shortcuts"
@@ -158,10 +168,14 @@ test "shortcuts route renders native Contract HUD with live global shortcuts"
   expect text "hud-show-hide-key" == "⌃⌥⌘F"
   expect text "hud-peek-key" == "Right ⌘"
 
-test "video brightness and contrast filters persist across reload and reset cleanly"
+test "video brightness, HDR preferences, stream-kind brightness, and View menu adjustments persist cleanly"
   clock data
   expect state st.videoBrightness == 1
+  expect state st.hdrVideoBrightness == 1
   expect state st.videoContrast == 1
+  expect state st.preferSdr == false
+  expect state st.streamBrightness == false
+  expect state st.activeVideoStream == ""
 
   tap "cmd-brightness-125"
   clock data
@@ -171,14 +185,65 @@ test "video brightness and contrast filters persist across reload and reset clea
   clock data
   expect state st.videoContrast == 1.15
 
-  reload
+  // View menu increase / decrease brightness adjusts SDR brightness when stream mode is off
+  tap "cmd-brightness-up"
+  clock data
+  expect state st.videoBrightness == 1.35
+
+  tap "cmd-brightness-down"
   clock data
   expect state st.videoBrightness == 1.25
+
+  // Prefer SDR and per-stream brightness preferences
+  tap "cmd-prefer-sdr-on"
+  clock data
+  expect state st.preferSdr == true
+
+  tap "cmd-stream-brightness-on"
+  clock data
+  expect state st.streamBrightness == true
+
+  tap "cmd-hdr-brightness-175"
+  clock data
+  expect state st.hdrVideoBrightness == 1.75
+
+  // When per-stream brightness is on and active stream is HDR, View brightness commands adjust HDR brightness only
+  tap "cmd-stream-hdr"
+  clock data
+  expect state st.activeVideoStream == "hdr"
+
+  tap "cmd-brightness-up"
+  clock data
+  expect state st.hdrVideoBrightness == 1.85
+  expect state st.videoBrightness == 1.25
+
+  tap "cmd-brightness-down"
+  clock data
+  expect state st.hdrVideoBrightness == 1.75
+
+  // When active stream switches to SDR, View brightness commands adjust SDR brightness only
+  tap "cmd-stream-sdr"
+  clock data
+  expect state st.activeVideoStream == "sdr"
+
+  tap "cmd-brightness-up"
+  clock data
+  expect state st.videoBrightness == 1.35
+  expect state st.hdrVideoBrightness == 1.75
+
+  // Preferences and both brightness levels persist across reload
+  reload
+  clock data
+  expect state st.videoBrightness == 1.35
+  expect state st.hdrVideoBrightness == 1.75
   expect state st.videoContrast == 1.15
+  expect state st.preferSdr == true
+  expect state st.streamBrightness == true
 
   tap "cmd-filters-reset"
   clock data
   expect state st.videoBrightness == 1
+  expect state st.hdrVideoBrightness == 1
   expect state st.videoContrast == 1
 
 test "glass reveal and open transition styles persist across reload and reverse wipe settles cleanly"

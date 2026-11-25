@@ -177,14 +177,366 @@ private func floatFillScript(_ on: Bool) -> String { """
 })();
 """ }
 
-// Applies live CSS brightness & contrast filters to <video> elements; removes the style tag at defaults.
-private func floatVideoFilterScript(brightness: Double, contrast: Double) -> String { """
+// Document-start hook: enforces Prefer SDR capability overrides and detects live HDR vs SDR video streams
+// (via MSE codec strings, unencrypted fMP4 init segment boxes, WebCodecs VideoFrame, and HLS playlists).
+private func floatMediaHookScript(preferSdr: Bool) -> String { """
+(() => {
+  window.__fpPreferSdr = \(preferSdr ? "true" : "false");
+  if (window.__fpMediaHooked) {
+    if (typeof window.__fpSyncStreams === 'function') window.__fpSyncStreams();
+    return;
+  }
+  window.__fpMediaHooked = true;
+
+  const isHdrMime = (mime) => {
+    if (typeof mime !== 'string' || /^audio\\//i.test(mime)) return false;
+    return /\\b(dvh1|dvhe|dav1)\\b/i.test(mime)
+      || /\\bvp09\\.0[23]\\b/i.test(mime)
+      || /\\bav01\\.\\d+\\.\\d+[MH]\\.(?:10|12)\\.\\d+\\.\\d+\\.\\d+\\.(?:16|18)\\b/i.test(mime);
+  };
+
+  const classifyMime = (mime) => {
+    if (typeof mime !== 'string' || /^audio\\//i.test(mime)) return null;
+    if (isHdrMime(mime)) return 'hdr';
+    if (/\\b(hev1|hvc1)\\.2\\./i.test(mime)) return 'hdr';
+    if (/\\b(avc1|avc3|hev1\\.1|hvc1\\.1|vp09\\.00|vp8)\\b/i.test(mime)) return 'sdr';
+    return null;
+  };
+
+  // --- Prefer SDR capability overrides ---
+  try {
+    const mc = navigator.mediaCapabilities;
+    if (mc && typeof mc.decodingInfo === 'function') {
+      const origDecode = mc.decodingInfo.bind(mc);
+      mc.decodingInfo = function(cfg) {
+        if (window.__fpPreferSdr && cfg && cfg.video) {
+          const v = cfg.video;
+          const tf = typeof v.transferFunction === 'string' ? v.transferFunction.toLowerCase() : '';
+          const gamut = typeof v.colorGamut === 'string' ? v.colorGamut.toLowerCase() : '';
+          if (tf === 'pq' || tf === 'hlg' || v.hdrMetadataType || gamut === 'rec2020' || isHdrMime(v.contentType || '')) {
+            return Promise.resolve({ supported: false, smooth: false, powerEfficient: false, configuration: cfg });
+          }
+        }
+        return origDecode(cfg);
+      };
+    }
+  } catch {}
+
+  for (const Ctor of [window.MediaSource, window.ManagedMediaSource]) {
+    if (!Ctor || typeof Ctor.isTypeSupported !== 'function') continue;
+    try {
+      const origSupported = Ctor.isTypeSupported.bind(Ctor);
+      Ctor.isTypeSupported = function(type) {
+        if (window.__fpPreferSdr && isHdrMime(type)) return false;
+        return origSupported(type);
+      };
+    } catch {}
+  }
+
+  try {
+    const origCanPlay = HTMLMediaElement.prototype.canPlayType;
+    if (typeof origCanPlay === 'function') {
+      HTMLMediaElement.prototype.canPlayType = function(type) {
+        if (window.__fpPreferSdr && isHdrMime(type)) return '';
+        return origCanPlay.call(this, type);
+      };
+    }
+  } catch {}
+
+  try {
+    if (navigator && typeof navigator.requestMediaKeySystemAccess === 'function') {
+      const origEme = navigator.requestMediaKeySystemAccess.bind(navigator);
+      navigator.requestMediaKeySystemAccess = function(keySystem, configs) {
+        if (window.__fpPreferSdr && Array.isArray(configs)) {
+          const filtered = [];
+          for (const cfg of configs) {
+            if (!cfg || !Array.isArray(cfg.videoCapabilities)) {
+              filtered.push(cfg);
+              continue;
+            }
+            const kept = cfg.videoCapabilities.filter(vc => !isHdrMime((vc && vc.contentType) || ''));
+            if (kept.length > 0 || cfg.videoCapabilities.length === 0) {
+              filtered.push(Object.assign({}, cfg, { videoCapabilities: kept }));
+            }
+          }
+          if (filtered.length > 0) return origEme(keySystem, filtered);
+        }
+        return origEme(keySystem, configs);
+      };
+    }
+  } catch {}
+
+  try {
+    const origMM = window.matchMedia && window.matchMedia.bind(window);
+    if (origMM) {
+      window.matchMedia = function(query) {
+        const res = origMM(query);
+        if (!window.__fpPreferSdr || typeof query !== 'string') return res;
+        let forced = null;
+        if (/\\(\\s*(?:video-)?dynamic-range\\s*:\\s*high\\s*\\)/i.test(query)
+            || /\\(\\s*color-gamut\\s*:\\s*rec2020\\s*\\)/i.test(query)) {
+          forced = false;
+        } else if (/\\(\\s*(?:video-)?dynamic-range\\s*:\\s*standard\\s*\\)/i.test(query)) {
+          forced = true;
+        }
+        if (forced === null) return res;
+        return new Proxy(res, {
+          get(target, prop) {
+            if (prop === 'matches') return forced;
+            const v = Reflect.get(target, prop, target);
+            return typeof v === 'function' ? v.bind(target) : v;
+          }
+        });
+      };
+    }
+  } catch {}
+
+  // --- Stream kind detection (HDR vs SDR) ---
+  const msKind = new WeakMap();
+  const sbOwner = new WeakMap();
+  const blobMs = new Map();
+  let lastMsKind = '';
+  let hlsHasHdr = null;
+
+  const u32 = (b, i) => ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+  const tag4 = (b, i) => String.fromCharCode(b[i], b[i + 1], b[i + 2], b[i + 3]);
+
+  // Parses unencrypted fMP4 init segments (moov) for Dolby Vision / HDR10 / HLG boxes.
+  const detectInitKind = (data) => {
+    let bytes;
+    if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    else return null;
+    if (bytes.length < 32) return null;
+    // Walk top-level boxes to find moov (media chunks start with moof/mdat and return immediately).
+    let off = 0, moovStart = -1, moovEnd = -1;
+    while (off + 8 <= bytes.length && off < 65536) {
+      let sz = u32(bytes, off);
+      const t = tag4(bytes, off + 4);
+      if (sz === 0) sz = bytes.length - off;
+      else if (sz < 8) break;
+      if (t === 'moov') {
+        moovStart = off + 8;
+        moovEnd = Math.min(bytes.length, off + sz, off + 65536);
+        break;
+      }
+      if (t === 'moof' || t === 'mdat') return null;
+      off += sz;
+    }
+    if (moovStart < 0) return null;
+    let isVideo = false;
+    let sdrFound = false;
+    for (let i = moovStart; i + 8 <= moovEnd; i++) {
+      const c0 = bytes[i];
+      if (c0 === 118 && bytes[i + 1] === 105 && bytes[i + 2] === 100 && bytes[i + 3] === 101) { // vide
+        isVideo = true;
+      } else if (c0 === 100 && bytes[i + 1] === 118 && (
+        (bytes[i + 2] === 99 && bytes[i + 3] === 67) || // dvcC
+        (bytes[i + 2] === 118 && bytes[i + 3] === 67) || // dvvC
+        (bytes[i + 2] === 104 && bytes[i + 3] === 49) || // dvh1
+        (bytes[i + 2] === 104 && bytes[i + 3] === 101)   // dvhe
+      )) {
+        return 'hdr';
+      } else if ((c0 === 109 && bytes[i + 1] === 100 && bytes[i + 2] === 99 && bytes[i + 3] === 118) || // mdcv
+                 (c0 === 99 && bytes[i + 1] === 108 && bytes[i + 2] === 108 && bytes[i + 3] === 105)) {   // clli
+        return 'hdr';
+      } else if (c0 === 99 && bytes[i + 1] === 111 && bytes[i + 2] === 108 && bytes[i + 3] === 114 && i + 12 <= moovEnd) { // colr
+        if (bytes[i + 4] === 110 && bytes[i + 5] === 99 && bytes[i + 6] === 108 && bytes[i + 7] === 120) { // nclx
+          const tf = (bytes[i + 10] << 8) | bytes[i + 11];
+          if (tf === 16 || tf === 18) return 'hdr';
+          if (tf === 1 || tf === 6 || tf === 13 || tf === 14 || tf === 15) sdrFound = true;
+        }
+      }
+    }
+    if (!isVideo) return null;
+    return sdrFound ? 'sdr' : null;
+  };
+
+  const setMsKind = (ms, kind) => {
+    if (!ms || !kind) return;
+    msKind.set(ms, kind);
+    lastMsKind = kind;
+    syncAllVideos();
+  };
+
+  const hookMediaSource = (Ctor) => {
+    if (!Ctor || !Ctor.prototype || typeof Ctor.prototype.addSourceBuffer !== 'function') return;
+    const origAdd = Ctor.prototype.addSourceBuffer;
+    Ctor.prototype.addSourceBuffer = function(mime) {
+      const sb = origAdd.call(this, mime);
+      try {
+        sbOwner.set(sb, this);
+        const k = classifyMime(mime);
+        if (k) setMsKind(this, k);
+      } catch {}
+      return sb;
+    };
+  };
+  hookMediaSource(window.MediaSource);
+  hookMediaSource(window.ManagedMediaSource);
+
+  try {
+    if (window.SourceBuffer && SourceBuffer.prototype) {
+      if (typeof SourceBuffer.prototype.changeType === 'function') {
+        const origChange = SourceBuffer.prototype.changeType;
+        SourceBuffer.prototype.changeType = function(mime) {
+          const r = origChange.call(this, mime);
+          try {
+            const k = classifyMime(mime);
+            const ms = sbOwner.get(this);
+            if (k && ms) setMsKind(ms, k);
+          } catch {}
+          return r;
+        };
+      }
+      if (typeof SourceBuffer.prototype.appendBuffer === 'function') {
+        const origAppend = SourceBuffer.prototype.appendBuffer;
+        SourceBuffer.prototype.appendBuffer = function(data) {
+          try {
+            const k = detectInitKind(data);
+            const ms = sbOwner.get(this);
+            if (k && ms) setMsKind(ms, k);
+          } catch {}
+          return origAppend.call(this, data);
+        };
+      }
+    }
+  } catch {}
+
+  try {
+    if (window.URL && typeof URL.createObjectURL === 'function') {
+      const origCreate = URL.createObjectURL.bind(URL);
+      URL.createObjectURL = function(obj) {
+        const u = origCreate(obj);
+        try {
+          if (obj && ((window.MediaSource && obj instanceof MediaSource) || (window.ManagedMediaSource && obj instanceof ManagedMediaSource))) {
+            if (blobMs.size > 64) blobMs.delete(blobMs.keys().next().value);
+            blobMs.set(u, obj);
+          }
+        } catch {}
+        return u;
+      };
+    }
+  } catch {}
+
+  // Read-only HLS playlist peek for native HLS players (e.g. Apple TV+)
+  try {
+    if (typeof window.fetch === 'function') {
+      const origFetch = window.fetch.bind(window);
+      window.fetch = function(input, init) {
+        const p = origFetch(input, init);
+        try {
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
+          if (/\\.m3u8(\\?|$|#)/i.test(url)) {
+            p.then(res => {
+              if (!res || !res.ok) return;
+              res.clone().text().then(txt => {
+                if (!txt || !txt.includes('#EXT-X-STREAM-INF')) return;
+                if (/VIDEO-RANGE=(?:PQ|HLG)/i.test(txt) || /CODECS="[^"]*\\b(?:dvh1|dvhe)\\b/i.test(txt)) {
+                  hlsHasHdr = true;
+                  syncAllVideos();
+                } else if (/VIDEO-RANGE=SDR/i.test(txt) && hlsHasHdr === null) {
+                  hlsHasHdr = false;
+                  syncAllVideos();
+                }
+              }).catch(() => {});
+            }).catch(() => {});
+          }
+        } catch {}
+        return p;
+      };
+    }
+  } catch {}
+
+  const classifyVideo = (v) => {
+    if (!v || !v.currentSrc) return '';
+    if (v.srcObject && msKind.has(v.srcObject)) return msKind.get(v.srcObject);
+    const bms = blobMs.get(v.currentSrc);
+    if (bms && msKind.has(bms)) return msKind.get(bms);
+    if (typeof window.VideoFrame === 'function' && v.readyState >= 2 && v.videoWidth > 0) {
+      try {
+        const vf = new VideoFrame(v);
+        const tf = vf.colorSpace && vf.colorSpace.transfer;
+        vf.close();
+        if (tf === 'pq' || tf === 'hlg') return 'hdr';
+        if (tf) return 'sdr';
+      } catch {}
+    }
+    if (window.__fpPreferSdr) return 'sdr';
+    if (lastMsKind) return lastMsKind;
+    if (hlsHasHdr === true) return 'hdr';
+    return 'sdr';
+  };
+
+  let syncTimer = 0;
+  const syncAllVideos = () => {
+    if (syncTimer) return;
+    syncTimer = setTimeout(() => {
+      syncTimer = 0;
+      const videos = [...document.querySelectorAll('video')];
+      let mainVid = null, mainArea = 0;
+      for (const v of videos) {
+        if (!v.currentSrc) {
+          if (v.hasAttribute('data-fp-stream')) v.removeAttribute('data-fp-stream');
+          continue;
+        }
+        const k = classifyVideo(v);
+        if (k && v.getAttribute('data-fp-stream') !== k) {
+          v.setAttribute('data-fp-stream', k);
+        }
+        const area = (v.offsetWidth * v.offsetHeight) || (v.videoWidth * v.videoHeight) || 1;
+        if (area >= mainArea && (!v.paused || !mainVid || mainVid.paused)) {
+          mainVid = v;
+          mainArea = area;
+        }
+      }
+      const active = mainVid ? (mainVid.getAttribute('data-fp-stream') || '') : '';
+      const root = document.documentElement;
+      if (root && root.getAttribute('data-fp-active-stream') !== active) {
+        if (active) root.setAttribute('data-fp-active-stream', active);
+        else root.removeAttribute('data-fp-active-stream');
+      }
+    }, 50);
+  };
+  window.__fpSyncStreams = syncAllVideos;
+
+  for (const ev of ['loadeddata', 'playing', 'resize', 'emptied']) {
+    document.addEventListener(ev, (e) => {
+      if (e.target instanceof HTMLVideoElement) {
+        if (ev === 'emptied') e.target.removeAttribute('data-fp-stream');
+        syncAllVideos();
+      }
+    }, true);
+  }
+})();
+""" }
+
+// Applies live CSS brightness & contrast filters (single or per-stream HDR/SDR) and optional dynamic-range-limit.
+private func floatVideoFilterScript(brightness: Double, hdrBrightness: Double, contrast: Double, streamBrightness: Bool, preferSdr: Bool) -> String { """
 (() => {
   const ID = '__fp_video_filter';
-  const B = \(String(format: "%.2f", brightness)), C = \(String(format: "%.2f", contrast));
+  const B = \(String(format: "%.2f", brightness)), HB = \(String(format: "%.2f", hdrBrightness)), C = \(String(format: "%.2f", contrast));
+  const SPLIT = \(streamBrightness ? "true" : "false"), PREFER_SDR = \(preferSdr ? "true" : "false");
+  const isOne = x => Math.abs(x - 1) < 0.005;
   const apply = () => {
+    const rules = [];
+    if (PREFER_SDR) {
+      rules.push('video { dynamic-range-limit: standard !important; }');
+    }
+    if (!SPLIT) {
+      if (!isOne(B) || !isOne(C)) {
+        rules.push(`video { filter: brightness(${B}) contrast(${C}) !important; }`);
+      }
+    } else {
+      if (!isOne(B) || !isOne(C)) {
+        rules.push(`video:not([data-fp-stream="hdr"]) { filter: brightness(${B}) contrast(${C}) !important; }`);
+      }
+      if (!isOne(HB) || !isOne(C)) {
+        rules.push(`video[data-fp-stream="hdr"] { filter: brightness(${HB}) contrast(${C}) !important; }`);
+      }
+    }
     let s = document.getElementById(ID);
-    if (Math.abs(B - 1) < 0.005 && Math.abs(C - 1) < 0.005) {
+    if (rules.length === 0) {
       if (s) s.remove();
       return;
     }
@@ -193,7 +545,7 @@ private func floatVideoFilterScript(brightness: Double, contrast: Double) -> Str
       s.id = ID;
       (document.head || document.documentElement).appendChild(s);
     }
-    s.textContent = `video { filter: brightness(${B}) contrast(${C}) !important; }`;
+    s.textContent = rules.join(' ');
   };
   if (document.documentElement) apply();
   else document.addEventListener('DOMContentLoaded', apply, { once: true });
@@ -202,14 +554,39 @@ private func floatVideoFilterScript(brightness: Double, contrast: Double) -> Str
 
 private let floatTrackScript = """
 (() => {
-  let last = 0;
-  const send = (event, v) => webkit.messageHandlers.fpPlay.postMessage({ event, t: v.currentTime || 0, d: v.duration || 0 });
+  let last = 0, lastStream = null;
+  const readStream = (v) => {
+    const s = (v && v.getAttribute('data-fp-stream'))
+      || (document.documentElement && document.documentElement.getAttribute('data-fp-active-stream'))
+      || '';
+    return (s === 'hdr' || s === 'sdr') ? s : '';
+  };
+  const sendStream = (s) => {
+    const norm = (s === 'hdr' || s === 'sdr') ? s : '';
+    if (norm === lastStream) return;
+    lastStream = norm;
+    webkit.messageHandlers.fpPlay.postMessage({ event: 'stream', stream: norm });
+  };
+  const send = (event, v) => {
+    const stream = readStream(v);
+    if (stream) lastStream = stream;
+    webkit.messageHandlers.fpPlay.postMessage({ event, t: v.currentTime || 0, d: v.duration || 0, stream });
+  };
   const isVid = e => e.target instanceof HTMLVideoElement;
   document.addEventListener('play', e => isVid(e) && send('play', e.target), true);
   document.addEventListener('pause', e => isVid(e) && send('time', e.target), true);
   document.addEventListener('timeupdate', e => {
     if (isVid(e) && Date.now() - last > 5000) { last = Date.now(); send('time', e.target); }
   }, true);
+  const watchRoot = () => {
+    if (!document.documentElement) return;
+    sendStream(document.documentElement.getAttribute('data-fp-active-stream') || '');
+    new MutationObserver(() => {
+      sendStream(document.documentElement.getAttribute('data-fp-active-stream') || '');
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-fp-active-stream'] });
+  };
+  if (document.documentElement) watchRoot();
+  else document.addEventListener('DOMContentLoaded', watchRoot, { once: true });
 })();
 """
 
@@ -307,9 +684,12 @@ private struct AgentSnapshot: Codable {
     var fill: Bool = true
     var alpha: Double = 1.0
     var videoBrightness: Double = 1.0
+    var hdrVideoBrightness: Double = 1.0
     var videoContrast: Double = 1.0
     var revealStyle: String = "wave"
     var openStyle: String = "lens"
+    var preferSdr: Bool = false
+    var streamBrightness: Bool = false
     var hotkeyKeys: String = "Control+Alt+Meta+F"
     var peekTrigger: String = "rightCommand"
     var peekAlpha: Double = 0.5
@@ -373,6 +753,14 @@ private final class FloatStore {
         }
     }
 
+    var hdrVideoBrightness: Double {
+        get { agentFile != nil ? snapshot.hdrVideoBrightness : (defaults.object(forKey: "hdrVideoBrightness") as? Double ?? 1.0) }
+        set {
+            if agentFile != nil { snapshot.hdrVideoBrightness = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "hdrVideoBrightness") }
+        }
+    }
+
     var videoContrast: Double {
         get { agentFile != nil ? snapshot.videoContrast : (defaults.object(forKey: "videoContrast") as? Double ?? 1.0) }
         set {
@@ -394,6 +782,22 @@ private final class FloatStore {
         set {
             if agentFile != nil { snapshot.openStyle = newValue; flushAgent() }
             else { defaults.set(newValue, forKey: "openStyle") }
+        }
+    }
+
+    var preferSdr: Bool {
+        get { agentFile != nil ? snapshot.preferSdr : (defaults.object(forKey: "preferSdr") as? Bool ?? false) }
+        set {
+            if agentFile != nil { snapshot.preferSdr = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "preferSdr") }
+        }
+    }
+
+    var streamBrightness: Bool {
+        get { agentFile != nil ? snapshot.streamBrightness : (defaults.object(forKey: "streamBrightness") as? Bool ?? false) }
+        set {
+            if agentFile != nil { snapshot.streamBrightness = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "streamBrightness") }
         }
     }
 
@@ -522,6 +926,7 @@ private final class FloatHub {
 
     var mode = "home"
     var currentUrl = ""
+    var activeVideoStream = ""
     var onTop = true
     var expanded = false
     var aspectLocked = false
@@ -607,6 +1012,11 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
               !web.isHidden,
               let url = web.url, url.scheme?.hasPrefix("http") == true, let host = url.host,
               let b = m.body as? [String: Any] else { return }
+        if let stream = b["stream"] as? String, ["", "sdr", "hdr"].contains(stream), module.activeVideoStream != stream {
+            module.activeVideoStream = stream
+            module.notifyChanged()
+        }
+        if b["event"] as? String == "stream" { return }
         let t = b["t"] as? Double ?? 0
         let d = b["d"] as? Double ?? 0
         guard t.isFinite, d.isFinite, t >= 0, d >= 0 else { return }
@@ -651,6 +1061,9 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
         if instance.isWarmSlot(w) {
             instance.handleWarmSlotCommitted(w)
             return
+        }
+        if let module, !module.activeVideoStream.isEmpty {
+            module.activeVideoStream = ""
         }
         instance.handleActiveCommitted(w)
         syncFromWebView(w)
@@ -769,7 +1182,15 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         web.autoresizingMask = [.width, .height]
         web.isHidden = (module.mode == "home")
         container.addSubview(web)
-        installUserScripts(on: web, fill: module.fill, brightness: module.videoBrightness, contrast: module.videoContrast)
+        installUserScripts(
+            on: web,
+            fill: module.fill,
+            brightness: module.videoBrightness,
+            hdrBrightness: module.hdrVideoBrightness,
+            contrast: module.videoContrast,
+            streamBrightness: module.streamBrightness,
+            preferSdr: module.preferSdr
+        )
         module.attachBrowser(self)
     }
 
@@ -926,29 +1347,45 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         }
     }
 
-    func installUserScripts(fill on: Bool, brightness: Double, contrast: Double) {
-        installUserScripts(on: web, fill: on, brightness: brightness, contrast: contrast)
+    func clearWarmPool() {
         for slot in warmPool.values {
-            installUserScripts(on: slot.web, fill: on, brightness: brightness, contrast: contrast)
+            slot.probeToken += 1
+            teardownWebView(slot.web)
+        }
+        warmPool.removeAll()
+    }
+
+    func installUserScripts(fill on: Bool, brightness: Double, hdrBrightness: Double, contrast: Double, streamBrightness: Bool, preferSdr: Bool) {
+        installUserScripts(on: web, fill: on, brightness: brightness, hdrBrightness: hdrBrightness, contrast: contrast, streamBrightness: streamBrightness, preferSdr: preferSdr)
+        for slot in warmPool.values {
+            installUserScripts(on: slot.web, fill: on, brightness: brightness, hdrBrightness: hdrBrightness, contrast: contrast, streamBrightness: streamBrightness, preferSdr: preferSdr)
         }
     }
 
-    private func installUserScripts(on target: WKWebView, fill on: Bool, brightness: Double, contrast: Double) {
+    private func installUserScripts(on target: WKWebView, fill on: Bool, brightness: Double, hdrBrightness: Double, contrast: Double, streamBrightness: Bool, preferSdr: Bool) {
         let ucc = target.configuration.userContentController
         ucc.removeAllUserScripts()
+        ucc.addUserScript(WKUserScript(source: floatMediaHookScript(preferSdr: preferSdr), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         ucc.addUserScript(WKUserScript(source: floatFillScript(on), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
-        ucc.addUserScript(WKUserScript(source: floatVideoFilterScript(brightness: brightness, contrast: contrast), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        ucc.addUserScript(WKUserScript(source: floatVideoFilterScript(brightness: brightness, hdrBrightness: hdrBrightness, contrast: contrast, streamBrightness: streamBrightness, preferSdr: preferSdr), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         ucc.addUserScript(WKUserScript(source: floatTrackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: trackWorld))
     }
 
-    func applyFill(_ on: Bool, brightness: Double, contrast: Double) {
-        installUserScripts(fill: on, brightness: brightness, contrast: contrast)
+    func applyFill(_ on: Bool, brightness: Double, hdrBrightness: Double, contrast: Double, streamBrightness: Bool, preferSdr: Bool) {
+        installUserScripts(fill: on, brightness: brightness, hdrBrightness: hdrBrightness, contrast: contrast, streamBrightness: streamBrightness, preferSdr: preferSdr)
         web.evaluateJavaScript(floatFillScript(on))
     }
 
-    func applyVideoFilter(fill on: Bool, brightness: Double, contrast: Double) {
-        installUserScripts(fill: on, brightness: brightness, contrast: contrast)
-        web.evaluateJavaScript(floatVideoFilterScript(brightness: brightness, contrast: contrast))
+    func applyVideoFilter(fill on: Bool, brightness: Double, hdrBrightness: Double, contrast: Double, streamBrightness: Bool, preferSdr: Bool) {
+        installUserScripts(fill: on, brightness: brightness, hdrBrightness: hdrBrightness, contrast: contrast, streamBrightness: streamBrightness, preferSdr: preferSdr)
+        let hookJs = floatMediaHookScript(preferSdr: preferSdr)
+        let filterJs = floatVideoFilterScript(brightness: brightness, hdrBrightness: hdrBrightness, contrast: contrast, streamBrightness: streamBrightness, preferSdr: preferSdr)
+        web.evaluateJavaScript(hookJs)
+        web.evaluateJavaScript(filterJs)
+        for slot in warmPool.values {
+            slot.web.evaluateJavaScript(hookJs)
+            slot.web.evaluateJavaScript(filterJs)
+        }
     }
 
     /// Wakes WebKit's WebContent + Networking XPC processes on cold start when there are no saved sites yet.
@@ -1018,7 +1455,15 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         w.frame = container.bounds
         w.autoresizingMask = [.width, .height]
         w.isHidden = true
-        installUserScripts(on: w, fill: module.fill, brightness: module.videoBrightness, contrast: module.videoContrast)
+        installUserScripts(
+            on: w,
+            fill: module.fill,
+            brightness: module.videoBrightness,
+            hdrBrightness: module.hdrVideoBrightness,
+            contrast: module.videoContrast,
+            streamBrightness: module.streamBrightness,
+            preferSdr: module.preferSdr
+        )
         container.addSubview(w, positioned: .below, relativeTo: web)
 
         let slot = FloatWarmSlot(hostKey: key, web: w, requestedUrl: url)
@@ -1167,8 +1612,15 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         if reveal {
             web.setAllMediaPlaybackSuspended(false)
             if let mod = module {
+                web.evaluateJavaScript(floatMediaHookScript(preferSdr: mod.preferSdr))
                 web.evaluateJavaScript(floatFillScript(mod.fill))
-                web.evaluateJavaScript(floatVideoFilterScript(brightness: mod.videoBrightness, contrast: mod.videoContrast))
+                web.evaluateJavaScript(floatVideoFilterScript(
+                    brightness: mod.videoBrightness,
+                    hdrBrightness: mod.hdrVideoBrightness,
+                    contrast: mod.videoContrast,
+                    streamBrightness: mod.streamBrightness,
+                    preferSdr: mod.preferSdr
+                ))
             }
         }
         if !activeContentReady {
@@ -1259,6 +1711,7 @@ final class FloatModule: ExactModule {
     // Agent sessions keep per-session transient state; live sessions share FloatHub.shared across windows.
     private var agentMode = "home"
     private var agentCurrentUrl = ""
+    private var agentActiveVideoStream = ""
     private var agentOnTop = true
     private var agentExpanded = false
     private var agentAspectLocked = false
@@ -1272,6 +1725,10 @@ final class FloatModule: ExactModule {
     var currentUrl: String {
         get { context.agent ? agentCurrentUrl : FloatHub.shared.currentUrl }
         set { if context.agent { agentCurrentUrl = newValue } else { FloatHub.shared.currentUrl = newValue } }
+    }
+    var activeVideoStream: String {
+        get { context.agent ? agentActiveVideoStream : FloatHub.shared.activeVideoStream }
+        set { if context.agent { agentActiveVideoStream = newValue } else { FloatHub.shared.activeVideoStream = newValue } }
     }
     var onTop: Bool {
         get { context.agent ? agentOnTop : FloatHub.shared.onTop }
@@ -1306,6 +1763,10 @@ final class FloatModule: ExactModule {
         get { min(2.0, max(0.5, store.videoBrightness)) }
         set { store.videoBrightness = min(2.0, max(0.5, newValue)) }
     }
+    var hdrVideoBrightness: Double {
+        get { min(2.0, max(0.5, store.hdrVideoBrightness)) }
+        set { store.hdrVideoBrightness = min(2.0, max(0.5, newValue)) }
+    }
     var videoContrast: Double {
         get { min(2.0, max(0.5, store.videoContrast)) }
         set { store.videoContrast = min(2.0, max(0.5, newValue)) }
@@ -1317,6 +1778,14 @@ final class FloatModule: ExactModule {
     var openStyle: String {
         get { store.openStyle == "diagonal" ? "diagonal" : "lens" }
         set { store.openStyle = (newValue == "diagonal" ? "diagonal" : "lens") }
+    }
+    var preferSdr: Bool {
+        get { store.preferSdr }
+        set { store.preferSdr = newValue }
+    }
+    var streamBrightness: Bool {
+        get { store.streamBrightness }
+        set { store.streamBrightness = newValue }
     }
     var hotkeyKeys: String {
         get { store.hotkeyKeys }
@@ -1504,7 +1973,7 @@ final class FloatModule: ExactModule {
         let savedKey = w.frameAutosaveName.isEmpty ? nil : "NSWindow Frame \(w.frameAutosaveName)"
         let hasSavedFrame = savedKey.map { UserDefaults.standard.object(forKey: $0) != nil } ?? false
         if !hasSavedFrame {
-            let targetSize = isPanel ? NSSize(width: 760, height: 320) : NSSize(width: 480, height: 520)
+            let targetSize = isPanel ? NSSize(width: 760, height: 340) : NSSize(width: 480, height: 640)
             w.setContentSize(targetSize)
             if let vis = (FloatHub.shared.primaryWindow?.screen ?? NSScreen.main)?.visibleFrame {
                 let s = w.frame.size
@@ -1689,7 +2158,13 @@ final class FloatModule: ExactModule {
             peekHold = (arg == "true")
             notifyChanged()
         case "setVideoBrightness": setVideoBrightness(Double(arg) ?? videoBrightness)
+        case "setHdrVideoBrightness": setHdrVideoBrightness(Double(arg) ?? hdrVideoBrightness)
+        case "brightenVideo": brightenVideo()
+        case "dimVideo": dimVideo()
         case "setVideoContrast": setVideoContrast(Double(arg) ?? videoContrast)
+        case "setPreferSdr": setPreferSdr(arg == "true")
+        case "setStreamBrightness": setStreamBrightness(arg == "true")
+        case "setActiveVideoStream": setActiveVideoStream(arg)
         case "resetVideoFilters": resetVideoFilters()
         case "setRevealStyle": setRevealStyle(arg)
         case "setOpenStyle": setOpenStyle(arg)
@@ -1776,11 +2251,15 @@ final class FloatModule: ExactModule {
             "clickThrough": clickThrough,
             "alpha": (alpha * 100).rounded() / 100,
             "videoBrightness": (videoBrightness * 100).rounded() / 100,
+            "hdrVideoBrightness": (hdrVideoBrightness * 100).rounded() / 100,
             "videoContrast": (videoContrast * 100).rounded() / 100,
             "revealStyle": revealStyle,
             "openStyle": openStyle,
             "preloadedHost": activeBrowser?.preloadedHost ?? "",
             "webContentReady": activeBrowser?.activeContentReady ?? true,
+            "preferSdr": preferSdr,
+            "streamBrightness": streamBrightness,
+            "activeVideoStream": activeVideoStream,
             "hotkeyKeys": hotkeyKeys,
             "hotkeyLabel": floatFormatChordLabel(hotkeyKeys),
             "peekTrigger": peekTrigger,
@@ -1848,6 +2327,7 @@ final class FloatModule: ExactModule {
         pendingSeek = nil
         mode = "web"
         currentUrl = normalizedUrlString(url)
+        activeVideoStream = ""
         if let targetBrowser = activeBrowser {
             if !context.agent {
                 targetBrowser.commitPreparedOrLoad(url, resumeIfPaused: false)
@@ -1876,6 +2356,7 @@ final class FloatModule: ExactModule {
         pendingSeek = r.time > 0 ? r.time : nil
         mode = "web"
         currentUrl = normalizedUrlString(url)
+        activeVideoStream = ""
         if let targetBrowser = activeBrowser {
             if !context.agent {
                 targetBrowser.commitPreparedOrLoad(url, resumeIfPaused: true)
@@ -1892,6 +2373,7 @@ final class FloatModule: ExactModule {
         pendingSeek = nil
         mode = "web"
         currentUrl = normalizedUrlString(url)
+        activeVideoStream = ""
         if let targetBrowser = activeBrowser {
             if !context.agent {
                 targetBrowser.loadRequest(url)
@@ -1911,6 +2393,7 @@ final class FloatModule: ExactModule {
 
     func showHome() {
         mode = "home"
+        activeVideoStream = ""
         pendingSeek = nil
         if context.agent {
             activeBrowser?.web.isHidden = true
@@ -1959,9 +2442,27 @@ final class FloatModule: ExactModule {
         }
     }
 
+    private func syncVideoFilterScripts() {
+        activeBrowser?.applyVideoFilter(
+            fill: fill,
+            brightness: videoBrightness,
+            hdrBrightness: hdrVideoBrightness,
+            contrast: videoContrast,
+            streamBrightness: streamBrightness,
+            preferSdr: preferSdr
+        )
+    }
+
     func toggleFill() {
         fill.toggle()
-        activeBrowser?.applyFill(fill, brightness: videoBrightness, contrast: videoContrast)
+        activeBrowser?.applyFill(
+            fill,
+            brightness: videoBrightness,
+            hdrBrightness: hdrVideoBrightness,
+            contrast: videoContrast,
+            streamBrightness: streamBrightness,
+            preferSdr: preferSdr
+        )
         notifyChanged()
     }
 
@@ -1969,22 +2470,71 @@ final class FloatModule: ExactModule {
         let clamped = (min(2.0, max(0.5, value)) * 100).rounded() / 100
         guard abs(clamped - videoBrightness) >= 0.005 else { return }
         videoBrightness = clamped
-        activeBrowser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        syncVideoFilterScripts()
         notifyChanged()
+    }
+
+    func setHdrVideoBrightness(_ value: Double) {
+        let clamped = (min(2.0, max(0.5, value)) * 100).rounded() / 100
+        guard abs(clamped - hdrVideoBrightness) >= 0.005 else { return }
+        hdrVideoBrightness = clamped
+        syncVideoFilterScripts()
+        notifyChanged()
+    }
+
+    func brightenVideo() {
+        if streamBrightness && activeVideoStream == "hdr" {
+            setHdrVideoBrightness(hdrVideoBrightness + 0.1)
+        } else {
+            setVideoBrightness(videoBrightness + 0.1)
+        }
+    }
+
+    func dimVideo() {
+        if streamBrightness && activeVideoStream == "hdr" {
+            setHdrVideoBrightness(hdrVideoBrightness - 0.1)
+        } else {
+            setVideoBrightness(videoBrightness - 0.1)
+        }
     }
 
     func setVideoContrast(_ value: Double) {
         let clamped = (min(2.0, max(0.5, value)) * 100).rounded() / 100
         guard abs(clamped - videoContrast) >= 0.005 else { return }
         videoContrast = clamped
-        activeBrowser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        syncVideoFilterScripts()
+        notifyChanged()
+    }
+
+    func setPreferSdr(_ value: Bool) {
+        guard preferSdr != value else { return }
+        preferSdr = value
+        activeBrowser?.clearWarmPool()
+        syncVideoFilterScripts()
+        if !context.agent, mode == "web", let web = activeBrowser?.web, web.url?.scheme?.hasPrefix("http") == true {
+            web.reload()
+        }
+        notifyChanged()
+    }
+
+    func setStreamBrightness(_ value: Bool) {
+        guard streamBrightness != value else { return }
+        streamBrightness = value
+        syncVideoFilterScripts()
+        notifyChanged()
+    }
+
+    func setActiveVideoStream(_ value: String) {
+        guard ["", "sdr", "hdr"].contains(value), activeVideoStream != value else { return }
+        activeVideoStream = value
         notifyChanged()
     }
 
     func resetVideoFilters() {
         videoBrightness = 1.0
+        hdrVideoBrightness = 1.0
         videoContrast = 1.0
-        activeBrowser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        syncVideoFilterScripts()
         notifyChanged()
     }
 

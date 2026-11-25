@@ -40,11 +40,15 @@ shape FloatState
   clickThrough: bool
   alpha: number
   videoBrightness: number
+  hdrVideoBrightness: number
   videoContrast: number
   revealStyle: string
   openStyle: string
   preloadedHost: string
   webContentReady: bool
+  preferSdr: bool
+  streamBrightness: bool
+  activeVideoStream: string
   hotkeyKeys: string
   hotkeyLabel: string
   peekTrigger: string
@@ -261,7 +265,7 @@ component Float
   resource vp = exactViewport() as shape Viewport
   resource morphFx = exactSurface("shader") as shape ShaderState
   resource screens = getScreenDetails() as shape ScreenDetails else empty()
-  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, videoContrast=1, revealStyle="wave", openStyle="lens", webContentReady=true, hotkeyKeys="Control+Alt+Meta+F", hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyKeys="Control+Alt+Meta+D", peekHotkeyLabel="⌃⌥⌘D", peekHold=true)
+  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, hdrVideoBrightness=1, videoContrast=1, revealStyle="wave", openStyle="lens", webContentReady=true, preferSdr=false, streamBrightness=false, activeVideoStream="", hotkeyKeys="Control+Alt+Meta+F", hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyKeys="Control+Alt+Meta+D", peekHotkeyLabel="⌃⌥⌘D", peekHold=true)
   resource shortcutStatus = globalShortcutStatus() as shape GlobalShortcutStatus else empty()
 
   derive isMainWindow = page.name == "main"
@@ -297,8 +301,10 @@ component Float
   )
   derive peekPercent = `${round(st.peekAlpha * 100)}%`
   derive brightnessPercent = `${round(st.videoBrightness * 100)}%`
+  derive hdrBrightnessPercent = `${round(st.hdrVideoBrightness * 100)}%`
   derive contrastPercent = `${round(st.videoContrast * 100)}%`
-  derive isPictureDefault = round(st.videoBrightness * 100) == 100 and round(st.videoContrast * 100) == 100
+  derive isPictureDefault = round(st.videoBrightness * 100) == 100 and round(st.hdrVideoBrightness * 100) == 100 and round(st.videoContrast * 100) == 100
+  derive activeStreamLabel = st.activeVideoStream == "hdr" ? "HDR" : (st.activeVideoStream == "sdr" ? "SDR" : "")
   derive peekIsModifier = st.peekTrigger == "rightCommand" or st.peekTrigger == "rightOption"
   derive accessibilityTrusted = match shortcutStatus.apple { case some(a) => a.accessibilityTrusted, case none => true }
   derive needsAccessibility = isMac and peekIsModifier and not accessibilityTrusted
@@ -606,6 +612,28 @@ component Float
   action stepVideoBrightness(delta: number)
     let next = round(min(2, max(0.5, st.videoBrightness + delta)) * 100) / 100
     send cmd = runFloatCommand("setVideoBrightness", `${next}`)
+
+  action setHdrVideoBrightness(val: string)
+    send cmd = runFloatCommand("setHdrVideoBrightness", val)
+
+  action onHdrBrightnessRange(v: number)
+    let stepped = round(min(2, max(0.5, v)) * 20) / 20
+    send cmd = runFloatCommand("setHdrVideoBrightness", `${stepped}`)
+
+  action brightenVideo
+    send cmd = runFloatCommand("brightenVideo", "")
+
+  action dimVideo
+    send cmd = runFloatCommand("dimVideo", "")
+
+  action setPreferSdr(val: string)
+    send cmd = runFloatCommand("setPreferSdr", val)
+
+  action setStreamBrightness(val: string)
+    send cmd = runFloatCommand("setStreamBrightness", val)
+
+  action setActiveVideoStream(val: string)
+    send cmd = runFloatCommand("setActiveVideoStream", val)
 
   action setVideoContrast(val: string)
     send cmd = runFloatCommand("setVideoContrast", val)
@@ -1363,18 +1391,62 @@ component Float
 
                 hr width="100%"
 
-                // Section 2: Video Picture (Brightness & Contrast)
+                // Section 2: Video Picture (HDR, Stream Brightness & Contrast)
                 column width="100%" gap=10
                   row width="100%" align-items="center" justify-content="space-between" gap=8
                     column flex=1 min-width=0 gap=2
-                      text "Video Picture" font-size=13 font-weight=600
-                      text "Adjust brightness and contrast for dark scenes." font-size=11 color="-exact-secondary-label"
+                      row align-items="center" gap=6
+                        text "Video Picture" font-size=13 font-weight=600
+                        if activeStreamLabel != ""
+                          view class=KeyBadge
+                            text activeStreamLabel font-size=10 font-weight=600 color="-exact-system-teal" testId="settings-stream-badge"
+                      text "Adjust brightness, contrast, and HDR playback." font-size=11 color="-exact-secondary-label"
                     button press=resetVideoFilters disabled=isPictureDefault testId="settings-reset-picture"
                       text "Reset"
 
+                  column width="100%" gap=6
+                    column gap=2
+                      text "HDR Playback" font-size=12 font-weight=500
+                      text "Prefer SDR asks streaming sites for SDR instead of HDR / Dolby Vision (reloads page)." font-size=11 color="-exact-secondary-label"
+                    row role="radiogroup" aria-label="HDR Playback" class=SegmentedWrap
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=(not st.preferSdr)
+                        class=(not st.preferSdr ? SegmentedBtnActive : SegmentedBtn)
+                        press=setPreferSdr("false")
+                        testId="hdr-mode-allow"
+                        text "Allow HDR"
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=st.preferSdr
+                        class=(st.preferSdr ? SegmentedBtnActive : SegmentedBtn)
+                        press=setPreferSdr("true")
+                        testId="hdr-mode-sdr"
+                        text "Prefer SDR"
+
+                  column width="100%" gap=6
+                    column gap=2
+                      text "Brightness by Stream Kind" font-size=12 font-weight=500
+                      text "Apply separate brightness levels automatically for HDR and SDR video streams." font-size=11 color="-exact-secondary-label"
+                    row role="radiogroup" aria-label="Brightness by Stream Kind" class=SegmentedWrap
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=(not st.streamBrightness)
+                        class=(not st.streamBrightness ? SegmentedBtnActive : SegmentedBtn)
+                        press=setStreamBrightness("false")
+                        testId="brightness-mode-single"
+                        text "Single"
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=st.streamBrightness
+                        class=(st.streamBrightness ? SegmentedBtnActive : SegmentedBtn)
+                        press=setStreamBrightness("true")
+                        testId="brightness-mode-stream"
+                        text "Separate HDR / SDR"
+
                   column width="100%" gap=4
                     row width="100%" align-items="center" justify-content="space-between"
-                      text "Brightness" font-size=12 font-weight=500
+                      text (st.streamBrightness ? (st.activeVideoStream == "sdr" ? "SDR Brightness (Active)" : "SDR Brightness") : "Brightness") font-size=12 font-weight=500
                       text brightnessPercent font-size=12 font-weight=600 color="-exact-system-teal" testId="settings-brightness-pct"
                     input type="range"
                       min=0.5
@@ -1382,8 +1454,22 @@ component Float
                       step=0.05
                       value=st.videoBrightness
                       input=onBrightnessRange
-                      aria-label="Brightness"
+                      aria-label=(st.streamBrightness ? "SDR Brightness" : "Brightness")
                       testId="settings-brightness-slider"
+
+                  if st.streamBrightness
+                    column width="100%" gap=4
+                      row width="100%" align-items="center" justify-content="space-between"
+                        text (st.activeVideoStream == "hdr" ? "HDR Brightness (Active)" : "HDR Brightness") font-size=12 font-weight=500
+                        text hdrBrightnessPercent font-size=12 font-weight=600 color="-exact-system-teal" testId="settings-hdr-brightness-pct"
+                      input type="range"
+                        min=0.5
+                        max=2
+                        step=0.05
+                        value=st.hdrVideoBrightness
+                        input=onHdrBrightnessRange
+                        aria-label="HDR Brightness"
+                        testId="settings-hdr-brightness-slider"
 
                   column width="100%" gap=4
                     row width="100%" align-items="center" justify-content="space-between"
@@ -1561,6 +1647,10 @@ component Float
                   text "Opacity − / +" font-size=12
                   view class=KeyBadge
                     text "⌘−  ⌘=" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Brightness − / +" font-size=12
+                  view class=KeyBadge
+                    text "⌃⌘−  ⌃⌘=" font-size=11
                 row width="100%" align-items="center" justify-content="space-between" gap=8
                   text "Click-Through" font-size=12
                   view class=KeyBadge
@@ -1760,6 +1850,33 @@ component Float
             width=4
             height=4
             overflow="hidden"
+            press=dimVideo
+            -exact-menu="view"
+            aria-keyshortcuts="Control+Meta+-"
+            aria-label="Decrease Brightness"
+            testId="cmd-brightness-down"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=brightenVideo
+            -exact-menu="view"
+            aria-keyshortcuts="Control+Meta+="
+            aria-label="Increase Brightness"
+            testId="cmd-brightness-up"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=resetVideoFilters
+            -exact-menu="view"
+            aria-keyshortcuts="Control+Meta+0"
+            aria-label="Reset Brightness & Contrast"
+            testId="cmd-filters-reset"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
             press=playPause
             -exact-menu="view"
             aria-keyshortcuts="Control+Space"
@@ -1889,14 +2006,6 @@ component Float
             width=4
             height=4
             overflow="hidden"
-            press=resetVideoFilters
-            -exact-menu="none"
-            aria-label="Reset Video Filters"
-            testId="cmd-filters-reset"
-          button appearance="none"
-            width=4
-            height=4
-            overflow="hidden"
             press=setRevealStyle("curtain")
             -exact-menu="none"
             aria-label="Reveal Curtain"
@@ -1925,3 +2034,59 @@ component Float
             -exact-menu="none"
             aria-label="Open Lens"
             testId="cmd-open-lens"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setPreferSdr("true")
+            -exact-menu="none"
+            aria-label="Prefer SDR On"
+            testId="cmd-prefer-sdr-on"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setPreferSdr("false")
+            -exact-menu="none"
+            aria-label="Prefer SDR Off"
+            testId="cmd-prefer-sdr-off"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setStreamBrightness("true")
+            -exact-menu="none"
+            aria-label="Stream Brightness On"
+            testId="cmd-stream-brightness-on"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setStreamBrightness("false")
+            -exact-menu="none"
+            aria-label="Stream Brightness Off"
+            testId="cmd-stream-brightness-off"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setHdrVideoBrightness("1.75")
+            -exact-menu="none"
+            aria-label="HDR Brightness 175%"
+            testId="cmd-hdr-brightness-175"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setActiveVideoStream("hdr")
+            -exact-menu="none"
+            aria-label="Active Stream HDR"
+            testId="cmd-stream-hdr"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setActiveVideoStream("sdr")
+            -exact-menu="none"
+            aria-label="Active Stream SDR"
+            testId="cmd-stream-sdr"
