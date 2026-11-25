@@ -667,7 +667,8 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         web.uiDelegate = delegate
         web.allowsBackForwardNavigationGestures = true
         web.allowsMagnification = true
-        web.setValue(false, forKey: "drawsBackground")
+        web.underPageBackgroundColor = .black
+        web.isHidden = (module.mode == "home")
         cfg.userContentController.add(delegate, contentWorld: trackWorld, name: "fpPlay")
         installUserScripts(fill: module.fill, brightness: module.videoBrightness, contrast: module.videoContrast)
         module.attachBrowser(self)
@@ -1014,19 +1015,39 @@ final class FloatModule: ExactModule {
         homeBackdropView = backdrop
     }
 
+    private func removeHomeBackdrop() {
+        guard let existing = homeBackdropView else { return }
+        existing.removeFromSuperview()
+        homeBackdropView = nil
+    }
+
     fileprivate func syncWindowBackdrop() {
         let isHome = (mode == "home")
-        browser?.web.isHidden = isHome
+        if let web = browser?.web, web.isHidden != isHome {
+            web.isHidden = isHome
+        }
         guard let w = mainWindow else { return }
-        installHomeBackdrop(in: w)
-        homeBackdropView?.isHidden = !isHome || !glassReady
+        let wantsHomeBackdrop = isHome && glassReady
+        if wantsHomeBackdrop {
+            installHomeBackdrop(in: w)
+            if homeBackdropView?.isHidden == true {
+                homeBackdropView?.isHidden = false
+            }
+        } else {
+            // Detach NSGlassEffectView/NSVisualEffectView completely in web mode (and before morph reveal):
+            // keeping a hidden glass backdrop mounted in an opaque floating window interferes with
+            // WindowServer shadow and behind-window vibrancy compositing.
+            removeHomeBackdrop()
+        }
         if let content = w.contentView {
             for sub in content.subviews {
                 if let scroll = sub as? NSScrollView {
                     if scroll.drawsBackground != !isHome {
                         scroll.drawsBackground = !isHome
                     }
-                    scroll.backgroundColor = isHome ? .clear : .black
+                    if isHome, scroll.backgroundColor != .clear {
+                        scroll.backgroundColor = .clear
+                    }
                     if scroll.hasVerticalScroller { scroll.hasVerticalScroller = false }
                     if scroll.hasHorizontalScroller { scroll.hasHorizontalScroller = false }
                 }
@@ -1041,7 +1062,9 @@ final class FloatModule: ExactModule {
         }
         if lastBackdropIsHome != isHome {
             lastBackdropIsHome = isHome
-            w.invalidateShadow()
+            if w.hasShadow {
+                w.invalidateShadow()
+            }
         }
     }
 
@@ -1050,8 +1073,8 @@ final class FloatModule: ExactModule {
         guard !glassReady else { return }
         glassReady = true
         guard let w = mainWindow else { return }
-        homeBackdropView?.alphaValue = 0
         syncWindowBackdrop()
+        homeBackdropView?.alphaValue = 0
         w.hasShadow = true
         w.invalidateShadow()
         NSAnimationContext.runAnimationGroup { ctx in
@@ -1247,6 +1270,7 @@ final class FloatModule: ExactModule {
     func showHome() {
         mode = "home"
         pendingSeek = nil
+        activeBrowser?.web.isHidden = true
         if !context.agent { activeBrowser?.loadBlank() }
         notifyChanged()
     }
