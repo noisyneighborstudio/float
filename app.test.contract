@@ -146,6 +146,10 @@ test "settings route renders native Contract controls"
   expect tree has "settings-brightness-slider"
   expect tree has "settings-contrast-slider"
   expect tree has "settings-peek-slider"
+  expect tree has "reveal-style-wave"
+  expect tree has "reveal-style-curtain"
+  expect tree has "open-style-lens"
+  expect tree has "open-style-diagonal"
 
 test "shortcuts route renders native Contract HUD with live global shortcuts"
   at "/shortcuts"
@@ -176,3 +180,38 @@ test "video brightness and contrast filters persist across reload and reset clea
   clock data
   expect state st.videoBrightness == 1
   expect state st.videoContrast == 1
+
+test "glass reveal and open transition styles persist across reload and reverse wipe settles cleanly"
+  clock data
+  expect state st.revealStyle == "wave"
+  expect state st.openStyle == "lens"
+
+  tap "cmd-reveal-curtain"
+  clock data
+  expect state st.revealStyle == "curtain"
+
+  tap "cmd-open-diagonal"
+  clock data
+  expect state st.openStyle == "diagonal"
+
+  reload
+  clock data
+  expect state st.revealStyle == "curtain"
+  expect state st.openStyle == "diagonal"
+
+  // Navigate to a site and return Home: reverse glass wipe mounts then unmounts cleanly
+  tap "cmd-open-url"
+  type "url-input" "vimeo.com"
+  type "url-input" key "Enter"
+  clock data
+  expect state st.mode == "web"
+
+  tap "cmd-home"
+  clock data
+  expect state st.mode == "home"
+  expect state fxKind == 5
+  expect tree has "home-transition-fx"
+
+  clock +1100
+  expect state fxKind == 0
+  expect tree missing "home-transition-fx"

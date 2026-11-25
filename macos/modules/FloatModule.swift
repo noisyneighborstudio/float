@@ -308,6 +308,8 @@ private struct AgentSnapshot: Codable {
     var alpha: Double = 1.0
     var videoBrightness: Double = 1.0
     var videoContrast: Double = 1.0
+    var revealStyle: String = "wave"
+    var openStyle: String = "lens"
     var hotkeyKeys: String = "Control+Alt+Meta+F"
     var peekTrigger: String = "rightCommand"
     var peekAlpha: Double = 0.5
@@ -376,6 +378,22 @@ private final class FloatStore {
         set {
             if agentFile != nil { snapshot.videoContrast = newValue; flushAgent() }
             else { defaults.set(newValue, forKey: "videoContrast") }
+        }
+    }
+
+    var revealStyle: String {
+        get { agentFile != nil ? snapshot.revealStyle : (defaults.string(forKey: "revealStyle") ?? "wave") }
+        set {
+            if agentFile != nil { snapshot.revealStyle = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "revealStyle") }
+        }
+    }
+
+    var openStyle: String {
+        get { agentFile != nil ? snapshot.openStyle : (defaults.string(forKey: "openStyle") ?? "lens") }
+        set {
+            if agentFile != nil { snapshot.openStyle = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "openStyle") }
         }
     }
 
@@ -552,13 +570,25 @@ private final class FloatHub {
     }
 }
 
+/// Compares two http(s) URLs ignoring trailing slash differences on the root path and host casing.
+private func floatSameLoadTarget(_ a: URL, _ b: URL) -> Bool {
+    guard (a.scheme?.lowercased() ?? "") == (b.scheme?.lowercased() ?? ""),
+          (a.host?.lowercased() ?? "") == (b.host?.lowercased() ?? ""),
+          a.port == b.port,
+          a.query == b.query else { return false }
+    let pa = a.path.isEmpty ? "/" : a.path
+    let pb = b.path.isEmpty ? "/" : b.path
+    return pa == pb
+}
+
 /// WKWebView subclass that suppresses initial opaque backing-store flash before the GPU morph presents.
 private final class FloatWebView: WKWebView {
     weak var module: FloatModule?
+    var triggersMorphPrepare = false
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if let win = window {
+        if triggersMorphPrepare, let win = window {
             module?.prepareWindowForMorph(win)
         }
     }
@@ -567,10 +597,14 @@ private final class FloatWebView: WKWebView {
 /// Delegate helper inheriting NSObject for WKNavigationDelegate, WKUIDelegate, and WKScriptMessageHandler.
 private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     weak var module: FloatModule?
-    weak var web: WKWebView?
+    weak var instance: FloatBrowserInstance?
 
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
-        guard let module, let web,
+        guard let module, let instance,
+              let web = m.webView,
+              web === instance.web,
+              module.mode == "web",
+              !web.isHidden,
               let url = web.url, url.scheme?.hasPrefix("http") == true, let host = url.host,
               let b = m.body as? [String: Any] else { return }
         let t = b["t"] as? Double ?? 0
@@ -613,15 +647,31 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
     }
 
     func webView(_ w: WKWebView, didCommit navigation: WKNavigation!) {
-        syncFromWebView()
+        guard let instance else { return }
+        if instance.isWarmSlot(w) {
+            instance.handleWarmSlotCommitted(w)
+            return
+        }
+        instance.handleActiveCommitted(w)
+        syncFromWebView(w)
     }
 
     func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
-        syncFromWebView()
+        guard let instance else { return }
+        if instance.isWarmSlot(w) {
+            instance.handleWarmSlotFinished(w)
+            return
+        }
+        instance.handleActiveFinished(w)
+        syncFromWebView(w)
     }
 
-    private func syncFromWebView() {
-        guard let module, let web, let url = web.url else { return }
+    private func syncFromWebView(_ web: WKWebView) {
+        guard let module, let instance,
+              web === instance.web,
+              module.mode == "web",
+              !web.isHidden,
+              let url = web.url else { return }
         if url.absoluteString == "about:blank" {
             if module.mode != "home" {
                 module.mode = "home"
@@ -644,47 +694,247 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
     }
 }
 
-/// Native WKWebView instance owning video playback, fill script, isolated fpPlay tracking, and navigation.
-fileprivate final class FloatBrowserInstance: ExactNativeInstance {
+/// Detects when a client-rendered SPA (like Apple TV+, Netflix, YouTube) has actually painted
+/// real content rather than an empty black #app shell.
+private let floatContentReadyScript = """
+(() => {
+  if (document.readyState === 'loading') return false;
+  const body = document.body;
+  if (!body) return false;
+  const vids = document.querySelectorAll('video');
+  for (const v of vids) {
+    if (v.readyState >= 2 || v.offsetWidth > 80) return true;
+  }
+  const imgs = [...document.querySelectorAll('img')].filter(i => i.complete && i.naturalWidth > 32 && i.offsetWidth > 16);
+  if (imgs.length >= 1) return true;
+  const text = (body.innerText || '').trim();
+  if (text.length >= 60) return true;
+  const graphics = document.querySelectorAll('canvas, svg');
+  if (graphics.length >= 3 && body.offsetHeight > 120) return true;
+  return false;
+})()
+"""
+
+private final class FloatWarmSlot {
+    let hostKey: String
     let web: FloatWebView
+    var requestedUrl: URL
+    var committed = false
+    var contentReady = false
+    var lastUsed = Date()
+    var probeToken: Int = 0
+
+    init(hostKey: String, web: FloatWebView, requestedUrl: URL) {
+        self.hostKey = hostKey
+        self.web = web
+        self.requestedUrl = requestedUrl
+    }
+}
+
+/// Native WKWebView host owning video playback, fill script, isolated fpPlay tracking,
+/// a bounded multi-site warm preload pool (up to 6 saved sites), true SPA readiness probing,
+/// and instant resume-from-pause.
+fileprivate final class FloatBrowserInstance: ExactNativeInstance {
+    private static let maxWarmPoolSize = 6
+
+    let container: NSView
+    private(set) var web: FloatWebView
+    private var warmPool: [String: FloatWarmSlot] = [:]
+    private var processWarmupWeb: FloatWebView?
+    private var pausedHomeUrl: URL?
+    private var pausedRequestedUrl: URL?
+    private var homeIdleCleanup: DispatchWorkItem?
+    private var preparedUrl: URL?
+    private var activeNavigationToken: Int = 0
+    private(set) var activeContentReady: Bool = true
+
+    private weak var module: FloatModule?
     private let delegate = FloatBrowserDelegate()
     // Tracking script + fpPlay bridge live here; page JS can't reach them to forge messages.
     private let trackWorld = WKContentWorld.world(name: "float-track")
 
     init(_ module: FloatModule, _ events: ExactNativeEvents) {
+        self.module = module
+        self.container = NSView(frame: .zero)
+        self.web = FloatBrowserInstance.makeWebView(
+            module: module,
+            delegate: delegate,
+            trackWorld: trackWorld,
+            triggersMorphPrepare: true
+        )
+        super.init(events: events)
+        delegate.module = module
+        delegate.instance = self
+        web.frame = container.bounds
+        web.autoresizingMask = [.width, .height]
+        web.isHidden = (module.mode == "home")
+        container.addSubview(web)
+        installUserScripts(on: web, fill: module.fill, brightness: module.videoBrightness, contrast: module.videoContrast)
+        module.attachBrowser(self)
+    }
+
+    private static func makeWebView(
+        module: FloatModule,
+        delegate: FloatBrowserDelegate,
+        trackWorld: WKContentWorld,
+        triggersMorphPrepare: Bool
+    ) -> FloatWebView {
         let cfg = WKWebViewConfiguration()
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.allowsAirPlayForMediaPlayback = true
         cfg.preferences.isElementFullscreenEnabled = true
         cfg.websiteDataStore = module.context.agent ? .nonPersistent() : .default()
-        web = FloatWebView(frame: .zero, configuration: cfg)
-        web.module = module
-        super.init(events: events)
-        delegate.module = module
-        delegate.web = web
-        web.customUserAgent = safariUA
-        web.navigationDelegate = delegate
-        web.uiDelegate = delegate
-        web.allowsBackForwardNavigationGestures = true
-        web.allowsMagnification = true
-        web.underPageBackgroundColor = .black
-        web.isHidden = (module.mode == "home")
         cfg.userContentController.add(delegate, contentWorld: trackWorld, name: "fpPlay")
-        installUserScripts(fill: module.fill, brightness: module.videoBrightness, contrast: module.videoContrast)
-        module.attachBrowser(self)
+        let w = FloatWebView(frame: .zero, configuration: cfg)
+        w.module = module
+        w.triggersMorphPrepare = triggersMorphPrepare
+        w.customUserAgent = safariUA
+        w.navigationDelegate = delegate
+        w.uiDelegate = delegate
+        w.allowsBackForwardNavigationGestures = true
+        w.allowsMagnification = true
+        w.underPageBackgroundColor = .black
+        return w
     }
 
-    override var view: ExactNativeView { web }
+    override var view: ExactNativeView { container }
 
     override func destroy() {
-        web.configuration.userContentController.removeScriptMessageHandler(forName: "fpPlay", contentWorld: trackWorld)
-        web.navigationDelegate = nil
-        web.uiDelegate = nil
-        web.stopLoading()
+        homeIdleCleanup?.cancel()
+        homeIdleCleanup = nil
+        activeNavigationToken += 1
+        teardownWebView(web)
+        for slot in warmPool.values {
+            slot.probeToken += 1
+            teardownWebView(slot.web)
+        }
+        warmPool.removeAll()
+        if let pw = processWarmupWeb {
+            teardownWebView(pw)
+            processWarmupWeb = nil
+        }
+    }
+
+    private func teardownWebView(_ w: FloatWebView) {
+        w.configuration.userContentController.removeScriptMessageHandler(forName: "fpPlay", contentWorld: trackWorld)
+        w.navigationDelegate = nil
+        w.uiDelegate = nil
+        w.stopLoading()
+        w.setAllMediaPlaybackSuspended(true)
+        w.removeFromSuperview()
+    }
+
+    func isWarmSlot(_ w: WKWebView) -> Bool {
+        if processWarmupWeb === w { return true }
+        return warmPool.values.contains { $0.web === w }
+    }
+
+    private func warmSlot(for w: WKWebView) -> FloatWarmSlot? {
+        warmPool.values.first { $0.web === w }
+    }
+
+    func handleWarmSlotCommitted(_ w: WKWebView) {
+        // Re-assert media suspension across cross-origin process swaps so preloaded views never leak audio.
+        w.setAllMediaPlaybackSuspended(true)
+        guard let slot = warmSlot(for: w) else { return }
+        slot.committed = true
+    }
+
+    func handleWarmSlotFinished(_ w: WKWebView) {
+        w.setAllMediaPlaybackSuspended(true)
+        guard let slot = warmSlot(for: w) else { return }
+        slot.committed = true
+        slot.probeToken += 1
+        probeWarmSlotReadiness(slot, token: slot.probeToken, attemptsLeft: 45)
+    }
+
+    private func probeWarmSlotReadiness(_ slot: FloatWarmSlot, token: Int, attemptsLeft: Int) {
+        guard slot.probeToken == token, warmPool[slot.hostKey] === slot, !slot.contentReady else { return }
+        slot.web.setAllMediaPlaybackSuspended(true)
+        slot.web.evaluateJavaScript(floatContentReadyScript) { [weak self, weak slot] res, _ in
+            guard let self, let slot, slot.probeToken == token, self.warmPool[slot.hostKey] === slot else { return }
+            let ready = (res as? Bool) ?? false
+            if ready || attemptsLeft <= 1 {
+                slot.contentReady = true
+                // Pause any media that bootstrapped during hydration
+                slot.web.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
+                slot.web.setAllMediaPlaybackSuspended(true)
+                self.module?.notifyChanged()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self, weak slot] in
+                    guard let self, let slot else { return }
+                    self.probeWarmSlotReadiness(slot, token: token, attemptsLeft: attemptsLeft - 1)
+                }
+            }
+        }
+    }
+
+    func handleActiveCommitted(_ w: WKWebView) {
+        guard w === web, !activeContentReady else { return }
+        let token = activeNavigationToken
+        probeActiveContentReady(token: token, attemptsLeft: 32)
+    }
+
+    func handleActiveFinished(_ w: WKWebView) {
+        guard w === web, !activeContentReady else { return }
+        let token = activeNavigationToken
+        probeActiveContentReady(token: token, attemptsLeft: 28)
+    }
+
+    private func probeActiveContentReady(token: Int, attemptsLeft: Int) {
+        guard token == activeNavigationToken, !activeContentReady else { return }
+        web.evaluateJavaScript(floatContentReadyScript) { [weak self] res, _ in
+            guard let self, token == self.activeNavigationToken, !self.activeContentReady else { return }
+            let ready = (res as? Bool) ?? false
+            if ready || attemptsLeft <= 1 {
+                self.activeContentReady = true
+                self.module?.notifyChanged()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in
+                    self?.probeActiveContentReady(token: token, attemptsLeft: attemptsLeft - 1)
+                }
+            }
+        }
+    }
+
+    var preloadedHost: String {
+        if let paused = pausedHomeUrl?.host ?? pausedRequestedUrl?.host {
+            return paused
+        }
+        if let readySlot = warmPool.values
+            .filter({ $0.contentReady })
+            .sorted(by: { $0.lastUsed > $1.lastUsed })
+            .first {
+            return readySlot.requestedUrl.host ?? ""
+        }
+        return ""
+    }
+
+    func hasWarmHost(_ host: String) -> Bool {
+        let key = host.lowercased()
+        if pausedHomeUrl?.host?.lowercased() == key || pausedRequestedUrl?.host?.lowercased() == key {
+            return true
+        }
+        return warmPool[key] != nil
+    }
+
+    func removeWarmSite(_ host: String) {
+        let key = host.lowercased()
+        if let slot = warmPool.removeValue(forKey: key) {
+            slot.probeToken += 1
+            teardownWebView(slot.web)
+        }
     }
 
     func installUserScripts(fill on: Bool, brightness: Double, contrast: Double) {
-        let ucc = web.configuration.userContentController
+        installUserScripts(on: web, fill: on, brightness: brightness, contrast: contrast)
+        for slot in warmPool.values {
+            installUserScripts(on: slot.web, fill: on, brightness: brightness, contrast: contrast)
+        }
+    }
+
+    private func installUserScripts(on target: WKWebView, fill on: Bool, brightness: Double, contrast: Double) {
+        let ucc = target.configuration.userContentController
         ucc.removeAllUserScripts()
         ucc.addUserScript(WKUserScript(source: floatFillScript(on), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         ucc.addUserScript(WKUserScript(source: floatVideoFilterScript(brightness: brightness, contrast: contrast), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
@@ -701,11 +951,274 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         web.evaluateJavaScript(floatVideoFilterScript(brightness: brightness, contrast: contrast))
     }
 
-    func loadRequest(_ url: URL) {
+    /// Wakes WebKit's WebContent + Networking XPC processes on cold start when there are no saved sites yet.
+    func warmWebKitProcesses() {
+        guard let module, !module.context.agent else { return }
+        guard processWarmupWeb == nil, warmPool.isEmpty else { return }
+        let w = FloatBrowserInstance.makeWebView(
+            module: module,
+            delegate: delegate,
+            trackWorld: trackWorld,
+            triggersMorphPrepare: false
+        )
+        w.frame = container.bounds
+        w.autoresizingMask = [.width, .height]
+        w.isHidden = true
+        w.setAllMediaPlaybackSuspended(true)
+        container.addSubview(w, positioned: .below, relativeTo: web)
+        processWarmupWeb = w
+        w.loadHTMLString("<!doctype html><html><body></body></html>", baseURL: nil)
+    }
+
+    /// Preloads a saved site's homepage into the bounded multi-site warm pool (max 6 slots, LRU).
+    func preloadStandby(_ url: URL) {
+        guard let module, !module.context.agent, floatIsWeb(url), let rawHost = url.host else { return }
+        let key = rawHost.lowercased()
+
+        // Already paused on this exact target in activeWeb
+        if let paused = pausedHomeUrl, floatSameLoadTarget(paused, url) { return }
+        if let pausedReq = pausedRequestedUrl, floatSameLoadTarget(pausedReq, url) { return }
+
+        // Already warm in pool for this site
+        if let existing = warmPool[key] {
+            existing.lastUsed = Date()
+            if floatSameLoadTarget(existing.requestedUrl, url) { return }
+            existing.requestedUrl = url
+            existing.committed = false
+            existing.contentReady = false
+            existing.probeToken += 1
+            existing.web.setAllMediaPlaybackSuspended(true)
+            existing.web.load(URLRequest(url: url))
+            return
+        }
+
+        // Clean up process-only warmup view once real sites enter the pool
+        if let pw = processWarmupWeb {
+            teardownWebView(pw)
+            processWarmupWeb = nil
+        }
+
+        // LRU eviction when pool is at capacity
+        while warmPool.count >= FloatBrowserInstance.maxWarmPoolSize {
+            if let oldest = warmPool.values.min(by: { $0.lastUsed < $1.lastUsed }) {
+                oldest.probeToken += 1
+                teardownWebView(oldest.web)
+                warmPool.removeValue(forKey: oldest.hostKey)
+            } else {
+                break
+            }
+        }
+
+        let w = FloatBrowserInstance.makeWebView(
+            module: module,
+            delegate: delegate,
+            trackWorld: trackWorld,
+            triggersMorphPrepare: false
+        )
+        w.frame = container.bounds
+        w.autoresizingMask = [.width, .height]
+        w.isHidden = true
+        installUserScripts(on: w, fill: module.fill, brightness: module.videoBrightness, contrast: module.videoContrast)
+        container.addSubview(w, positioned: .below, relativeTo: web)
+
+        let slot = FloatWarmSlot(hostKey: key, web: w, requestedUrl: url)
+        warmPool[key] = slot
+        w.setAllMediaPlaybackSuspended(true)
+        w.load(URLRequest(url: url))
+    }
+
+    private func matchingWarmSlot(for url: URL) -> FloatWarmSlot? {
+        guard let key = url.host?.lowercased(), let slot = warmPool[key] else { return nil }
+        if floatSameLoadTarget(slot.requestedUrl, url) { return slot }
+        if let current = slot.web.url, floatSameLoadTarget(current, url) { return slot }
+        return nil
+    }
+
+    /// Prepares or promotes the target URL in the background without unhiding yet (used during glass wipe).
+    func prepareRequest(_ url: URL, resumeIfPaused: Bool = false) {
+        homeIdleCleanup?.cancel()
+        homeIdleCleanup = nil
+        preparedUrl = url
+
+        // 1. Instant 0ms path: target is already paused in activeWeb from a recent showHome()
+        let matchesPaused = (pausedHomeUrl.map { floatSameLoadTarget($0, url) } ?? false)
+            || (pausedRequestedUrl.map { floatSameLoadTarget($0, url) } ?? false)
+            || (resumeIfPaused && pausedHomeUrl?.host?.lowercased() == url.host?.lowercased() && pausedHomeUrl?.path == url.path)
+        if matchesPaused {
+            activeNavigationToken += 1
+            activeContentReady = true
+            module?.notifyChanged()
+            return
+        }
+
+        // 2. Instant pool promotion path: site is already warm/hydrated in warmPool
+        if let slot = matchingWarmSlot(for: url) {
+            promoteWarmSlot(slot, reveal: false)
+            return
+        }
+
+        // 3. Cold navigation directly into activeWeb behind the breathing glass veil
+        parkActiveIfHomepage()
+        pausedHomeUrl = nil
+        pausedRequestedUrl = nil
+        activeNavigationToken += 1
+        activeContentReady = false
+        web.setAllMediaPlaybackSuspended(true)
         web.load(URLRequest(url: url))
+        module?.notifyChanged()
+    }
+
+    /// Commits a previously prepared load (or loads fresh if not yet prepared), revealing and unsuspending media.
+    func commitPreparedOrLoad(_ url: URL, resumeIfPaused: Bool = false) {
+        homeIdleCleanup?.cancel()
+        homeIdleCleanup = nil
+
+        let wasPrepared = preparedUrl.map { floatSameLoadTarget($0, url) } ?? false
+        preparedUrl = nil
+
+        // 1. Instant 0ms resume from paused Home state
+        let matchesPaused = (pausedHomeUrl.map { floatSameLoadTarget($0, url) } ?? false)
+            || (pausedRequestedUrl.map { floatSameLoadTarget($0, url) } ?? false)
+            || (resumeIfPaused && pausedHomeUrl?.host?.lowercased() == url.host?.lowercased() && pausedHomeUrl?.path == url.path)
+        if matchesPaused {
+            pausedHomeUrl = nil
+            pausedRequestedUrl = nil
+            activeNavigationToken += 1
+            activeContentReady = true
+            web.isHidden = false
+            web.setAllMediaPlaybackSuspended(false)
+            if resumeIfPaused {
+                web.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v && v.paused){ v.play().catch(()=>{}); } })()")
+            }
+            return
+        }
+
+        // 2. Promote matching warm slot if not already promoted in prepareRequest
+        if let slot = matchingWarmSlot(for: url) {
+            promoteWarmSlot(slot, reveal: true)
+            return
+        }
+
+        // 3. Reveal & unsuspend activeWeb (either already prepared or fresh load)
+        pausedHomeUrl = nil
+        pausedRequestedUrl = nil
+        web.isHidden = false
+        web.setAllMediaPlaybackSuspended(false)
+        if !wasPrepared {
+            activeNavigationToken += 1
+            activeContentReady = false
+            web.load(URLRequest(url: url))
+            let token = activeNavigationToken
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                self?.probeActiveContentReady(token: token, attemptsLeft: 32)
+            }
+        } else if !activeContentReady {
+            // Ensure active readiness polling continues after unhiding (for SPAs that waited on visibility)
+            let token = activeNavigationToken
+            probeActiveContentReady(token: token, attemptsLeft: 32)
+        }
+    }
+
+    /// Parks the current activeWeb back into warmPool when switching sites if it's a clean site homepage
+    /// so bouncing back to it later is 0ms.
+    private func parkActiveIfHomepage() {
+        guard let cur = web.url, floatIsWeb(cur), let rawHost = cur.host else { return }
+        let key = rawHost.lowercased()
+        let isRootOrBrowse = cur.path.isEmpty || cur.path == "/" || cur.path == "/browse" || cur.path == "/home"
+        guard isRootOrBrowse, warmPool[key] == nil, warmPool.count < FloatBrowserInstance.maxWarmPoolSize else { return }
+        // Caller will swap web out when promoting; only used when replacing activeWeb in promoteWarmSlot.
+    }
+
+    private func promoteWarmSlot(_ slot: FloatWarmSlot, reveal: Bool) {
+        let oldWeb = web
+        let oldPausedUrl = pausedHomeUrl ?? oldWeb.url
+        let oldWasReady = activeContentReady
+        warmPool.removeValue(forKey: slot.hostKey)
+        slot.probeToken += 1
+
+        pausedHomeUrl = nil
+        pausedRequestedUrl = nil
+
+        slot.web.frame = container.bounds
+        slot.web.isHidden = !reveal
+        web = slot.web
+        activeNavigationToken += 1
+        activeContentReady = slot.contentReady
+
+        // Park oldWeb back into warmPool if it was sitting cleanly on a different site's browse/home page
+        if let oldUrl = oldPausedUrl, floatIsWeb(oldUrl), let oldHost = oldUrl.host {
+            let oldKey = oldHost.lowercased()
+            let isCleanHome = oldUrl.path.isEmpty || oldUrl.path == "/" || oldUrl.path == "/browse" || oldUrl.path == "/home"
+            if oldKey != slot.hostKey, isCleanHome, warmPool[oldKey] == nil, warmPool.count < FloatBrowserInstance.maxWarmPoolSize {
+                oldWeb.isHidden = true
+                oldWeb.setAllMediaPlaybackSuspended(true)
+                let parked = FloatWarmSlot(hostKey: oldKey, web: oldWeb, requestedUrl: URL(string: "\(oldUrl.scheme ?? "https")://\(oldHost)") ?? oldUrl)
+                parked.committed = true
+                parked.contentReady = oldWasReady
+                parked.lastUsed = Date()
+                warmPool[oldKey] = parked
+            } else {
+                teardownWebView(oldWeb)
+            }
+        } else {
+            teardownWebView(oldWeb)
+        }
+
+        if reveal {
+            web.setAllMediaPlaybackSuspended(false)
+            if let mod = module {
+                web.evaluateJavaScript(floatFillScript(mod.fill))
+                web.evaluateJavaScript(floatVideoFilterScript(brightness: mod.videoBrightness, contrast: mod.videoContrast))
+            }
+        }
+        if !activeContentReady {
+            let token = activeNavigationToken
+            probeActiveContentReady(token: token, attemptsLeft: 32)
+        }
+        module?.notifyChanged()
+    }
+
+    func loadRequest(_ url: URL) {
+        commitPreparedOrLoad(url, resumeIfPaused: false)
+    }
+
+    /// Pauses & suspends media when returning Home so jumping back to the active video is 0ms.
+    func suspendForHome() {
+        preparedUrl = nil
+        activeNavigationToken += 1
+        activeContentReady = true
+        homeIdleCleanup?.cancel()
+        homeIdleCleanup = nil
+
+        if let cur = web.url, floatIsWeb(cur) {
+            pausedHomeUrl = cur
+            pausedRequestedUrl = cur
+            web.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
+            web.setAllMediaPlaybackSuspended(true)
+            web.isHidden = true
+
+            // Release memory if user stays on Home idle for 3 minutes
+            let cleanup = DispatchWorkItem { [weak self] in
+                guard let self, self.module?.mode == "home" else { return }
+                self.loadBlank()
+            }
+            homeIdleCleanup = cleanup
+            DispatchQueue.main.asyncAfter(deadline: .now() + 180.0, execute: cleanup)
+        } else {
+            loadBlank()
+        }
     }
 
     func loadBlank() {
+        homeIdleCleanup?.cancel()
+        homeIdleCleanup = nil
+        pausedHomeUrl = nil
+        pausedRequestedUrl = nil
+        preparedUrl = nil
+        activeNavigationToken += 1
+        activeContentReady = true
+        web.isHidden = true
+        web.setAllMediaPlaybackSuspended(true)
         web.load(URLRequest(url: URL(string: "about:blank")!))
     }
 }
@@ -738,6 +1251,7 @@ final class FloatModule: ExactModule {
     private var morphPrepared = false
     private var morphWindowShown = false
     private var glassReady = false
+    private var coldWarmupScheduled = false
     private var pendingUrlLoad: String?
     private var cliHandled = false
     private var lastSelectSeq: String?
@@ -795,6 +1309,14 @@ final class FloatModule: ExactModule {
     var videoContrast: Double {
         get { min(2.0, max(0.5, store.videoContrast)) }
         set { store.videoContrast = min(2.0, max(0.5, newValue)) }
+    }
+    var revealStyle: String {
+        get { store.revealStyle == "curtain" ? "curtain" : "wave" }
+        set { store.revealStyle = (newValue == "curtain" ? "curtain" : "wave") }
+    }
+    var openStyle: String {
+        get { store.openStyle == "diagonal" ? "diagonal" : "lens" }
+        set { store.openStyle = (newValue == "diagonal" ? "diagonal" : "lens") }
     }
     var hotkeyKeys: String {
         get { store.hotkeyKeys }
@@ -917,6 +1439,7 @@ final class FloatModule: ExactModule {
                     }
                 } else if !context.agent {
                     FloatUpdater.shared.start()
+                    scheduleColdStartPreload(delay: 0.25)
                 }
             } else {
                 syncWindowBackdrop()
@@ -1081,6 +1604,46 @@ final class FloatModule: ExactModule {
             ctx.duration = 0.22
             self.homeBackdropView?.animator().alphaValue = 1
         }
+        scheduleColdStartPreload(delay: 0.28)
+    }
+
+    /// Runs after the opening morph settles so WebKit warms without stealing launch morph frames:
+    /// stagger-preloads up to 6 saved site homepages into the media-suspended warm pool (prioritizing
+    /// the Resume host + most recent sites so heavy SPAs like Apple TV+ hydrate before you click).
+    private func scheduleColdStartPreload(delay: TimeInterval) {
+        guard !coldWarmupScheduled, !context.agent, ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1" else { return }
+        coldWarmupScheduled = true
+        scheduleWarmPoolSweep(initialDelay: delay)
+    }
+
+    private func scheduleWarmPoolSweep(initialDelay: TimeInterval) {
+        guard !context.agent, ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1" else { return }
+        var ordered = store.allSites().sorted { $0.last > $1.last }
+        if let resumeHost = store.loadResume().flatMap({ URL(string: $0.url)?.host?.lowercased() }),
+           let idx = ordered.firstIndex(where: { $0.host.lowercased() == resumeHost }),
+           idx > 0 {
+            let resumed = ordered.remove(at: idx)
+            ordered.insert(resumed, at: 0)
+        }
+        let targets = Array(ordered.prefix(6))
+        if targets.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + initialDelay) { [weak self] in
+                guard let self, self.mode == "home" else { return }
+                self.activeBrowser?.warmWebKitProcesses()
+            }
+            return
+        }
+        for (i, site) in targets.enumerated() {
+            let fireAt = initialDelay + Double(i) * 0.26
+            DispatchQueue.main.asyncAfter(deadline: .now() + fireAt) { [weak self] in
+                guard let self, self.mode == "home",
+                      let targetBrowser = self.activeBrowser,
+                      !targetBrowser.hasWarmHost(site.host),
+                      let url = URL(string: site.url),
+                      floatIsWeb(url) else { return }
+                targetBrowser.preloadStandby(url)
+            }
+        }
     }
 
     // MARK: Contract Data Seam (native.call)
@@ -1099,6 +1662,7 @@ final class FloatModule: ExactModule {
         case "resumeLast": resumeLast()
         case "removeSite":
             store.removeSite(arg)
+            activeBrowser?.removeWarmSite(arg)
             notifyChanged()
         case "reloadPage": reloadPage()
         case "back": activeBrowser?.web.goBack()
@@ -1127,6 +1691,13 @@ final class FloatModule: ExactModule {
         case "setVideoBrightness": setVideoBrightness(Double(arg) ?? videoBrightness)
         case "setVideoContrast": setVideoContrast(Double(arg) ?? videoContrast)
         case "resetVideoFilters": resetVideoFilters()
+        case "setRevealStyle": setRevealStyle(arg)
+        case "setOpenStyle": setOpenStyle(arg)
+        case "preloadSite", "prewarmUrl": preloadSite(arg)
+        case "prepareLoad": prepareLoad(arg)
+        case "commitLoad": commitLoad(arg)
+        case "prepareResume": prepareResume()
+        case "commitResume": commitResume()
         case "requestPeekPermission": requestPeekPermission()
         case "showMorphWindow": showMorphWindow()
         case "revealGlass": revealHomeGlass()
@@ -1206,6 +1777,10 @@ final class FloatModule: ExactModule {
             "alpha": (alpha * 100).rounded() / 100,
             "videoBrightness": (videoBrightness * 100).rounded() / 100,
             "videoContrast": (videoContrast * 100).rounded() / 100,
+            "revealStyle": revealStyle,
+            "openStyle": openStyle,
+            "preloadedHost": activeBrowser?.preloadedHost ?? "",
+            "webContentReady": activeBrowser?.activeContentReady ?? true,
             "hotkeyKeys": hotkeyKeys,
             "hotkeyLabel": floatFormatChordLabel(hotkeyKeys),
             "peekTrigger": peekTrigger,
@@ -1229,9 +1804,9 @@ final class FloatModule: ExactModule {
 
     // MARK: Actions
 
-    func load(_ raw: String) {
+    private func resolveWebURL(_ raw: String) -> URL? {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return }
+        guard !s.isEmpty else { return nil }
         let url: URL?
         if s.contains("://") {
             url = URL(string: s)
@@ -1242,14 +1817,81 @@ final class FloatModule: ExactModule {
             c.queryItems = [URLQueryItem(name: "search_query", value: s)]
             url = c.url
         }
-        guard let url, floatIsWeb(url) else { return }
-        pendingSeek = nil
-        // Match URL.toString() normalization for bare host URLs like https://netflix.com/
-        let normalized = url.path.isEmpty && url.query == nil && url.fragment == nil
+        guard let url, floatIsWeb(url) else { return nil }
+        return url
+    }
+
+    private func normalizedUrlString(_ url: URL) -> String {
+        url.path.isEmpty && url.query == nil && url.fragment == nil
             ? url.absoluteString + "/"
             : url.absoluteString
+    }
+
+    func preloadSite(_ raw: String) {
+        guard !context.agent, mode == "home", let url = resolveWebURL(raw) else { return }
+        activeBrowser?.preloadStandby(url)
+    }
+
+    /// Starts loading or promoting the URL in WKWebView while keeping Home glass backdrop visible
+    /// behind the expanding liquid-glass transition veil.
+    func prepareLoad(_ raw: String) {
+        guard let url = resolveWebURL(raw) else { return }
+        pendingSeek = nil
+        if !context.agent, let targetBrowser = activeBrowser {
+            targetBrowser.prepareRequest(url, resumeIfPaused: false)
+        }
+    }
+
+    /// Completes a deferred click transition once the shader veil covers the window.
+    func commitLoad(_ raw: String) {
+        guard let url = resolveWebURL(raw) else { return }
+        pendingSeek = nil
         mode = "web"
-        currentUrl = normalized
+        currentUrl = normalizedUrlString(url)
+        if let targetBrowser = activeBrowser {
+            if !context.agent {
+                targetBrowser.commitPreparedOrLoad(url, resumeIfPaused: false)
+                (mainWindow ?? FloatHub.shared.primaryWindow)?.makeFirstResponder(targetBrowser.web)
+            }
+        } else {
+            pendingUrlLoad = url.absoluteString
+        }
+        notifyChanged()
+    }
+
+    func prepareResume() {
+        guard let r = store.loadResume() else { return }
+        let target = URL(string: r.url).map { floatAppleTVResumeURL($0).absoluteString } ?? r.url
+        guard let url = resolveWebURL(target) else { return }
+        pendingSeek = r.time > 0 ? r.time : nil
+        if !context.agent, let targetBrowser = activeBrowser {
+            targetBrowser.prepareRequest(url, resumeIfPaused: true)
+        }
+    }
+
+    func commitResume() {
+        guard let r = store.loadResume() else { return }
+        let target = URL(string: r.url).map { floatAppleTVResumeURL($0).absoluteString } ?? r.url
+        guard let url = resolveWebURL(target) else { return }
+        pendingSeek = r.time > 0 ? r.time : nil
+        mode = "web"
+        currentUrl = normalizedUrlString(url)
+        if let targetBrowser = activeBrowser {
+            if !context.agent {
+                targetBrowser.commitPreparedOrLoad(url, resumeIfPaused: true)
+                (mainWindow ?? FloatHub.shared.primaryWindow)?.makeFirstResponder(targetBrowser.web)
+            }
+        } else {
+            pendingUrlLoad = url.absoluteString
+        }
+        notifyChanged()
+    }
+
+    func load(_ raw: String) {
+        guard let url = resolveWebURL(raw) else { return }
+        pendingSeek = nil
+        mode = "web"
+        currentUrl = normalizedUrlString(url)
         if let targetBrowser = activeBrowser {
             if !context.agent {
                 targetBrowser.loadRequest(url)
@@ -1270,16 +1912,43 @@ final class FloatModule: ExactModule {
     func showHome() {
         mode = "home"
         pendingSeek = nil
-        activeBrowser?.web.isHidden = true
-        if !context.agent { activeBrowser?.loadBlank() }
+        if context.agent {
+            activeBrowser?.web.isHidden = true
+        } else {
+            activeBrowser?.suspendForHome()
+            scheduleWarmPoolSweep(initialDelay: 0.45)
+        }
         notifyChanged()
     }
 
     func resumeLast() {
         guard let r = store.loadResume() else { return }
         let target = URL(string: r.url).map { floatAppleTVResumeURL($0).absoluteString } ?? r.url
-        load(target)
+        guard let url = resolveWebURL(target) else { return }
         pendingSeek = r.time > 0 ? r.time : nil
+        mode = "web"
+        currentUrl = normalizedUrlString(url)
+        if let targetBrowser = activeBrowser {
+            if !context.agent {
+                targetBrowser.commitPreparedOrLoad(url, resumeIfPaused: true)
+                (mainWindow ?? FloatHub.shared.primaryWindow)?.makeFirstResponder(targetBrowser.web)
+            }
+        } else {
+            pendingUrlLoad = url.absoluteString
+        }
+        notifyChanged()
+    }
+
+    func setRevealStyle(_ style: String) {
+        guard style == "wave" || style == "curtain" else { return }
+        revealStyle = style
+        notifyChanged()
+    }
+
+    func setOpenStyle(_ style: String) {
+        guard style == "lens" || style == "diagonal" else { return }
+        openStyle = style
+        notifyChanged()
     }
 
     func reloadPage() {

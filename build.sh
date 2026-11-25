@@ -1,13 +1,14 @@
 #!/bin/zsh
 # ./build.sh [Name]            Name=FloatDev → separate test app w/ own data
-#   OUT=/Applications          install location (default build/)
+#   OUT=/Applications          install location (default dist/; Exact's bake captures every other directory
+#                              of the app as source, and a stale .app there breaks the next build or test)
 #   VERSION=1.2.3 BUILD=42     release build version & build number
 #   NOTARIZE=1                 delegate to `exact release` (sign, notarize, staple → dist/$Name-$VERSION.zip)
 set -euo pipefail
 cd "${0:A:h}"
 NAME=${1:-Float}
 ID=com.sethwebster.${NAME:l}
-APP=${OUT:-build}/$NAME.app
+APP=${OUT:-dist}/$NAME.app
 SIGN=${SIGN:-Developer ID Application: Seth Webster (P8ZBH5878Q)}
 # Resolve common-name signing identities to their 40-char SHA-1 thumbprint, which
 # Exact's signingOrder requires for `codesign --verify -R '=certificate leaf = H"<sha1>"'`.
@@ -39,9 +40,11 @@ if [[ -z ${RUSTUP_HOME:-} ]] && command -v rustup >/dev/null 2>&1; then
 fi
 BUN=${BUN:-$(command -v bun)}
 
-# Ensure .exact/checkout resolves local @exact/* packages before building
+# Ensure .exact/checkout resolves local @exact/* packages before building, and that each file: @exact/*
+# dependency is linked into node_modules on a fresh checkout (as npm ci would install it)
 mkdir -p .exact
 ln -sfn "$EXACT2" .exact/checkout
+"$BUN" scripts/link-file-dependencies.mjs "$PWD"
 
 # Clean prior bundle before Exact's source baker scans the workspace
 rm -rf "$APP"

@@ -132,7 +132,7 @@ Float is built on **Exact** with a native Swift/AppKit/`WKWebView` macOS module.
 ### Build & Install
 
 ```sh
-./build.sh                                      # Build → build/Float.app
+./build.sh                                      # Build → dist/Float.app
 OUT=/Applications ./build.sh                    # Build and install to /Applications
 ./build.sh FloatDev                             # Separate dev app with isolated bundle ID & data
 VERSION=1.2.3 BUILD=7 NOTARIZE=1 ./build.sh     # Signed, notarized release with Sparkle feed → dist/
@@ -145,6 +145,8 @@ bun exact.mjs mac --run         # Build and launch on macOS
 bun exact.mjs test web          # Run Contract tests on web
 bun exact.mjs test macos        # Run Contract tests on macOS
 ```
+
+Both `exact.mjs` and `build.sh` link the `file:` `@exact/*` dependencies from `package.json` into `node_modules` on a fresh checkout (`scripts/link-file-dependencies.mjs`), so no `npm ci` is needed before building or testing; the release workflow's `npm ci` produces the same links.
 
 > [!NOTE]
 > **Code signing, Sparkle & DRM:** `app.json` links Sparkle `2.10.1` via `host.macos.swiftPackages` and sets `SUFeedURL`/`SUPublicEDKey`/`SUEnableAutomaticChecks` via `host.macos.infoPlist`. `NOTARIZE=1 ./build.sh` delegates directly to `exact release` to embed Sparkle, sign inside-out with hardened runtime (`Developer ID Application: Seth Webster (P8ZBH5878Q)`), notarize, staple, and assess with Gatekeeper.

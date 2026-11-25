@@ -241,7 +241,7 @@ jobs:
           Verified on M4 against Exact \`$EXACT_SHA\` ([workflow run]($RUN_URL)):
           - \`bun exact.mjs test web\` passed
           - \`bun exact.mjs test macos\` passed
-          - \`./build.sh\` built \`build/Float.app\` cleanly
+          - \`./build.sh\` built \`dist/Float.app\` cleanly
           $FIX_NOTE
           Merging to \`main\` now.
           EOF

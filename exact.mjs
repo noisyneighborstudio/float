@@ -33,5 +33,8 @@ if (!existsSync(cli)) {
 }
 const { ensureBun } = await import(resolve(EXACT2, 'scripts/bun.mjs'));
 ensureBun('1.4.2');
+// A fresh checkout has no node_modules: link the file: @exact/* packages so the bake resolves them.
+const { linkFileDependencies } = await import(resolve(import.meta.dir, 'scripts/link-file-dependencies.mjs'));
+linkFileDependencies(import.meta.dir);
 const { run } = await import(cli);
 process.exit(await run({ dir: import.meta.dir, name: basename(import.meta.dir), exact2: EXACT2, args: process.argv.slice(2) }));
