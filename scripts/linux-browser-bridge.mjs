@@ -226,15 +226,27 @@ function fillScript(on) {
   })();`;
 }
 
-function videoFilterScript(brightness, contrast) {
+function videoFilterScript(brightness, hdrBrightness, contrast, streamBrightness, preferSdr) {
   const b = Number(brightness || 1).toFixed(2);
+  const hb = Number(hdrBrightness || 1).toFixed(2);
   const c = Number(contrast || 1).toFixed(2);
+  const split = Boolean(streamBrightness);
+  const sdr = Boolean(preferSdr);
   return `(() => {
-    const ID = '__fp_video_filter', B = ${b}, C = ${c};
+    const ID = '__fp_video_filter', B = ${b}, HB = ${hb}, C = ${c}, SPLIT = ${split}, PREFER_SDR = ${sdr};
+    const isOne = x => Math.abs(x - 1) < 0.005;
+    const rules = [];
+    if (PREFER_SDR) rules.push('video { dynamic-range-limit: standard !important; }');
+    if (!SPLIT) {
+      if (!isOne(B) || !isOne(C)) rules.push(\`video { filter: brightness(\${B}) contrast(\${C}) !important; }\`);
+    } else {
+      if (!isOne(B) || !isOne(C)) rules.push(\`video:not([data-fp-stream="hdr"]) { filter: brightness(\${B}) contrast(\${C}) !important; }\`);
+      if (!isOne(HB) || !isOne(C)) rules.push(\`video[data-fp-stream="hdr"] { filter: brightness(\${HB}) contrast(\${C}) !important; }\`);
+    }
     let s = document.getElementById(ID);
-    if (Math.abs(B - 1) < 0.005 && Math.abs(C - 1) < 0.005) { if (s) s.remove(); return; }
+    if (rules.length === 0) { if (s) s.remove(); return; }
     if (!s) { s = document.createElement('style'); s.id = ID; (document.head || document.documentElement).appendChild(s); }
-    s.textContent = \`video { filter: brightness(\${B}) contrast(\${C}) !important; }\`;
+    s.textContent = rules.join(' ');
   })();`;
 }
 
@@ -250,7 +262,11 @@ const DEFAULT_STATE = {
   clickThrough: false,
   alpha: 1,
   videoBrightness: 1,
+  hdrVideoBrightness: 1,
   videoContrast: 1,
+  preferSdr: false,
+  streamBrightness: false,
+  activeVideoStream: '',
   hotkeyKeys: 'Control+Alt+Meta+F',
   hotkeyLabel: '⌃⌥⌘F',
   peekTrigger: 'rightCommand',
@@ -339,7 +355,11 @@ function buildFloatState() {
     clickThrough: data.clickThrough,
     alpha: data.alpha,
     videoBrightness: data.videoBrightness,
+    hdrVideoBrightness: data.hdrVideoBrightness,
     videoContrast: data.videoContrast,
+    preferSdr: data.preferSdr,
+    streamBrightness: data.streamBrightness,
+    activeVideoStream: data.activeVideoStream,
     hotkeyKeys: data.hotkeyKeys,
     hotkeyLabel: data.hotkeyLabel,
     peekTrigger: data.peekTrigger,
@@ -747,8 +767,37 @@ async function handleCommand(op, arg) {
       if (Number.isFinite(n)) {
         data.videoBrightness = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
         saveState(data);
-        page.evaluate(videoFilterScript(data.videoBrightness, data.videoContrast)).then(() => captureNow(true)).catch(() => {});
+        page.evaluate(videoFilterScript(data.videoBrightness, data.hdrVideoBrightness, data.videoContrast, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
       }
+      break;
+    }
+    case 'setHdrVideoBrightness': {
+      const n = Number(arg);
+      if (Number.isFinite(n)) {
+        data.hdrVideoBrightness = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
+        saveState(data);
+        page.evaluate(videoFilterScript(data.videoBrightness, data.hdrVideoBrightness, data.videoContrast, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
+      }
+      break;
+    }
+    case 'brightenVideo': {
+      if (data.streamBrightness && data.activeVideoStream === 'hdr') {
+        data.hdrVideoBrightness = Math.round(Math.min(2, Math.max(0.5, data.hdrVideoBrightness + 0.1)) * 100) / 100;
+      } else {
+        data.videoBrightness = Math.round(Math.min(2, Math.max(0.5, data.videoBrightness + 0.1)) * 100) / 100;
+      }
+      saveState(data);
+      page.evaluate(videoFilterScript(data.videoBrightness, data.hdrVideoBrightness, data.videoContrast, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
+      break;
+    }
+    case 'dimVideo': {
+      if (data.streamBrightness && data.activeVideoStream === 'hdr') {
+        data.hdrVideoBrightness = Math.round(Math.min(2, Math.max(0.5, data.hdrVideoBrightness - 0.1)) * 100) / 100;
+      } else {
+        data.videoBrightness = Math.round(Math.min(2, Math.max(0.5, data.videoBrightness - 0.1)) * 100) / 100;
+      }
+      saveState(data);
+      page.evaluate(videoFilterScript(data.videoBrightness, data.hdrVideoBrightness, data.videoContrast, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
       break;
     }
     case 'setVideoContrast': {
@@ -756,15 +805,32 @@ async function handleCommand(op, arg) {
       if (Number.isFinite(n)) {
         data.videoContrast = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
         saveState(data);
-        page.evaluate(videoFilterScript(data.videoBrightness, data.videoContrast)).then(() => captureNow(true)).catch(() => {});
+        page.evaluate(videoFilterScript(data.videoBrightness, data.hdrVideoBrightness, data.videoContrast, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
       }
       break;
     }
+    case 'setPreferSdr':
+      data.preferSdr = arg === 'true';
+      saveState(data);
+      page.evaluate(videoFilterScript(data.videoBrightness, data.hdrVideoBrightness, data.videoContrast, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
+      break;
+    case 'setStreamBrightness':
+      data.streamBrightness = arg === 'true';
+      saveState(data);
+      page.evaluate(videoFilterScript(data.videoBrightness, data.hdrVideoBrightness, data.videoContrast, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
+      break;
+    case 'setActiveVideoStream':
+      if (arg === '' || arg === 'sdr' || arg === 'hdr') {
+        data.activeVideoStream = arg;
+        saveState(data);
+      }
+      break;
     case 'resetVideoFilters':
       data.videoBrightness = 1;
+      data.hdrVideoBrightness = 1;
       data.videoContrast = 1;
       saveState(data);
-      page.evaluate(videoFilterScript(1, 1)).then(() => captureNow(true)).catch(() => {});
+      page.evaluate(videoFilterScript(1, 1, 1, data.streamBrightness, data.preferSdr)).then(() => captureNow(true)).catch(() => {});
       break;
     case 'openSettings':
       data.settingsOpen = true;

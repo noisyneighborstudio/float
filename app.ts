@@ -40,9 +40,13 @@ interface PersistedFallback {
   clickThrough: boolean;
   alpha: number;
   videoBrightness: number;
+  hdrVideoBrightness: number;
   videoContrast: number;
   revealStyle: string;
   openStyle: string;
+  preferSdr: boolean;
+  streamBrightness: boolean;
+  activeVideoStream: string;
   hotkeyKeys: string;
   peekTrigger: string;
   peekAlpha: number;
@@ -65,9 +69,13 @@ const DEFAULT_FALLBACK: PersistedFallback = {
   clickThrough: false,
   alpha: 1,
   videoBrightness: 1,
+  hdrVideoBrightness: 1,
   videoContrast: 1,
   revealStyle: 'wave',
   openStyle: 'lens',
+  preferSdr: false,
+  streamBrightness: false,
+  activeVideoStream: '',
   hotkeyKeys: 'Control+Alt+Meta+F',
   peekTrigger: 'rightCommand',
   peekAlpha: 0.5,
@@ -235,11 +243,15 @@ function toFloatState(p: PersistedFallback): FloatState {
     clickThrough: p.clickThrough,
     alpha: p.alpha,
     videoBrightness: p.videoBrightness,
+    hdrVideoBrightness: p.hdrVideoBrightness,
     videoContrast: p.videoContrast,
     revealStyle: p.revealStyle || 'wave',
     openStyle: p.openStyle || 'lens',
     preloadedHost: '',
     webContentReady: true,
+    preferSdr: p.preferSdr,
+    streamBrightness: p.streamBrightness,
+    activeVideoStream: p.activeVideoStream,
     hotkeyKeys: p.hotkeyKeys,
     hotkeyLabel: formatChordLabel(p.hotkeyKeys),
     peekTrigger: p.peekTrigger,
@@ -289,6 +301,7 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       if (url) {
         data.mode = 'web';
         data.currentUrl = url;
+        data.activeVideoStream = '';
         data.history = data.history.slice(0, data.historyIndex + 1).concat([url]);
         data.historyIndex = data.history.length - 1;
       }
@@ -296,6 +309,7 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
     }
     case 'showHome':
       data.mode = 'home';
+      data.activeVideoStream = '';
       break;
     case 'resumeLast':
       if (data.resume) {
@@ -362,6 +376,29 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       }
       break;
     }
+    case 'setHdrVideoBrightness': {
+      const n = Number(arg);
+      if (Number.isFinite(n)) {
+        data.hdrVideoBrightness = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
+      }
+      break;
+    }
+    case 'brightenVideo': {
+      if (data.streamBrightness && data.activeVideoStream === 'hdr') {
+        data.hdrVideoBrightness = Math.round(Math.min(2, Math.max(0.5, data.hdrVideoBrightness + 0.1)) * 100) / 100;
+      } else {
+        data.videoBrightness = Math.round(Math.min(2, Math.max(0.5, data.videoBrightness + 0.1)) * 100) / 100;
+      }
+      break;
+    }
+    case 'dimVideo': {
+      if (data.streamBrightness && data.activeVideoStream === 'hdr') {
+        data.hdrVideoBrightness = Math.round(Math.min(2, Math.max(0.5, data.hdrVideoBrightness - 0.1)) * 100) / 100;
+      } else {
+        data.videoBrightness = Math.round(Math.min(2, Math.max(0.5, data.videoBrightness - 0.1)) * 100) / 100;
+      }
+      break;
+    }
     case 'setVideoContrast': {
       const n = Number(arg);
       if (Number.isFinite(n)) {
@@ -369,8 +406,20 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       }
       break;
     }
+    case 'setPreferSdr':
+      data.preferSdr = arg === 'true';
+      break;
+    case 'setStreamBrightness':
+      data.streamBrightness = arg === 'true';
+      break;
+    case 'setActiveVideoStream':
+      if (arg === '' || arg === 'sdr' || arg === 'hdr') {
+        data.activeVideoStream = arg;
+      }
+      break;
     case 'resetVideoFilters':
       data.videoBrightness = 1;
+      data.hdrVideoBrightness = 1;
       data.videoContrast = 1;
       break;
     case 'setRevealStyle':
