@@ -162,3 +162,26 @@ test "glassy keyboard shortcuts display opens as a separate window and closes cl
   tap "cmd-shortcuts-close"
   clock data
   expect state st.shortcutsOpen == false
+
+test "video brightness and contrast filters persist across reload and reset cleanly"
+  clock data
+  expect state st.videoBrightness == 1
+  expect state st.videoContrast == 1
+
+  tap "cmd-brightness-125"
+  clock data
+  expect state st.videoBrightness == 1.25
+
+  tap "cmd-contrast-115"
+  clock data
+  expect state st.videoContrast == 1.15
+
+  reload
+  clock data
+  expect state st.videoBrightness == 1.25
+  expect state st.videoContrast == 1.15
+
+  tap "cmd-filters-reset"
+  clock data
+  expect state st.videoBrightness == 1
+  expect state st.videoContrast == 1

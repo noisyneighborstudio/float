@@ -218,6 +218,29 @@ private func floatFillScript(_ on: Bool) -> String { """
 })();
 """ }
 
+// Applies live CSS brightness & contrast filters to <video> elements; removes the style tag at defaults.
+private func floatVideoFilterScript(brightness: Double, contrast: Double) -> String { """
+(() => {
+  const ID = '__fp_video_filter';
+  const B = \(String(format: "%.2f", brightness)), C = \(String(format: "%.2f", contrast));
+  const apply = () => {
+    let s = document.getElementById(ID);
+    if (Math.abs(B - 1) < 0.005 && Math.abs(C - 1) < 0.005) {
+      if (s) s.remove();
+      return;
+    }
+    if (!s) {
+      s = document.createElement('style');
+      s.id = ID;
+      (document.head || document.documentElement).appendChild(s);
+    }
+    s.textContent = `video { filter: brightness(${B}) contrast(${C}) !important; }`;
+  };
+  if (document.documentElement) apply();
+  else document.addEventListener('DOMContentLoaded', apply, { once: true });
+})();
+""" }
+
 private let floatTrackScript = """
 (() => {
   let last = 0;
@@ -327,6 +350,8 @@ private struct AgentSnapshot: Codable {
     var resume: FloatResume?
     var fill: Bool = true
     var alpha: Double = 1.0
+    var videoBrightness: Double = 1.0
+    var videoContrast: Double = 1.0
     var hotKey: FloatHotKey? = .fallback
     var peekTrigger: String = "rightCommand"
     var peekAlpha: Double = 0.5
@@ -379,6 +404,22 @@ private final class FloatStore {
         set {
             if agentFile != nil { snapshot.alpha = newValue; flushAgent() }
             else { defaults.set(newValue, forKey: "alpha") }
+        }
+    }
+
+    var videoBrightness: Double {
+        get { agentFile != nil ? snapshot.videoBrightness : (defaults.object(forKey: "videoBrightness") as? Double ?? 1.0) }
+        set {
+            if agentFile != nil { snapshot.videoBrightness = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "videoBrightness") }
+        }
+    }
+
+    var videoContrast: Double {
+        get { agentFile != nil ? snapshot.videoContrast : (defaults.object(forKey: "videoContrast") as? Double ?? 1.0) }
+        set {
+            if agentFile != nil { snapshot.videoContrast = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "videoContrast") }
         }
     }
 
@@ -666,7 +707,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         web.allowsMagnification = true
         web.setValue(false, forKey: "drawsBackground")
         cfg.userContentController.add(delegate, contentWorld: trackWorld, name: "fpPlay")
-        installFillScript(module.fill)
+        installUserScripts(fill: module.fill, brightness: module.videoBrightness, contrast: module.videoContrast)
         module.attachBrowser(self)
     }
 
@@ -679,16 +720,22 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         web.stopLoading()
     }
 
-    func installFillScript(_ on: Bool) {
+    func installUserScripts(fill on: Bool, brightness: Double, contrast: Double) {
         let ucc = web.configuration.userContentController
         ucc.removeAllUserScripts()
         ucc.addUserScript(WKUserScript(source: floatFillScript(on), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        ucc.addUserScript(WKUserScript(source: floatVideoFilterScript(brightness: brightness, contrast: contrast), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         ucc.addUserScript(WKUserScript(source: floatTrackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: trackWorld))
     }
 
-    func applyFill(_ on: Bool) {
-        installFillScript(on)
+    func applyFill(_ on: Bool, brightness: Double, contrast: Double) {
+        installUserScripts(fill: on, brightness: brightness, contrast: contrast)
         web.evaluateJavaScript(floatFillScript(on))
+    }
+
+    func applyVideoFilter(fill on: Bool, brightness: Double, contrast: Double) {
+        installUserScripts(fill: on, brightness: brightness, contrast: contrast)
+        web.evaluateJavaScript(floatVideoFilterScript(brightness: brightness, contrast: contrast))
     }
 
     func loadRequest(_ url: URL) {
@@ -735,7 +782,13 @@ private final class FloatSettingsWindowController: NSWindowController, NSWindowD
         action: nil
     )
     private let opacitySlider = NSSlider(value: 0.5, minValue: 0.15, maxValue: 0.95, target: nil, action: nil)
+    private let brightnessValueLabel = NSTextField(labelWithString: "100%")
+    private let brightnessSlider = NSSlider(value: 1.0, minValue: 0.5, maxValue: 2.0, target: nil, action: nil)
+    private let contrastValueLabel = NSTextField(labelWithString: "100%")
+    private let contrastSlider = NSSlider(value: 1.0, minValue: 0.5, maxValue: 2.0, target: nil, action: nil)
+    private let resetPictureButton = NSButton(title: "Reset", target: nil, action: nil)
     private let showHideBadge = NSTextField(labelWithString: "")
+    private weak var trackingSlider: NSSlider?
 
     private let triggerKeys = ["rightCommand", "rightOption", "hotkey", "none"]
     private let presetValues: [Double] = [0.15, 0.25, 0.5, 0.75]
@@ -920,13 +973,91 @@ private final class FloatSettingsWindowController: NSWindowController, NSWindowD
         ])
 
         // Divider
+        let pictureSep = NSBox()
+        pictureSep.boxType = .separator
+        pictureSep.translatesAutoresizingMaskIntoConstraints = false
+        rootStack.addArrangedSubview(pictureSep)
+        pictureSep.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
+
+        // Section 2: Video Picture (Brightness & Contrast)
+        let pictureTitleStack = NSStackView(views: [
+            makeHeading("Video Picture"),
+            makeSubtext("Adjust brightness and contrast for dark scenes."),
+        ])
+        pictureTitleStack.orientation = .vertical
+        pictureTitleStack.alignment = .leading
+        pictureTitleStack.spacing = 2
+        resetPictureButton.target = self
+        resetPictureButton.action = #selector(resetPicture(_:))
+        resetPictureButton.bezelStyle = .rounded
+        let pictureSpacer = NSView()
+        pictureSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let pictureHeader = NSStackView(views: [pictureTitleStack, pictureSpacer, resetPictureButton])
+        pictureHeader.orientation = .horizontal
+        pictureHeader.alignment = .centerY
+        pictureHeader.spacing = 8
+        pictureHeader.translatesAutoresizingMaskIntoConstraints = false
+        rootStack.addArrangedSubview(pictureHeader)
+        pictureHeader.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
+
+        let accentTeal = NSColor(calibratedRed: 0.50, green: 0.85, blue: 0.85, alpha: 1.0)
+        func makeSliderRow(title: String, valueLabel: NSTextField, slider: NSSlider, action: Selector) -> NSStackView {
+            let lbl = NSTextField(labelWithString: title)
+            lbl.font = .systemFont(ofSize: 12, weight: .medium)
+            lbl.textColor = .labelColor
+            valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+            valueLabel.textColor = accentTeal
+            let sp = NSView()
+            sp.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let top = NSStackView(views: [lbl, sp, valueLabel])
+            top.orientation = .horizontal
+            top.alignment = .centerY
+            top.translatesAutoresizingMaskIntoConstraints = false
+
+            slider.target = self
+            slider.action = action
+            slider.isContinuous = true
+            slider.translatesAutoresizingMaskIntoConstraints = false
+
+            let col = NSStackView(views: [top, slider])
+            col.orientation = .vertical
+            col.alignment = .leading
+            col.spacing = 4
+            col.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                top.widthAnchor.constraint(equalTo: col.widthAnchor),
+                slider.widthAnchor.constraint(equalTo: col.widthAnchor),
+            ])
+            return col
+        }
+
+        let brightnessRow = makeSliderRow(
+            title: "Brightness",
+            valueLabel: brightnessValueLabel,
+            slider: brightnessSlider,
+            action: #selector(brightnessSliderChanged(_:))
+        )
+        let contrastRow = makeSliderRow(
+            title: "Contrast",
+            valueLabel: contrastValueLabel,
+            slider: contrastSlider,
+            action: #selector(contrastSliderChanged(_:))
+        )
+        rootStack.addArrangedSubview(brightnessRow)
+        rootStack.addArrangedSubview(contrastRow)
+        NSLayoutConstraint.activate([
+            brightnessRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40),
+            contrastRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40),
+        ])
+
+        // Divider
         let sep = NSBox()
         sep.boxType = .separator
         sep.translatesAutoresizingMaskIntoConstraints = false
         rootStack.addArrangedSubview(sep)
         sep.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
 
-        // Section 2: Show / Hide Window shortcut
+        // Section 3: Show / Hide Window shortcut
         let showHeader = NSStackView(views: [
             makeHeading("Show / Hide Window"),
             makeSubtext("Global shortcut to toggle Float visibility."),
@@ -991,12 +1122,26 @@ private final class FloatSettingsWindowController: NSWindowController, NSWindowD
         opacitySection.isHidden = module.peekTrigger == "none"
         let pct = Int((module.peekAlpha * 100).rounded())
         opacityValueLabel.stringValue = "\(pct)%"
-        opacitySlider.doubleValue = module.peekAlpha
+        if trackingSlider !== opacitySlider {
+            opacitySlider.doubleValue = module.peekAlpha
+        }
         if let presetIdx = presetValues.firstIndex(where: { Int(($0 * 100).rounded()) == pct }) {
             opacityPresets.selectedSegment = presetIdx
         } else {
             opacityPresets.selectedSegment = -1
         }
+
+        let brightPct = Int((module.videoBrightness * 100).rounded())
+        brightnessValueLabel.stringValue = "\(brightPct)%"
+        if trackingSlider !== brightnessSlider {
+            brightnessSlider.doubleValue = module.videoBrightness
+        }
+        let contrastPct = Int((module.videoContrast * 100).rounded())
+        contrastValueLabel.stringValue = "\(contrastPct)%"
+        if trackingSlider !== contrastSlider {
+            contrastSlider.doubleValue = module.videoContrast
+        }
+        resetPictureButton.isEnabled = brightPct != 100 || contrastPct != 100
 
         showHideBadge.stringValue = module.hotKeyLabel
 
@@ -1035,8 +1180,28 @@ private final class FloatSettingsWindowController: NSWindowController, NSWindowD
     }
 
     @objc private func sliderChanged(_ sender: NSSlider) {
+        trackingSlider = sender
+        defer { trackingSlider = nil }
         let stepped = (sender.doubleValue * 20).rounded() / 20 // 5% steps
         module?.setPeekAlpha(stepped)
+    }
+
+    @objc private func brightnessSliderChanged(_ sender: NSSlider) {
+        trackingSlider = sender
+        defer { trackingSlider = nil }
+        let stepped = (sender.doubleValue * 20).rounded() / 20 // 5% steps
+        module?.setVideoBrightness(stepped)
+    }
+
+    @objc private func contrastSliderChanged(_ sender: NSSlider) {
+        trackingSlider = sender
+        defer { trackingSlider = nil }
+        let stepped = (sender.doubleValue * 20).rounded() / 20 // 5% steps
+        module?.setVideoContrast(stepped)
+    }
+
+    @objc private func resetPicture(_ sender: Any?) {
+        module?.resetVideoFilters()
     }
 
     @objc private func recordPeek(_ sender: Any?) {
@@ -1945,6 +2110,8 @@ final class FloatModule: ExactModule {
     var aspectLocked = false
     var clickThrough = false
     var alpha: Double
+    var videoBrightness: Double
+    var videoContrast: Double
     var peekTrigger: String
     var peekAlpha: Double
     var peekHold: Bool
@@ -1962,6 +2129,8 @@ final class FloatModule: ExactModule {
         store = FloatStore(agent: context.agent, dataDir: context.data)
         fill = store.fill
         alpha = store.alpha
+        videoBrightness = min(2.0, max(0.5, store.videoBrightness))
+        videoContrast = min(2.0, max(0.5, store.videoContrast))
         peekTrigger = store.peekTrigger
         peekAlpha = min(0.95, max(0.15, store.peekAlpha))
         peekHold = store.peekHold
@@ -2273,6 +2442,9 @@ final class FloatModule: ExactModule {
         case "setPeekAlpha": setPeekAlpha(Double(arg) ?? peekAlpha)
         case "setPeekHold": setPeekHold(arg == "true")
         case "setPeeking": setPeeking(arg == "true")
+        case "setVideoBrightness": setVideoBrightness(Double(arg) ?? videoBrightness)
+        case "setVideoContrast": setVideoContrast(Double(arg) ?? videoContrast)
+        case "resetVideoFilters": resetVideoFilters()
         case "recordPeekHotKey": recordPeekHotKey()
         case "requestPeekPermission": requestPeekPermission()
         case "checkForUpdates":
@@ -2349,6 +2521,8 @@ final class FloatModule: ExactModule {
             "aspectLocked": aspectLocked,
             "clickThrough": clickThrough,
             "alpha": (alpha * 100).rounded() / 100,
+            "videoBrightness": (videoBrightness * 100).rounded() / 100,
+            "videoContrast": (videoContrast * 100).rounded() / 100,
             "hotkeyLabel": store.hotKey?.label ?? "",
             "peekTrigger": peekTrigger,
             "peekAlpha": (peekAlpha * 100).rounded() / 100,
@@ -2442,7 +2616,34 @@ final class FloatModule: ExactModule {
     func toggleFill() {
         fill.toggle()
         store.fill = fill
-        browser?.applyFill(fill)
+        browser?.applyFill(fill, brightness: videoBrightness, contrast: videoContrast)
+        notifyChanged()
+    }
+
+    func setVideoBrightness(_ value: Double) {
+        let clamped = (min(2.0, max(0.5, value)) * 100).rounded() / 100
+        guard abs(clamped - videoBrightness) >= 0.005 else { return }
+        videoBrightness = clamped
+        store.videoBrightness = clamped
+        browser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        notifyChanged()
+    }
+
+    func setVideoContrast(_ value: Double) {
+        let clamped = (min(2.0, max(0.5, value)) * 100).rounded() / 100
+        guard abs(clamped - videoContrast) >= 0.005 else { return }
+        videoContrast = clamped
+        store.videoContrast = clamped
+        browser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        notifyChanged()
+    }
+
+    func resetVideoFilters() {
+        videoBrightness = 1.0
+        videoContrast = 1.0
+        store.videoBrightness = 1.0
+        store.videoContrast = 1.0
+        browser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
         notifyChanged()
     }
 

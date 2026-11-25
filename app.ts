@@ -36,6 +36,8 @@ interface PersistedFallback {
   aspectLocked: boolean;
   clickThrough: boolean;
   alpha: number;
+  videoBrightness: number;
+  videoContrast: number;
   hotkeyLabel: string;
   peekTrigger: string;
   peekAlpha: number;
@@ -60,6 +62,8 @@ const DEFAULT_FALLBACK: PersistedFallback = {
   aspectLocked: false,
   clickThrough: false,
   alpha: 1,
+  videoBrightness: 1,
+  videoContrast: 1,
   hotkeyLabel: '⌃⌥⌘F',
   peekTrigger: 'rightCommand',
   peekAlpha: 0.5,
@@ -204,6 +208,8 @@ function toFloatState(p: PersistedFallback): FloatState {
     aspectLocked: p.aspectLocked,
     clickThrough: p.clickThrough,
     alpha: p.alpha,
+    videoBrightness: p.videoBrightness,
+    videoContrast: p.videoContrast,
     hotkeyLabel: p.hotkeyLabel,
     peekTrigger: p.peekTrigger,
     peekAlpha: p.peekAlpha,
@@ -319,6 +325,24 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       break;
     case 'setPeeking':
       data.peeking = arg === 'true';
+      break;
+    case 'setVideoBrightness': {
+      const n = Number(arg);
+      if (Number.isFinite(n)) {
+        data.videoBrightness = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
+      }
+      break;
+    }
+    case 'setVideoContrast': {
+      const n = Number(arg);
+      if (Number.isFinite(n)) {
+        data.videoContrast = Math.round(Math.min(2, Math.max(0.5, n)) * 100) / 100;
+      }
+      break;
+    }
+    case 'resetVideoFilters':
+      data.videoBrightness = 1;
+      data.videoContrast = 1;
       break;
     case 'openSettings':
       data.settingsOpen = true;
