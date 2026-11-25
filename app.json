@@ -62,7 +62,8 @@
         "width": 640,
         "height": 360,
         "minWidth": 160,
-        "minHeight": 90
+        "minHeight": 90,
+        "keepRunning": true
       }
     }
   },

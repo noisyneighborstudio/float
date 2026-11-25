@@ -3,69 +3,9 @@ import WebKit
 #if os(macOS)
 import AppKit
 import ApplicationServices
-import Carbon.HIToolbox
-import QuartzCore
 import Sparkle
 
-private let floatRightCommandMask: UInt = 0x0000_0010 // NX_DEVICERCMDKEYMASK
-private let floatRightOptionMask: UInt = 0x0000_0040  // NX_DEVICERALTKEYMASK
-
 private let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
-
-// Global show/hide hotkey (Carbon: no Accessibility permission needed)
-struct FloatHotKey: Codable, Equatable {
-    var code: UInt32
-    var mods: UInt32 // Carbon keyCode + cmdKey/shiftKey/optionKey/controlKey
-
-    static let fallback = FloatHotKey(code: UInt32(kVK_ANSI_F), mods: UInt32(controlKey | optionKey | cmdKey))
-    static let peekFallback = FloatHotKey(code: UInt32(kVK_ANSI_D), mods: UInt32(controlKey | optionKey | cmdKey))
-
-    init(code: UInt32, mods: UInt32) {
-        self.code = code
-        self.mods = mods
-    }
-
-    // nil unless ⌘, ⌃ or ⌥ is held: a bare key would swallow typing everywhere
-    init?(_ e: NSEvent) {
-        let f = e.modifierFlags
-        guard !f.intersection([.command, .control, .option]).isEmpty else { return nil }
-        code = UInt32(e.keyCode)
-        mods = (f.contains(.command) ? UInt32(cmdKey) : 0)
-            | (f.contains(.shift) ? UInt32(shiftKey) : 0)
-            | (f.contains(.option) ? UInt32(optionKey) : 0)
-            | (f.contains(.control) ? UInt32(controlKey) : 0)
-    }
-
-    var label: String {
-        let names: [Int: String] = [
-            kVK_Space: "Space", kVK_Return: "↩", kVK_Tab: "⇥",
-            kVK_LeftArrow: "←", kVK_RightArrow: "→", kVK_UpArrow: "↑", kVK_DownArrow: "↓",
-            kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4", kVK_F5: "F5", kVK_F6: "F6",
-            kVK_F7: "F7", kVK_F8: "F8", kVK_F9: "F9", kVK_F10: "F10", kVK_F11: "F11", kVK_F12: "F12",
-        ]
-        var key = names[Int(code)]
-        if key == nil,
-           let src = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-           let raw = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData) {
-            let layout = unsafeBitCast(raw, to: CFData.self)
-            var dead: UInt32 = 0
-            var len = 0
-            var chars = [UniChar](repeating: 0, count: 4)
-            CFDataGetBytePtr(layout).withMemoryRebound(to: UCKeyboardLayout.self, capacity: 1) {
-                _ = UCKeyTranslate(
-                    $0, UInt16(code), UInt16(kUCKeyActionDisplay), 0, UInt32(LMGetKbdType()),
-                    OptionBits(kUCKeyTranslateNoDeadKeysBit), &dead, 4, &len, &chars
-                )
-            }
-            key = String(utf16CodeUnits: chars, count: len).uppercased()
-        }
-        return (mods & UInt32(controlKey) != 0 ? "⌃" : "")
-            + (mods & UInt32(optionKey) != 0 ? "⌥" : "")
-            + (mods & UInt32(shiftKey) != 0 ? "⇧" : "")
-            + (mods & UInt32(cmdKey) != 0 ? "⌘" : "")
-            + (key ?? "key \(code)")
-    }
-}
 
 struct FloatSite: Codable {
     var host: String
@@ -80,6 +20,25 @@ struct FloatResume: Codable {
     var title: String
     var time: Double
     var duration: Double
+}
+
+private func floatFormatChordLabel(_ keys: String) -> String {
+    guard !keys.isEmpty else { return "None" }
+    if keys == "MetaRight" { return "Right ⌘" }
+    if keys == "AltRight" { return "Right ⌥" }
+    var parts = keys.split(separator: "+").map(String.init)
+    let key = parts.popLast() ?? ""
+    let mods = Set(parts)
+    let named: [String: String] = [
+        "Space": "Space", "Enter": "↩", "Tab": "⇥",
+        "ArrowLeft": "←", "ArrowRight": "→", "ArrowUp": "↑", "ArrowDown": "↓",
+    ]
+    let keyLabel = named[key] ?? (key.count == 1 ? key.uppercased() : key)
+    return (mods.contains("Control") ? "⌃" : "")
+        + (mods.contains("Alt") ? "⌥" : "")
+        + (mods.contains("Shift") ? "⇧" : "")
+        + (mods.contains("Meta") ? "⌘" : "")
+        + keyLabel
 }
 
 private func floatIsWeb(_ u: URL) -> Bool {
@@ -251,9 +210,6 @@ private let floatTrackScript = """
   document.addEventListener('timeupdate', e => {
     if (isVid(e) && Date.now() - last > 5000) { last = Date.now(); send('time', e.target); }
   }, true);
-  const isEd = el => !!(el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)));
-  document.addEventListener('focusin', e => webkit.messageHandlers.fpPlay.postMessage({ event: 'edit', on: isEd(e.target) }), true);
-  document.addEventListener('focusout', () => setTimeout(() => webkit.messageHandlers.fpPlay.postMessage({ event: 'edit', on: isEd(document.activeElement) }), 0), true);
 })();
 """
 
@@ -352,10 +308,10 @@ private struct AgentSnapshot: Codable {
     var alpha: Double = 1.0
     var videoBrightness: Double = 1.0
     var videoContrast: Double = 1.0
-    var hotKey: FloatHotKey? = .fallback
+    var hotkeyKeys: String = "Control+Alt+Meta+F"
     var peekTrigger: String = "rightCommand"
     var peekAlpha: Double = 0.5
-    var peekHotKey: FloatHotKey? = .peekFallback
+    var peekHotkeyKeys: String = "Control+Alt+Meta+D"
     var peekHold: Bool = true
 }
 
@@ -423,14 +379,14 @@ private final class FloatStore {
         }
     }
 
-    var hotKey: FloatHotKey? {
+    var hotkeyKeys: String {
         get {
-            if agentFile != nil { return snapshot.hotKey }
-            return defaults.data(forKey: "hotkey").map { try? JSONDecoder().decode(FloatHotKey.self, from: $0) } ?? .fallback
+            if agentFile != nil { return snapshot.hotkeyKeys }
+            return defaults.object(forKey: "hotkeyKeys") as? String ?? "Control+Alt+Meta+F"
         }
         set {
-            if agentFile != nil { snapshot.hotKey = newValue; flushAgent() }
-            else { defaults.set(newValue.flatMap { try? JSONEncoder().encode($0) } ?? Data(), forKey: "hotkey") }
+            if agentFile != nil { snapshot.hotkeyKeys = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "hotkeyKeys") }
         }
     }
 
@@ -450,14 +406,14 @@ private final class FloatStore {
         }
     }
 
-    var peekHotKey: FloatHotKey? {
+    var peekHotkeyKeys: String {
         get {
-            if agentFile != nil { return snapshot.peekHotKey }
-            return defaults.data(forKey: "peekHotkey").map { try? JSONDecoder().decode(FloatHotKey.self, from: $0) } ?? .peekFallback
+            if agentFile != nil { return snapshot.peekHotkeyKeys }
+            return defaults.object(forKey: "peekHotkeyKeys") as? String ?? "Control+Alt+Meta+D"
         }
         set {
-            if agentFile != nil { snapshot.peekHotKey = newValue; flushAgent() }
-            else { defaults.set(newValue.flatMap { try? JSONEncoder().encode($0) } ?? Data(), forKey: "peekHotkey") }
+            if agentFile != nil { snapshot.peekHotkeyKeys = newValue; flushAgent() }
+            else { defaults.set(newValue, forKey: "peekHotkeyKeys") }
         }
     }
 
@@ -537,62 +493,73 @@ private final class FloatUpdater {
     }
 }
 
-/// Process-wide Carbon hotkey callback owner (handles press + release for show/hide and peek).
-private final class FloatHotKeyCenter {
-    static let shared = FloatHotKeyCenter()
-    weak var active: FloatModule?
-    private var handlerInstalled = false
+/// Process-wide live session hub so secondary windows (Settings, Shortcuts HUD) share state
+/// and live video-filter updates with the main window's WKWebView.
+private final class FloatHub {
+    static let shared = FloatHub()
 
-    func installIfNeeded() {
-        guard !handlerInstalled else { return }
-        handlerInstalled = true
-        var specs = [
-            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
-            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
-        ]
-        InstallEventHandler(
-            GetApplicationEventTarget(),
-            { _, event, _ in
-                guard let event else { return noErr }
-                var hkID = EventHotKeyID()
-                let status = GetEventParameter(
-                    event,
-                    EventParamName(kEventParamDirectObject),
-                    EventParamType(typeEventHotKeyID),
-                    nil,
-                    MemoryLayout<EventHotKeyID>.size,
-                    nil,
-                    &hkID
-                )
-                guard status == noErr else { return noErr }
-                let kind = GetEventKind(event)
-                DispatchQueue.main.async {
-                    guard let mod = FloatHotKeyCenter.shared.active else { return }
-                    if hkID.id == 1, kind == UInt32(kEventHotKeyPressed) {
-                        mod.toggleShown()
-                    } else if hkID.id == 2 {
-                        if kind == UInt32(kEventHotKeyPressed) {
-                            mod.peekHotKeyPressed()
-                        } else if kind == UInt32(kEventHotKeyReleased) {
-                            mod.peekHotKeyReleased()
-                        }
-                    }
-                }
-                return noErr
-            },
-            specs.count, &specs, nil, nil
-        )
+    private struct WeakMod { weak var value: FloatModule? }
+    private var sessions: [WeakMod] = []
+    private var liveStore: FloatStore?
+
+    var mode = "home"
+    var currentUrl = ""
+    var onTop = true
+    var expanded = false
+    var aspectLocked = false
+    var clickThrough = false
+    var pendingSeek: Double?
+
+    func store(for context: ExactModuleContext) -> FloatStore {
+        if context.agent {
+            return FloatStore(agent: true, dataDir: context.data)
+        }
+        if let liveStore { return liveStore }
+        let s = FloatStore(agent: false, dataDir: context.data)
+        liveStore = s
+        return s
+    }
+
+    func register(_ mod: FloatModule) {
+        sessions.removeAll { $0.value == nil || $0.value === mod }
+        sessions.append(WeakMod(value: mod))
+    }
+
+    func unregister(_ mod: FloatModule) {
+        sessions.removeAll { $0.value == nil || $0.value === mod }
+    }
+
+    var primaryBrowser: FloatBrowserInstance? {
+        sessions.compactMap { $0.value?.browser }.first
+    }
+
+    var primaryWindow: NSWindow? {
+        sessions.compactMap { $0.value?.mainWindow }.first
+    }
+
+    func broadcastChange(from origin: FloatModule) {
+        if origin.context.agent {
+            origin.syncWindowBackdrop()
+            origin.context.changed("float")
+            return
+        }
+        sessions.removeAll { $0.value == nil }
+        for entry in sessions {
+            guard let mod = entry.value else { continue }
+            mod.syncWindowBackdrop()
+            mod.context.changed("float")
+        }
     }
 }
 
-/// WKWebView subclass that suppresses initial window flash before the opening morph attaches.
+/// WKWebView subclass that suppresses initial opaque backing-store flash before the GPU morph presents.
 private final class FloatWebView: WKWebView {
     weak var module: FloatModule?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let win = window {
-            module?.prepareOpeningAnimation(for: win)
+            module?.prepareWindowForMorph(win)
         }
     }
 }
@@ -606,10 +573,6 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
         guard let module, let web,
               let url = web.url, url.scheme?.hasPrefix("http") == true, let host = url.host,
               let b = m.body as? [String: Any] else { return }
-        if b["event"] as? String == "edit" {
-            module.webEditingText = b["on"] as? Bool ?? false
-            return
-        }
         let t = b["t"] as? Double ?? 0
         let d = b["d"] as? Double ?? 0
         guard t.isFinite, d.isFinite, t >= 0, d >= 0 else { return }
@@ -650,7 +613,6 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
     }
 
     func webView(_ w: WKWebView, didCommit navigation: WKNavigation!) {
-        module?.webEditingText = false
         syncFromWebView()
     }
 
@@ -747,828 +709,6 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     }
 }
 
-/// Dedicated native macOS Settings window (`Float › Settings…` / `⌘,`).
-private final class FloatSettingsWindow: NSWindow {
-    override func cancelOperation(_ sender: Any?) {
-        performClose(sender)
-    }
-}
-
-private final class FloatSettingsWindowController: NSWindowController, NSWindowDelegate {
-    private weak var module: FloatModule?
-    private let rootStack = NSStackView()
-    private let triggerControl = NSSegmentedControl(
-        labels: ["Hold Right ⌘", "Hold Right ⌥", "Custom Hotkey", "Off"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
-    private let customRow = NSStackView()
-    private let peekKeyBadge = NSTextField(labelWithString: "")
-    private let modeControl = NSSegmentedControl(
-        labels: ["Hold", "Toggle"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
-    private let permissionBox = NSView()
-    private let permissionTitle = NSTextField(labelWithString: "")
-    private let opacitySection = NSStackView()
-    private let opacityValueLabel = NSTextField(labelWithString: "50%")
-    private let opacityPresets = NSSegmentedControl(
-        labels: ["15%", "25%", "50%", "75%"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
-    private let opacitySlider = NSSlider(value: 0.5, minValue: 0.15, maxValue: 0.95, target: nil, action: nil)
-    private let brightnessValueLabel = NSTextField(labelWithString: "100%")
-    private let brightnessSlider = NSSlider(value: 1.0, minValue: 0.5, maxValue: 2.0, target: nil, action: nil)
-    private let contrastValueLabel = NSTextField(labelWithString: "100%")
-    private let contrastSlider = NSSlider(value: 1.0, minValue: 0.5, maxValue: 2.0, target: nil, action: nil)
-    private let resetPictureButton = NSButton(title: "Reset", target: nil, action: nil)
-    private let showHideBadge = NSTextField(labelWithString: "")
-    private weak var trackingSlider: NSSlider?
-
-    private let triggerKeys = ["rightCommand", "rightOption", "hotkey", "none"]
-    private let presetValues: [Double] = [0.15, 0.25, 0.5, 0.75]
-
-    init(module: FloatModule) {
-        self.module = module
-        let win = FloatSettingsWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 320),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        win.title = "Float Settings"
-        win.appearance = NSAppearance(named: .darkAqua)
-        win.isReleasedWhenClosed = false
-        win.level = .floating
-        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        win.backgroundColor = NSColor(calibratedWhite: 0.10, alpha: 1.0)
-        super.init(window: win)
-        win.delegate = self
-        buildUI()
-        refresh()
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    private func makeHeading(_ text: String) -> NSTextField {
-        let f = NSTextField(labelWithString: text)
-        f.font = .systemFont(ofSize: 13, weight: .semibold)
-        f.textColor = .labelColor
-        return f
-    }
-
-    private func makeSubtext(_ text: String) -> NSTextField {
-        let f = NSTextField(wrappingLabelWithString: text)
-        f.font = .systemFont(ofSize: 11)
-        f.textColor = .secondaryLabelColor
-        return f
-    }
-
-    private func styleBadge(_ field: NSTextField) -> NSView {
-        field.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-        field.textColor = .labelColor
-        field.alignment = .center
-        field.translatesAutoresizingMaskIntoConstraints = false
-        let box = NSView()
-        box.wantsLayer = true
-        box.layer?.backgroundColor = NSColor(calibratedWhite: 0.22, alpha: 1.0).cgColor
-        box.layer?.cornerRadius = 6
-        box.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(field)
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 8),
-            field.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -8),
-            field.topAnchor.constraint(equalTo: box.topAnchor, constant: 4),
-            field.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -4),
-            box.widthAnchor.constraint(greaterThanOrEqualToConstant: 56),
-        ])
-        return box
-    }
-
-    private func buildUI() {
-        guard let content = window?.contentView else { return }
-        rootStack.orientation = .vertical
-        rootStack.alignment = .leading
-        rootStack.spacing = 14
-        rootStack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
-        rootStack.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(rootStack)
-        NSLayoutConstraint.activate([
-            rootStack.topAnchor.constraint(equalTo: content.topAnchor),
-            rootStack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            rootStack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            rootStack.widthAnchor.constraint(equalToConstant: 460),
-        ])
-
-        // Section 1: Quick Fade (Global)
-        let fadeHeader = NSStackView(views: [
-            makeHeading("Quick Fade (Global)"),
-            makeSubtext("Temporarily fade Float from any app to see what is behind it."),
-        ])
-        fadeHeader.orientation = .vertical
-        fadeHeader.alignment = .leading
-        fadeHeader.spacing = 2
-        rootStack.addArrangedSubview(fadeHeader)
-
-        triggerControl.target = self
-        triggerControl.action = #selector(triggerChanged(_:))
-        triggerControl.segmentStyle = .rounded
-        triggerControl.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(triggerControl)
-        triggerControl.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
-
-        // Custom hotkey row
-        let peekBadgeWrap = styleBadge(peekKeyBadge)
-        let recordPeekBtn = NSButton(title: "Record…", target: self, action: #selector(recordPeek(_:)))
-        recordPeekBtn.bezelStyle = .rounded
-        modeControl.target = self
-        modeControl.action = #selector(modeChanged(_:))
-        modeControl.segmentStyle = .rounded
-        let customSpacer = NSView()
-        customSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        customRow.orientation = .horizontal
-        customRow.alignment = .centerY
-        customRow.spacing = 8
-        customRow.addArrangedSubview(peekBadgeWrap)
-        customRow.addArrangedSubview(recordPeekBtn)
-        customRow.addArrangedSubview(customSpacer)
-        customRow.addArrangedSubview(modeControl)
-        customRow.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(customRow)
-        customRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
-
-        // Input Monitoring permission banner
-        permissionBox.wantsLayer = true
-        permissionBox.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.14).cgColor
-        permissionBox.layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.35).cgColor
-        permissionBox.layer?.borderWidth = 1
-        permissionBox.layer?.cornerRadius = 9
-        permissionBox.translatesAutoresizingMaskIntoConstraints = false
-        permissionTitle.font = .systemFont(ofSize: 11, weight: .semibold)
-        permissionTitle.textColor = NSColor.systemOrange
-        let permBody = makeSubtext("Required by macOS to detect bare modifier keys when other apps are focused. Custom Hotkey works without permission.")
-        let permTextStack = NSStackView(views: [permissionTitle, permBody])
-        permTextStack.orientation = .vertical
-        permTextStack.alignment = .leading
-        permTextStack.spacing = 2
-        let grantBtn = NSButton(title: "Grant…", target: self, action: #selector(grantPermission(_:)))
-        grantBtn.bezelStyle = .rounded
-        grantBtn.setContentHuggingPriority(.required, for: .horizontal)
-        let permRow = NSStackView(views: [permTextStack, grantBtn])
-        permRow.orientation = .horizontal
-        permRow.alignment = .centerY
-        permRow.spacing = 10
-        permRow.translatesAutoresizingMaskIntoConstraints = false
-        permissionBox.addSubview(permRow)
-        NSLayoutConstraint.activate([
-            permRow.topAnchor.constraint(equalTo: permissionBox.topAnchor, constant: 10),
-            permRow.bottomAnchor.constraint(equalTo: permissionBox.bottomAnchor, constant: -10),
-            permRow.leadingAnchor.constraint(equalTo: permissionBox.leadingAnchor, constant: 12),
-            permRow.trailingAnchor.constraint(equalTo: permissionBox.trailingAnchor, constant: -12),
-        ])
-        rootStack.addArrangedSubview(permissionBox)
-        permissionBox.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
-
-        // Fade Opacity section (presets + continuous slider)
-        let opacityLabel = NSTextField(labelWithString: "Fade Opacity")
-        opacityLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        opacityLabel.textColor = .labelColor
-        opacityValueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        opacityValueLabel.textColor = NSColor(calibratedRed: 0.50, green: 0.85, blue: 0.85, alpha: 1.0)
-        let opacitySpacer = NSView()
-        opacitySpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let opacityTopRow = NSStackView(views: [opacityLabel, opacitySpacer, opacityValueLabel])
-        opacityTopRow.orientation = .horizontal
-        opacityTopRow.alignment = .centerY
-        opacityTopRow.translatesAutoresizingMaskIntoConstraints = false
-
-        opacityPresets.target = self
-        opacityPresets.action = #selector(presetChanged(_:))
-        opacityPresets.segmentStyle = .rounded
-        opacityPresets.translatesAutoresizingMaskIntoConstraints = false
-
-        opacitySlider.target = self
-        opacitySlider.action = #selector(sliderChanged(_:))
-        opacitySlider.isContinuous = true
-        opacitySlider.translatesAutoresizingMaskIntoConstraints = false
-
-        opacitySection.orientation = .vertical
-        opacitySection.alignment = .leading
-        opacitySection.spacing = 8
-        opacitySection.addArrangedSubview(opacityTopRow)
-        opacitySection.addArrangedSubview(opacityPresets)
-        opacitySection.addArrangedSubview(opacitySlider)
-        opacitySection.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(opacitySection)
-        NSLayoutConstraint.activate([
-            opacitySection.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40),
-            opacityTopRow.widthAnchor.constraint(equalTo: opacitySection.widthAnchor),
-            opacityPresets.widthAnchor.constraint(equalTo: opacitySection.widthAnchor),
-            opacitySlider.widthAnchor.constraint(equalTo: opacitySection.widthAnchor),
-        ])
-
-        // Divider
-        let pictureSep = NSBox()
-        pictureSep.boxType = .separator
-        pictureSep.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(pictureSep)
-        pictureSep.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
-
-        // Section 2: Video Picture (Brightness & Contrast)
-        let pictureTitleStack = NSStackView(views: [
-            makeHeading("Video Picture"),
-            makeSubtext("Adjust brightness and contrast for dark scenes."),
-        ])
-        pictureTitleStack.orientation = .vertical
-        pictureTitleStack.alignment = .leading
-        pictureTitleStack.spacing = 2
-        resetPictureButton.target = self
-        resetPictureButton.action = #selector(resetPicture(_:))
-        resetPictureButton.bezelStyle = .rounded
-        let pictureSpacer = NSView()
-        pictureSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let pictureHeader = NSStackView(views: [pictureTitleStack, pictureSpacer, resetPictureButton])
-        pictureHeader.orientation = .horizontal
-        pictureHeader.alignment = .centerY
-        pictureHeader.spacing = 8
-        pictureHeader.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(pictureHeader)
-        pictureHeader.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
-
-        let accentTeal = NSColor(calibratedRed: 0.50, green: 0.85, blue: 0.85, alpha: 1.0)
-        func makeSliderRow(title: String, valueLabel: NSTextField, slider: NSSlider, action: Selector) -> NSStackView {
-            let lbl = NSTextField(labelWithString: title)
-            lbl.font = .systemFont(ofSize: 12, weight: .medium)
-            lbl.textColor = .labelColor
-            valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-            valueLabel.textColor = accentTeal
-            let sp = NSView()
-            sp.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            let top = NSStackView(views: [lbl, sp, valueLabel])
-            top.orientation = .horizontal
-            top.alignment = .centerY
-            top.translatesAutoresizingMaskIntoConstraints = false
-
-            slider.target = self
-            slider.action = action
-            slider.isContinuous = true
-            slider.translatesAutoresizingMaskIntoConstraints = false
-
-            let col = NSStackView(views: [top, slider])
-            col.orientation = .vertical
-            col.alignment = .leading
-            col.spacing = 4
-            col.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([
-                top.widthAnchor.constraint(equalTo: col.widthAnchor),
-                slider.widthAnchor.constraint(equalTo: col.widthAnchor),
-            ])
-            return col
-        }
-
-        let brightnessRow = makeSliderRow(
-            title: "Brightness",
-            valueLabel: brightnessValueLabel,
-            slider: brightnessSlider,
-            action: #selector(brightnessSliderChanged(_:))
-        )
-        let contrastRow = makeSliderRow(
-            title: "Contrast",
-            valueLabel: contrastValueLabel,
-            slider: contrastSlider,
-            action: #selector(contrastSliderChanged(_:))
-        )
-        rootStack.addArrangedSubview(brightnessRow)
-        rootStack.addArrangedSubview(contrastRow)
-        NSLayoutConstraint.activate([
-            brightnessRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40),
-            contrastRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40),
-        ])
-
-        // Divider
-        let sep = NSBox()
-        sep.boxType = .separator
-        sep.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(sep)
-        sep.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
-
-        // Section 3: Show / Hide Window shortcut
-        let showHeader = NSStackView(views: [
-            makeHeading("Show / Hide Window"),
-            makeSubtext("Global shortcut to toggle Float visibility."),
-        ])
-        showHeader.orientation = .vertical
-        showHeader.alignment = .leading
-        showHeader.spacing = 2
-        let showBadgeWrap = styleBadge(showHideBadge)
-        let recordShowBtn = NSButton(title: "Record…", target: self, action: #selector(recordShowHide(_:)))
-        recordShowBtn.bezelStyle = .rounded
-        let showSpacer = NSView()
-        showSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let showRow = NSStackView(views: [showHeader, showSpacer, showBadgeWrap, recordShowBtn])
-        showRow.orientation = .horizontal
-        showRow.alignment = .centerY
-        showRow.spacing = 8
-        showRow.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(showRow)
-        showRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -40).isActive = true
-    }
-
-    func show(relativeTo host: NSWindow?) {
-        guard let win = window else { return }
-        refresh()
-        if !win.isVisible {
-            if !win.setFrameUsingName("FloatSettingsWindow") {
-                if let vis = (host?.screen ?? NSScreen.main)?.visibleFrame {
-                    let s = win.frame.size
-                    let origin = NSPoint(
-                        x: (vis.midX - s.width / 2).rounded(),
-                        y: (vis.midY - s.height / 2).rounded()
-                    )
-                    win.setFrameOrigin(origin)
-                } else {
-                    win.center()
-                }
-            }
-            win.setFrameAutosaveName("FloatSettingsWindow")
-        }
-        win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func refresh() {
-        guard let module, let win = window else { return }
-        if let idx = triggerKeys.firstIndex(of: module.peekTrigger) {
-            triggerControl.selectedSegment = idx
-        }
-        let isHotkey = module.peekTrigger == "hotkey"
-        let isModifier = module.peekTrigger == "rightCommand" || module.peekTrigger == "rightOption"
-        customRow.isHidden = !isHotkey
-        peekKeyBadge.stringValue = module.peekHotKeyLabel
-        modeControl.selectedSegment = module.peekHold ? 0 : 1
-
-        let needsPerm = isModifier && !module.peekPermissionGranted
-        permissionBox.isHidden = !needsPerm
-        if needsPerm {
-            let keyName = module.peekTrigger == "rightCommand" ? "Right ⌘" : "Right ⌥"
-            permissionTitle.stringValue = "Enable Input Monitoring for \(keyName)"
-        }
-
-        opacitySection.isHidden = module.peekTrigger == "none"
-        let pct = Int((module.peekAlpha * 100).rounded())
-        opacityValueLabel.stringValue = "\(pct)%"
-        if trackingSlider !== opacitySlider {
-            opacitySlider.doubleValue = module.peekAlpha
-        }
-        if let presetIdx = presetValues.firstIndex(where: { Int(($0 * 100).rounded()) == pct }) {
-            opacityPresets.selectedSegment = presetIdx
-        } else {
-            opacityPresets.selectedSegment = -1
-        }
-
-        let brightPct = Int((module.videoBrightness * 100).rounded())
-        brightnessValueLabel.stringValue = "\(brightPct)%"
-        if trackingSlider !== brightnessSlider {
-            brightnessSlider.doubleValue = module.videoBrightness
-        }
-        let contrastPct = Int((module.videoContrast * 100).rounded())
-        contrastValueLabel.stringValue = "\(contrastPct)%"
-        if trackingSlider !== contrastSlider {
-            contrastSlider.doubleValue = module.videoContrast
-        }
-        resetPictureButton.isEnabled = brightPct != 100 || contrastPct != 100
-
-        showHideBadge.stringValue = module.hotKeyLabel
-
-        // Fit height cleanly while keeping top-left anchored
-        rootStack.layoutSubtreeIfNeeded()
-        let fit = rootStack.fittingSize
-        let targetH = max(180, fit.height)
-        let current = win.contentRect(forFrameRect: win.frame)
-        if abs(current.height - targetH) > 1 {
-            let newFrame = win.frameRect(forContentRect: NSRect(x: 0, y: 0, width: 460, height: targetH))
-            var f = win.frame
-            f.origin.y += f.height - newFrame.height
-            f.size = newFrame.size
-            win.setFrame(f, display: true, animate: win.isVisible)
-        }
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        module?.settingsWindowDidClose()
-    }
-
-    @objc private func triggerChanged(_ sender: NSSegmentedControl) {
-        let idx = sender.selectedSegment
-        guard triggerKeys.indices.contains(idx) else { return }
-        module?.setPeekTrigger(triggerKeys[idx])
-    }
-
-    @objc private func modeChanged(_ sender: NSSegmentedControl) {
-        module?.setPeekHold(sender.selectedSegment == 0)
-    }
-
-    @objc private func presetChanged(_ sender: NSSegmentedControl) {
-        let idx = sender.selectedSegment
-        guard presetValues.indices.contains(idx) else { return }
-        module?.setPeekAlpha(presetValues[idx])
-    }
-
-    @objc private func sliderChanged(_ sender: NSSlider) {
-        trackingSlider = sender
-        defer { trackingSlider = nil }
-        let stepped = (sender.doubleValue * 20).rounded() / 20 // 5% steps
-        module?.setPeekAlpha(stepped)
-    }
-
-    @objc private func brightnessSliderChanged(_ sender: NSSlider) {
-        trackingSlider = sender
-        defer { trackingSlider = nil }
-        let stepped = (sender.doubleValue * 20).rounded() / 20 // 5% steps
-        module?.setVideoBrightness(stepped)
-    }
-
-    @objc private func contrastSliderChanged(_ sender: NSSlider) {
-        trackingSlider = sender
-        defer { trackingSlider = nil }
-        let stepped = (sender.doubleValue * 20).rounded() / 20 // 5% steps
-        module?.setVideoContrast(stepped)
-    }
-
-    @objc private func resetPicture(_ sender: Any?) {
-        module?.resetVideoFilters()
-    }
-
-    @objc private func recordPeek(_ sender: Any?) {
-        module?.recordPeekHotKey()
-    }
-
-    @objc private func recordShowHide(_ sender: Any?) {
-        module?.recordHotKey()
-    }
-
-    @objc private func grantPermission(_ sender: Any?) {
-        module?.requestPeekPermission()
-    }
-}
-
-/// Separate floating Liquid Glass keyboard shortcuts HUD (`?` while Float is focused).
-private final class FloatShortcutsPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
-
-    override func cancelOperation(_ sender: Any?) {
-        performClose(sender)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
-        if mods == .command, event.charactersIgnoringModifiers?.lowercased() == "w" {
-            performClose(nil)
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-}
-
-private final class FloatShortcutsWindowController: NSWindowController, NSWindowDelegate {
-    private weak var module: FloatModule?
-    private let panelWidth: CGFloat = 760
-    private let rootStack = NSStackView()
-    private let peekDescLabel = NSTextField(labelWithString: "Quick Fade (50%)")
-    private let peekKeyLabel = NSTextField(labelWithString: "Right ⌘")
-    private let showHideKeyLabel = NSTextField(labelWithString: "⌃⌥⌘F")
-
-    init(module: FloatModule) {
-        self.module = module
-        let panel = FloatShortcutsPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 300),
-            styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        panel.titlebarAppearsTransparent = true
-        panel.titleVisibility = .hidden
-        if #available(macOS 11.0, *) { panel.titlebarSeparatorStyle = .none }
-        [.closeButton, .miniaturizeButton, .zoomButton].forEach { panel.standardWindowButton($0)?.isHidden = true }
-        panel.appearance = NSAppearance(named: .darkAqua)
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.isMovableByWindowBackground = true
-        panel.isReleasedWhenClosed = false
-        panel.hidesOnDeactivate = false
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        super.init(window: panel)
-        panel.delegate = self
-        buildUI()
-        refresh()
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    private func makeKeycap(_ label: NSTextField) -> NSView {
-        label.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
-        label.textColor = NSColor(calibratedWhite: 0.96, alpha: 1.0)
-        label.alignment = .center
-        label.setContentHuggingPriority(.required, for: .horizontal)
-        label.setContentCompressionResistancePriority(.required, for: .horizontal)
-        label.translatesAutoresizingMaskIntoConstraints = false
-
-        let pill = NSView()
-        pill.wantsLayer = true
-        pill.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
-        pill.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
-        pill.layer?.borderWidth = 1
-        pill.layer?.cornerRadius = 6
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        pill.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 7),
-            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -7),
-            label.topAnchor.constraint(equalTo: pill.topAnchor, constant: 2),
-            label.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -2),
-        ])
-        return pill
-    }
-
-    private func makeShortcutRow(titleField: NSTextField, keyField: NSTextField) -> NSView {
-        titleField.font = .systemFont(ofSize: 12)
-        titleField.textColor = NSColor(calibratedWhite: 0.92, alpha: 1.0)
-        titleField.lineBreakMode = .byTruncatingTail
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let row = NSStackView(views: [titleField, spacer, makeKeycap(keyField)])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-        row.translatesAutoresizingMaskIntoConstraints = false
-        return row
-    }
-
-    private func makeShortcutRow(_ title: String, key: String) -> NSView {
-        makeShortcutRow(
-            titleField: NSTextField(labelWithString: title),
-            keyField: NSTextField(labelWithString: key)
-        )
-    }
-
-    private func makeGroup(_ heading: String, rows: [NSView]) -> NSView {
-        let box = NSView()
-        box.wantsLayer = true
-        box.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
-        box.layer?.borderColor = NSColor.white.withAlphaComponent(0.11).cgColor
-        box.layer?.borderWidth = 1
-        box.layer?.cornerRadius = 12
-        box.translatesAutoresizingMaskIntoConstraints = false
-
-        let title = NSTextField(labelWithString: heading)
-        title.font = .systemFont(ofSize: 10, weight: .semibold)
-        title.textColor = NSColor(calibratedRed: 0.50, green: 0.85, blue: 0.85, alpha: 1.0)
-
-        let stack = NSStackView(views: [title] + rows)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 7
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: box.topAnchor, constant: 12),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: box.bottomAnchor, constant: -12),
-            stack.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12),
-        ])
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
-        return box
-    }
-
-    private func buildUI() {
-        guard let panel = window else { return }
-
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        rootStack.orientation = .vertical
-        rootStack.alignment = .leading
-        rootStack.spacing = 12
-        rootStack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 16, right: 16)
-        rootStack.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(rootStack)
-        NSLayoutConstraint.activate([
-            rootStack.topAnchor.constraint(equalTo: container.topAnchor),
-            rootStack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            rootStack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            rootStack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            rootStack.widthAnchor.constraint(equalToConstant: panelWidth),
-        ])
-
-        // Header bar
-        let title = NSTextField(labelWithString: "Keyboard Shortcuts")
-        title.font = .systemFont(ofSize: 14, weight: .semibold)
-        title.textColor = NSColor(calibratedWhite: 0.96, alpha: 1.0)
-
-        let hintText = NSTextField(labelWithString: "? or Esc")
-        hintText.font = .systemFont(ofSize: 10, weight: .medium)
-        hintText.textColor = NSColor(calibratedRed: 0.55, green: 0.89, blue: 0.89, alpha: 1.0)
-        hintText.translatesAutoresizingMaskIntoConstraints = false
-        let hintPill = NSView()
-        hintPill.wantsLayer = true
-        hintPill.layer?.backgroundColor = NSColor(calibratedRed: 0.25, green: 0.82, blue: 0.82, alpha: 0.16).cgColor
-        hintPill.layer?.borderColor = NSColor(calibratedRed: 0.31, green: 0.86, blue: 0.86, alpha: 0.34).cgColor
-        hintPill.layer?.borderWidth = 1
-        hintPill.layer?.cornerRadius = 9
-        hintPill.translatesAutoresizingMaskIntoConstraints = false
-        hintPill.addSubview(hintText)
-        NSLayoutConstraint.activate([
-            hintText.leadingAnchor.constraint(equalTo: hintPill.leadingAnchor, constant: 8),
-            hintText.trailingAnchor.constraint(equalTo: hintPill.trailingAnchor, constant: -8),
-            hintText.topAnchor.constraint(equalTo: hintPill.topAnchor, constant: 2),
-            hintText.bottomAnchor.constraint(equalTo: hintPill.bottomAnchor, constant: -2),
-        ])
-
-        let closeBtn = NSButton(title: "×", target: self, action: #selector(closeClicked(_:)))
-        closeBtn.isBordered = false
-        closeBtn.wantsLayer = true
-        closeBtn.font = .systemFont(ofSize: 15, weight: .medium)
-        closeBtn.contentTintColor = NSColor(calibratedWhite: 0.92, alpha: 1.0)
-        closeBtn.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        closeBtn.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
-        closeBtn.layer?.borderWidth = 1
-        closeBtn.layer?.cornerRadius = 12
-        closeBtn.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            closeBtn.widthAnchor.constraint(equalToConstant: 24),
-            closeBtn.heightAnchor.constraint(equalToConstant: 24),
-        ])
-
-        let headerSpacer = NSView()
-        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let headerRow = NSStackView(views: [title, hintPill, headerSpacer, closeBtn])
-        headerRow.orientation = .horizontal
-        headerRow.alignment = .centerY
-        headerRow.spacing = 8
-        headerRow.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(headerRow)
-        headerRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -32).isActive = true
-
-        // Subtle divider
-        let divider = NSView()
-        divider.wantsLayer = true
-        divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(divider)
-        NSLayoutConstraint.activate([
-            divider.heightAnchor.constraint(equalToConstant: 1),
-            divider.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -32),
-        ])
-
-        // 3 balanced shortcut groups
-        let navGroup = makeGroup("NAVIGATION", rows: [
-            makeShortcutRow("Open URL or Search", key: "⌘L"),
-            makeShortcutRow("Open Clipboard URL", key: "⇧⌘V"),
-            makeShortcutRow("Home Mosaic", key: "⇧⌘H"),
-            makeShortcutRow("Resume Last Video", key: "⇧⌘R"),
-            makeShortcutRow("Back / Forward", key: "⌘[  ⌘]"),
-            makeShortcutRow("Reload Page", key: "⌘R"),
-        ])
-
-        let videoGroup = makeGroup("VIDEO & WINDOW", rows: [
-            makeShortcutRow("Play / Pause", key: "⌃Space"),
-            makeShortcutRow("Toggle Video Fill", key: "⇧⌘F"),
-            makeShortcutRow("Expand Window", key: "⇧⌘E"),
-            makeShortcutRow("Lock Video Aspect", key: "⇧⌘A"),
-            makeShortcutRow("Opacity − / +", key: "⌘−  ⌘="),
-            makeShortcutRow("Click-Through", key: "⇧⌘K"),
-            makeShortcutRow("Always on Top", key: "⌘T"),
-        ])
-
-        let globalGroup = makeGroup("POSITION & GLOBAL", rows: [
-            makeShortcutRow("Dock Top / Bottom", key: "⌃⌘1–6"),
-            makeShortcutRow(titleField: peekDescLabel, keyField: peekKeyLabel),
-            makeShortcutRow(titleField: NSTextField(labelWithString: "Show / Hide Float"), keyField: showHideKeyLabel),
-            makeShortcutRow("Settings", key: "⌘,"),
-            makeShortcutRow("Drag / Aspect Lock", key: "Top Strip"),
-            makeShortcutRow("Keyboard Shortcuts", key: "?"),
-        ])
-
-        let columns = NSStackView(views: [navGroup, videoGroup, globalGroup])
-        columns.orientation = .horizontal
-        columns.distribution = .fillEqually
-        columns.alignment = .top
-        columns.spacing = 10
-        columns.translatesAutoresizingMaskIntoConstraints = false
-        rootStack.addArrangedSubview(columns)
-        columns.widthAnchor.constraint(equalTo: rootStack.widthAnchor, constant: -32).isActive = true
-        navGroup.heightAnchor.constraint(equalTo: videoGroup.heightAnchor).isActive = true
-        globalGroup.heightAnchor.constraint(equalTo: videoGroup.heightAnchor).isActive = true
-
-        // Mount inside native macOS 26 Liquid Glass (window itself owns the native corner mask & rim)
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView(frame: .zero)
-            glass.style = .regular
-            glass.tintColor = NSColor(calibratedRed: 0.07, green: 0.08, blue: 0.11, alpha: 0.44)
-            glass.contentView = container
-            panel.contentView = glass
-        } else {
-            let fx = NSVisualEffectView(frame: .zero)
-            fx.material = .hudWindow
-            fx.blendingMode = .behindWindow
-            fx.state = .active
-            fx.addSubview(container)
-            NSLayoutConstraint.activate([
-                container.topAnchor.constraint(equalTo: fx.topAnchor),
-                container.bottomAnchor.constraint(equalTo: fx.bottomAnchor),
-                container.leadingAnchor.constraint(equalTo: fx.leadingAnchor),
-                container.trailingAnchor.constraint(equalTo: fx.trailingAnchor),
-            ])
-            panel.contentView = fx
-        }
-    }
-
-    func show(relativeTo host: NSWindow?) {
-        guard let panel = window else { return }
-        refresh()
-        if !panel.isVisible {
-            if let vis = (host?.screen ?? NSScreen.main)?.visibleFrame {
-                let s = panel.frame.size
-                let origin = NSPoint(
-                    x: (vis.midX - s.width / 2).rounded(),
-                    y: (vis.midY - s.height / 2).rounded()
-                )
-                panel.setFrameOrigin(origin)
-            } else {
-                panel.center()
-            }
-            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-                panel.alphaValue = 1
-                panel.makeKeyAndOrderFront(nil)
-            } else {
-                panel.alphaValue = 0
-                panel.makeKeyAndOrderFront(nil)
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.16
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    panel.animator().alphaValue = 1
-                }
-            }
-        } else {
-            panel.makeKeyAndOrderFront(nil)
-        }
-    }
-
-    func hideAnimated() {
-        guard let panel = window, panel.isVisible else { return }
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            panel.orderOut(nil)
-            return
-        }
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.12
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().alphaValue = 0
-        }, completionHandler: {
-            panel.orderOut(nil)
-            panel.alphaValue = 1
-        })
-    }
-
-    func refresh() {
-        guard let module, let panel = window else { return }
-        let pct = Int((module.peekAlpha * 100).rounded())
-        peekDescLabel.stringValue = module.peekTrigger == "none" ? "Quick Fade (Off)" : "Quick Fade (\(pct)%)"
-        switch module.peekTrigger {
-        case "rightCommand": peekKeyLabel.stringValue = "Right ⌘"
-        case "rightOption": peekKeyLabel.stringValue = "Right ⌥"
-        case "hotkey": peekKeyLabel.stringValue = module.peekHotKeyLabel
-        default: peekKeyLabel.stringValue = "Off"
-        }
-        showHideKeyLabel.stringValue = module.hotKeyLabel
-
-        rootStack.layoutSubtreeIfNeeded()
-        let fit = rootStack.fittingSize
-        let size = NSSize(width: max(panelWidth, fit.width.rounded(.up)), height: max(220, fit.height.rounded(.up)))
-        if abs(panel.frame.height - size.height) > 1 || abs(panel.frame.width - size.width) > 1 {
-            panel.setContentSize(size)
-        }
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        module?.shortcutsWindowDidClose()
-    }
-
-    @objc private func closeClicked(_ sender: Any?) {
-        module?.setShortcutsOpen(false)
-    }
-}
-
 /// Non-interactive Liquid Glass window backdrop for the Home screen (macOS 26+ native glass, older HUD material fallback).
 @available(macOS 26.0, *)
 private final class FloatHomeGlassView: NSGlassEffectView {
@@ -1577,499 +717,6 @@ private final class FloatHomeGlassView: NSGlassEffectView {
 
 private final class FloatHomeVisualEffectView: NSVisualEffectView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
-}
-
-/// Borderless, screen-unconstrained overlay panel used solely during the opening glassy-logo morph.
-private final class FloatOpeningMorphPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
-    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
-}
-
-/// Opening animation: materializes a floating, 3D-tilted Liquid Glass version of the Float logo
-/// (teal refracting glass pane, luminous cyan bevel rim, specular sheen, and rounded play mark)
-/// and smoothly morphs its glass geometry, tint, and perspective into the exact Float window shape.
-private final class FloatOpeningMorphController: NSObject {
-    private weak var hostWindow: NSWindow?
-    private let targetAlphaProvider: () -> CGFloat
-    private let isHomeProvider: () -> Bool
-    private let onBeforeReveal: () -> Void
-    private let onComplete: () -> Void
-
-    private let panel: FloatOpeningMorphPanel
-    private let rootView: NSView
-    private let shadowLayer = CAGradientLayer()
-    private let stageView: NSView
-    private let glassView: NSView
-    private let interiorView: NSView
-
-    private let tealDepthLayer = CAGradientLayer()
-    private let sheenLayer = CAGradientLayer()
-    private let rimGradientLayer = CAGradientLayer()
-    private let rimMaskLayer = CAShapeLayer()
-    private let innerHighlightLayer = CAShapeLayer()
-    private let playLayer = CAShapeLayer()
-
-    private let pad: CGFloat = 88
-    private let targetRect: NSRect
-    private let logoRect: NSRect
-    private let startCornerRadius: CGFloat
-    private let endCornerRadius: CGFloat = 16
-
-    private var displayLink: CADisplayLink?
-    private var startTimestamp: CFTimeInterval?
-    private var finished = false
-    private var hostRevealPrepared = false
-    private var hostShadowRestored = false
-
-    private let totalDuration: CFTimeInterval = 0.64
-
-    init(
-        hostWindow: NSWindow,
-        targetAlphaProvider: @escaping () -> CGFloat,
-        isHomeProvider: @escaping () -> Bool,
-        onBeforeReveal: @escaping () -> Void,
-        onComplete: @escaping () -> Void
-    ) {
-        self.hostWindow = hostWindow
-        self.targetAlphaProvider = targetAlphaProvider
-        self.isHomeProvider = isHomeProvider
-        self.onBeforeReveal = onBeforeReveal
-        self.onComplete = onComplete
-
-        let hostFrame = hostWindow.frame
-        let overlayFrame = hostFrame.insetBy(dx: -pad, dy: -pad)
-        self.targetRect = NSRect(x: pad, y: pad, width: hostFrame.width, height: hostFrame.height)
-
-        // Proportion the glassy Float logo pane (~1.58:1 aspect like Float.icon) cleanly for any window size
-        let maxLogoW = min(204, hostFrame.width * 0.64)
-        let maxLogoH = min(130, hostFrame.height * 0.64)
-        var logoW = min(max(hostFrame.width * 0.30, 116), maxLogoW)
-        var logoH = logoW / 1.58
-        if logoH > maxLogoH {
-            logoH = maxLogoH
-            logoW = min(maxLogoW, logoH * 1.58)
-        }
-        logoW = max(68, logoW)
-        logoH = max(44, logoH)
-        self.logoRect = NSRect(
-            x: targetRect.midX - logoW / 2,
-            y: targetRect.midY - logoH / 2,
-            width: logoW,
-            height: logoH
-        )
-        self.startCornerRadius = min(max(logoH * 0.21, 14), 28)
-
-        panel = FloatOpeningMorphPanel(
-            contentRect: overlayFrame,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        panel.appearance = NSAppearance(named: .darkAqua)
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = false
-        panel.ignoresMouseEvents = true
-        panel.isReleasedWhenClosed = false
-        panel.hidesOnDeactivate = false
-        panel.animationBehavior = .none
-        panel.level = hostWindow.level
-        panel.collectionBehavior = hostWindow.collectionBehavior
-
-        let overlayBounds = NSRect(origin: .zero, size: overlayFrame.size)
-        rootView = NSView(frame: overlayBounds)
-        rootView.wantsLayer = true
-        rootView.layer?.backgroundColor = NSColor.clear.cgColor
-
-        stageView = NSView(frame: overlayBounds)
-        stageView.wantsLayer = true
-        stageView.layer?.backgroundColor = NSColor.clear.cgColor
-
-        interiorView = NSView(frame: NSRect(origin: .zero, size: logoRect.size))
-        interiorView.wantsLayer = true
-        interiorView.layer?.masksToBounds = true
-
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView(frame: logoRect)
-            glass.style = .regular
-            glass.cornerRadius = startCornerRadius
-            glass.tintColor = NSColor(calibratedRed: 0.00, green: 0.44, blue: 0.48, alpha: 0.74)
-            glass.contentView = interiorView
-            glassView = glass
-        } else {
-            let fx = NSVisualEffectView(frame: logoRect)
-            fx.material = .hudWindow
-            fx.blendingMode = .behindWindow
-            fx.state = .active
-            fx.wantsLayer = true
-            fx.layer?.cornerRadius = startCornerRadius
-            fx.layer?.masksToBounds = true
-            interiorView.autoresizingMask = [.width, .height]
-            fx.addSubview(interiorView)
-            glassView = fx
-        }
-
-        super.init()
-        setupLayers()
-        rootView.layer?.addSublayer(shadowLayer)
-        stageView.addSubview(glassView)
-        rootView.addSubview(stageView)
-        panel.contentView = rootView
-    }
-
-    private func setupLayers() {
-        // Feather-soft radial floating shadow hovering below the tilted logo (never blocks behind translucent glass)
-        shadowLayer.type = .radial
-        shadowLayer.colors = [
-            NSColor(calibratedRed: 0.00, green: 0.14, blue: 0.16, alpha: 0.34).cgColor,
-            NSColor(calibratedRed: 0.00, green: 0.14, blue: 0.16, alpha: 0.16).cgColor,
-            NSColor(calibratedRed: 0.00, green: 0.14, blue: 0.16, alpha: 0.0).cgColor,
-        ]
-        shadowLayer.locations = [0.0, 0.48, 1.0]
-        shadowLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
-        shadowLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
-
-        guard let interiorLayer = interiorView.layer else { return }
-
-        // 1. Rich emerald-teal glass depth gradient matching Float.icon
-        tealDepthLayer.colors = [
-            NSColor(calibratedRed: 0.18, green: 0.90, blue: 0.92, alpha: 0.46).cgColor,
-            NSColor(calibratedRed: 0.00, green: 0.42, blue: 0.47, alpha: 0.42).cgColor,
-            NSColor(calibratedRed: 0.00, green: 0.28, blue: 0.33, alpha: 0.48).cgColor,
-            NSColor(calibratedRed: 0.10, green: 0.84, blue: 0.86, alpha: 0.40).cgColor,
-        ]
-        tealDepthLayer.locations = [0.0, 0.34, 0.70, 1.0]
-        tealDepthLayer.startPoint = CGPoint(x: 0.05, y: 0.95)
-        tealDepthLayer.endPoint = CGPoint(x: 0.95, y: 0.05)
-        interiorLayer.addSublayer(tealDepthLayer)
-
-        // 2. Diagonal glossy glass light sheen sweep
-        sheenLayer.colors = [
-            NSColor.white.withAlphaComponent(0.0).cgColor,
-            NSColor(calibratedRed: 0.78, green: 1.00, blue: 0.99, alpha: 0.34).cgColor,
-            NSColor.white.withAlphaComponent(0.46).cgColor,
-            NSColor(calibratedRed: 0.58, green: 0.98, blue: 0.98, alpha: 0.16).cgColor,
-            NSColor.white.withAlphaComponent(0.0).cgColor,
-        ]
-        sheenLayer.locations = [0.0, 0.34, 0.50, 0.66, 1.0]
-        sheenLayer.startPoint = CGPoint(x: 0.0, y: 1.0)
-        sheenLayer.endPoint = CGPoint(x: 1.0, y: 0.0)
-        interiorLayer.addSublayer(sheenLayer)
-
-        // 3. Luminous cyan-turquoise specular bevel rim (gradient masked by morphing rounded-rect stroke)
-        rimGradientLayer.colors = [
-            NSColor(calibratedRed: 0.80, green: 1.00, blue: 0.99, alpha: 0.98).cgColor,
-            NSColor(calibratedRed: 0.16, green: 0.90, blue: 0.90, alpha: 0.95).cgColor,
-            NSColor(calibratedRed: 0.04, green: 0.50, blue: 0.56, alpha: 0.78).cgColor,
-            NSColor(calibratedRed: 0.42, green: 0.98, blue: 0.97, alpha: 0.98).cgColor,
-            NSColor(calibratedRed: 0.08, green: 0.68, blue: 0.72, alpha: 0.86).cgColor,
-        ]
-        rimGradientLayer.locations = [0.0, 0.25, 0.52, 0.78, 1.0]
-        rimGradientLayer.startPoint = CGPoint(x: 0.0, y: 1.0)
-        rimGradientLayer.endPoint = CGPoint(x: 1.0, y: 0.0)
-        rimMaskLayer.fillColor = nil
-        rimMaskLayer.strokeColor = NSColor.white.cgColor
-        rimMaskLayer.lineWidth = 3.0
-        rimGradientLayer.mask = rimMaskLayer
-        interiorLayer.addSublayer(rimGradientLayer)
-
-        // Subtle inner white-cyan highlight edge
-        innerHighlightLayer.fillColor = nil
-        innerHighlightLayer.strokeColor = NSColor(calibratedRed: 0.86, green: 1.00, blue: 1.00, alpha: 0.38).cgColor
-        innerHighlightLayer.lineWidth = 1.0
-        interiorLayer.addSublayer(innerHighlightLayer)
-
-        // 4. Sculpted warm-ivory rounded play triangle hovering over the teal glass
-        playLayer.fillColor = NSColor(calibratedRed: 0.975, green: 0.97, blue: 0.95, alpha: 0.98).cgColor
-        playLayer.shadowColor = NSColor(calibratedRed: 0.00, green: 0.16, blue: 0.20, alpha: 1.0).cgColor
-        playLayer.shadowOpacity = 0.48
-        playLayer.shadowRadius = 8
-        playLayer.shadowOffset = CGSize(width: 0, height: -4)
-        interiorLayer.addSublayer(playLayer)
-    }
-
-    func start() {
-        guard !finished, let host = hostWindow else { return }
-        applyFrame(elapsed: 0)
-        panel.order(.above, relativeTo: host.windowNumber)
-        let link = rootView.displayLink(target: self, selector: #selector(step(_:)))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-    }
-
-    func cancel(restoreHost: Bool) {
-        guard !finished else { return }
-        finished = true
-        displayLink?.invalidate()
-        displayLink = nil
-        panel.orderOut(nil)
-        if restoreHost, let host = hostWindow {
-            host.hasShadow = true
-            host.alphaValue = targetAlphaProvider()
-            host.invalidateShadow()
-        }
-        onComplete()
-    }
-
-    @objc private func step(_ link: CADisplayLink) {
-        guard !finished else { return }
-        let now = link.timestamp
-        if startTimestamp == nil { startTimestamp = now }
-        let elapsed = max(0, now - (startTimestamp ?? now))
-        applyFrame(elapsed: elapsed)
-        if elapsed >= totalDuration {
-            finish()
-        }
-    }
-
-    private func finish() {
-        guard !finished else { return }
-        finished = true
-        displayLink?.invalidate()
-        displayLink = nil
-        if let host = hostWindow {
-            host.hasShadow = true
-            host.alphaValue = targetAlphaProvider()
-            host.invalidateShadow()
-        }
-        panel.orderOut(nil)
-        onComplete()
-    }
-
-    private func applyFrame(elapsed t: CFTimeInterval) {
-        let targetAlpha = targetAlphaProvider()
-        let isHome = isHomeProvider()
-
-        // Single continuous gesture (0.00 -> 0.64s): immediate glassy logo presence flowing
-        // directly into full window expansion with zero pause between materialize and morph.
-        let appear = Self.easeOutCubic(Self.clamp01(t / 0.09))
-        let liftY = Self.lerp(-10.0, 0.0, Self.easeOutCubic(Self.clamp01(t / 0.44)))
-
-        let morphU = Self.clamp01(t / 0.52)
-        let morphSmooth = Self.continuousMorph(morphU)
-        let morphSize = morphSmooth + sin(morphU * .pi) * pow(morphU, 3.0) * 0.012
-
-        // 3D logo perspective unwinds on the same unified curve from frame 0
-        let pose = 1.0 - Self.continuousMorph(Self.clamp01(t / 0.48))
-        let rotZ = pose * (10.0 * .pi / 180.0)
-        let rotY = pose * (-22.0 * .pi / 180.0)
-        let rotX = pose * (4.5 * .pi / 180.0)
-
-        // Morphing rectangle & corner radius
-        let curW = Self.lerp(logoRect.width, targetRect.width, morphSize)
-        let curH = Self.lerp(logoRect.height, targetRect.height, morphSize)
-        let curCenterX = Self.lerp(logoRect.midX, targetRect.midX, morphSmooth)
-        let curCenterY = Self.lerp(logoRect.midY, targetRect.midY, morphSmooth) + liftY
-        let curRect = NSRect(
-            x: curCenterX - curW / 2,
-            y: curCenterY - curH / 2,
-            width: curW,
-            height: curH
-        )
-        let clampedRadius = min(
-            Self.lerp(startCornerRadius, endCornerRadius, morphSmooth),
-            min(curW, curH) * 0.48
-        )
-
-        // Seamless cross-fade handoff into real hostWindow as the glass finishes landing
-        let hostReveal = Self.easeOutCubic(Self.clamp01((t - 0.40) / 0.14))
-        let overlayFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.48) / 0.16))
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-
-        // Update real Liquid Glass geometry, corner radius, and tint
-        glassView.frame = curRect
-        let localBounds = NSRect(origin: .zero, size: curRect.size)
-        interiorView.frame = localBounds
-        interiorView.layer?.cornerRadius = clampedRadius
-        if #available(macOS 26.0, *), let glass = glassView as? NSGlassEffectView {
-            glass.cornerRadius = clampedRadius
-            let tealBlend = 1.0 - morphSmooth
-            if isHome {
-                let tintAlpha = 0.74 * tealBlend
-                glass.tintColor = tintAlpha > 0.005
-                    ? NSColor(calibratedRed: 0.00, green: 0.44, blue: 0.48, alpha: tintAlpha)
-                    : nil
-            } else {
-                glass.tintColor = NSColor(
-                    calibratedRed: Self.lerp(0.00, 0.02, morphSmooth),
-                    green: Self.lerp(0.44, 0.02, morphSmooth),
-                    blue: Self.lerp(0.48, 0.03, morphSmooth),
-                    alpha: Self.lerp(0.74, 0.94, morphSmooth)
-                )
-            }
-        } else {
-            glassView.layer?.cornerRadius = clampedRadius
-            glassView.layer?.backgroundColor = isHome
-                ? NSColor(calibratedRed: 0.00, green: 0.36, blue: 0.40, alpha: 0.56 * (1.0 - morphSmooth)).cgColor
-                : NSColor(
-                    calibratedRed: 0.0,
-                    green: 0.36 * (1.0 - morphSmooth),
-                    blue: 0.40 * (1.0 - morphSmooth),
-                    alpha: Self.lerp(0.56, 0.95, morphSmooth)
-                ).cgColor
-        }
-
-        // Apply centered 3D perspective + tilt around the morphing glass center
-        stageView.layer?.transform = Self.centeredTransform(
-            around: CGPoint(x: curRect.midX, y: curRect.midY),
-            scale: 1.0,
-            rotX: rotX,
-            rotY: rotY,
-            rotZ: rotZ
-        )
-
-        // Update interior optical layers
-        tealDepthLayer.frame = localBounds
-        tealDepthLayer.cornerRadius = clampedRadius
-        tealDepthLayer.opacity = Float(1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.06) / 0.42)))
-
-        // Diagonal sheen sweeps continuously across the unfolding glass
-        let sheenT = Self.easeInOutCubic(Self.clamp01(t / 0.48))
-        let sheenShift = Self.lerp(-0.55, 0.78, sheenT)
-        sheenLayer.frame = localBounds
-        sheenLayer.cornerRadius = clampedRadius
-        sheenLayer.startPoint = CGPoint(x: max(-0.5, sheenShift - 0.35), y: 1.0)
-        sheenLayer.endPoint = CGPoint(x: min(1.5, sheenShift + 0.55), y: 0.0)
-        let sheenVis = (1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.28) / 0.24))) * appear
-        sheenLayer.opacity = Float(0.85 * sheenVis)
-
-        // Luminous cyan-turquoise bevel rim stretches to trace the window, then dissolves into native rim
-        rimGradientLayer.frame = localBounds
-        rimMaskLayer.frame = localBounds
-        let rimWidth = Self.lerp(3.0, 1.35, morphSmooth)
-        rimMaskLayer.lineWidth = rimWidth
-        let rimRect = localBounds.insetBy(dx: rimWidth * 0.5, dy: rimWidth * 0.5)
-        let rimRadius = max(0, clampedRadius - rimWidth * 0.5)
-        rimMaskLayer.path = CGPath(roundedRect: rimRect, cornerWidth: rimRadius, cornerHeight: rimRadius, transform: nil)
-        let rimFade = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.36) / 0.20))
-        rimGradientLayer.opacity = Float(0.96 * rimFade)
-
-        innerHighlightLayer.frame = localBounds
-        let innerRect = localBounds.insetBy(dx: rimWidth + 1.0, dy: rimWidth + 1.0)
-        let innerRadius = max(0, clampedRadius - rimWidth - 1.0)
-        innerHighlightLayer.path = CGPath(roundedRect: innerRect, cornerWidth: innerRadius, cornerHeight: innerRadius, transform: nil)
-        innerHighlightLayer.opacity = Float(0.70 * (1.0 - morphSmooth))
-
-        // Rounded play triangle appears immediately with the glass, then blooms & dissolves in one move
-        let playFadeOut = 1.0 - Self.easeInOutCubic(Self.clamp01((t - 0.10) / 0.24))
-        let playBloom = Self.lerp(0.92, 1.26, Self.easeOutCubic(Self.clamp01(t / 0.34)))
-        let playSize = min(logoRect.height * 0.52, logoRect.width * 0.35) * playBloom
-        playLayer.frame = localBounds
-        playLayer.path = Self.roundedPlayTrianglePath(
-            center: CGPoint(x: localBounds.midX, y: localBounds.midY),
-            size: max(8, playSize)
-        )
-        playLayer.opacity = Float(appear * playFadeOut)
-
-        // Feather-soft radial floating floor shadow strictly beneath the tilted logo; dissolves cleanly as it expands
-        let shadowW = logoRect.width * 0.90
-        let shadowH: CGFloat = 24.0
-        let shadowY = curRect.minY - shadowH - 10.0
-        shadowLayer.frame = CGRect(
-            x: curRect.midX - shadowW / 2,
-            y: shadowY,
-            width: shadowW,
-            height: shadowH
-        )
-        shadowLayer.opacity = Float(appear * pose * pose)
-
-        // Apply overlay alpha and seamlessly bring up hostWindow behind it
-        panel.alphaValue = targetAlpha * appear * overlayFade
-
-        if let host = hostWindow {
-            if t >= 0.36, !hostRevealPrepared {
-                hostRevealPrepared = true
-                onBeforeReveal()
-            }
-            if t >= 0.40 {
-                if !hostShadowRestored {
-                    hostShadowRestored = true
-                    host.hasShadow = true
-                    host.invalidateShadow()
-                }
-                host.alphaValue = max(0.001, targetAlpha * hostReveal)
-            } else {
-                host.alphaValue = 0.001
-            }
-        }
-
-        CATransaction.commit()
-    }
-
-    private static func centeredTransform(
-        around center: CGPoint,
-        scale: CGFloat,
-        rotX: CGFloat,
-        rotY: CGFloat,
-        rotZ: CGFloat
-    ) -> CATransform3D {
-        let toOrigin = CATransform3DMakeTranslation(-center.x, -center.y, 0)
-        var local = CATransform3DMakeScale(scale, scale, 1)
-        if abs(rotX) > 0.0001 {
-            local = CATransform3DConcat(local, CATransform3DMakeRotation(rotX, 1, 0, 0))
-        }
-        if abs(rotY) > 0.0001 {
-            local = CATransform3DConcat(local, CATransform3DMakeRotation(rotY, 0, 1, 0))
-        }
-        if abs(rotZ) > 0.0001 {
-            local = CATransform3DConcat(local, CATransform3DMakeRotation(rotZ, 0, 0, 1))
-        }
-        var persp = CATransform3DIdentity
-        persp.m34 = -1.0 / 880.0
-        local = CATransform3DConcat(local, persp)
-        let back = CATransform3DMakeTranslation(center.x, center.y, 0)
-        return CATransform3DConcat(CATransform3DConcat(toOrigin, local), back)
-    }
-
-    private static func roundedPlayTrianglePath(center: CGPoint, size: CGFloat) -> CGPath {
-        let h = size * 0.50
-        let w = size * 0.866
-        let leftX = center.x - w * 0.36
-        let rightX = center.x + w * 0.64
-        let pTop = CGPoint(x: leftX, y: center.y + h)
-        let pBottom = CGPoint(x: leftX, y: center.y - h)
-        let pRight = CGPoint(x: rightX, y: center.y)
-        let radius = size * 0.145
-
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: leftX, y: center.y))
-        path.addArc(tangent1End: pTop, tangent2End: pRight, radius: radius)
-        path.addArc(tangent1End: pRight, tangent2End: pBottom, radius: radius)
-        path.addArc(tangent1End: pBottom, tangent2End: pTop, radius: radius)
-        path.closeSubpath()
-        return path
-    }
-
-    private static func clamp01(_ x: Double) -> CGFloat {
-        CGFloat(min(1.0, max(0.0, x)))
-    }
-
-    private static func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
-        a + (b - a) * t
-    }
-
-    private static func easeOutCubic(_ t: CGFloat) -> CGFloat {
-        let inv = 1.0 - t
-        return 1.0 - inv * inv * inv
-    }
-
-    private static func easeInOutCubic(_ t: CGFloat) -> CGFloat {
-        t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0
-    }
-
-    /// Unified asymmetric fluid curve: moving cleanly from frame 0 with an energetic liquid sweep
-    /// and a long, silky deceleration into the exact window bounds.
-    private static func continuousMorph(_ t: CGFloat) -> CGFloat {
-        guard t > 0 else { return 0 }
-        guard t < 1 else { return 1 }
-        let a = pow(t, 1.65)
-        let b = pow(1.0 - t, 2.35)
-        return a / (a + b)
-    }
 }
 
 final class FloatModule: ExactModule {
@@ -2083,97 +730,110 @@ final class FloatModule: ExactModule {
 
     private let store: FloatStore
     private weak var hostWindow: NSWindow?
-    private weak var browser: FloatBrowserInstance?
+    fileprivate weak var mainWindow: NSWindow?
+    fileprivate weak var browser: FloatBrowserInstance?
     private var homeBackdropView: NSView?
     private var lastBackdropIsHome: Bool?
-    private var openingMorph: FloatOpeningMorphController?
-    private var openingPrepared = false
-    private var openingPlayed = false
-    private var openingHostRevealing = false
-    private var settingsWindow: FloatSettingsWindowController?
-    private var shortcutsWindow: FloatShortcutsWindowController?
-    private var hotKeyRef: EventHotKeyRef?
-    private var peekHotKeyRef: EventHotKeyRef?
-    private var peekGlobalFlagsMonitor: Any?
-    private var peekLocalFlagsMonitor: Any?
-    private var activeObserver: NSObjectProtocol?
-    private var shortcutsKeyMonitor: Any?
+    private var morphPrepared = false
+    private var morphWindowShown = false
+    private var glassReady = false
     private var pendingUrlLoad: String?
     private var cliHandled = false
     private var lastSelectSeq: String?
 
-    var mode = "home"
-    var currentUrl = ""
-    var fill: Bool
-    var onTop = true
-    var expanded = false
-    var aspectLocked = false
-    var clickThrough = false
-    var alpha: Double
-    var videoBrightness: Double
-    var videoContrast: Double
-    var peekTrigger: String
-    var peekAlpha: Double
-    var peekHold: Bool
-    var peeking = false
-    var settingsOpen = false
-    var shortcutsOpen = false
-    var webEditingText = false
-    var pendingSeek: Double?
+    // Agent sessions keep per-session transient state; live sessions share FloatHub.shared across windows.
+    private var agentMode = "home"
+    private var agentCurrentUrl = ""
+    private var agentOnTop = true
+    private var agentExpanded = false
+    private var agentAspectLocked = false
+    private var agentClickThrough = false
+    private var agentPendingSeek: Double?
 
-    var hotKeyLabel: String { store.hotKey?.label ?? "None" }
-    var peekHotKeyLabel: String { store.peekHotKey?.label ?? "None" }
-    var peekPermissionGranted: Bool { context.agent ? true : hasInputMonitoringPermission() }
+    var mode: String {
+        get { context.agent ? agentMode : FloatHub.shared.mode }
+        set { if context.agent { agentMode = newValue } else { FloatHub.shared.mode = newValue } }
+    }
+    var currentUrl: String {
+        get { context.agent ? agentCurrentUrl : FloatHub.shared.currentUrl }
+        set { if context.agent { agentCurrentUrl = newValue } else { FloatHub.shared.currentUrl = newValue } }
+    }
+    var onTop: Bool {
+        get { context.agent ? agentOnTop : FloatHub.shared.onTop }
+        set { if context.agent { agentOnTop = newValue } else { FloatHub.shared.onTop = newValue } }
+    }
+    var expanded: Bool {
+        get { context.agent ? agentExpanded : FloatHub.shared.expanded }
+        set { if context.agent { agentExpanded = newValue } else { FloatHub.shared.expanded = newValue } }
+    }
+    var aspectLocked: Bool {
+        get { context.agent ? agentAspectLocked : FloatHub.shared.aspectLocked }
+        set { if context.agent { agentAspectLocked = newValue } else { FloatHub.shared.aspectLocked = newValue } }
+    }
+    var clickThrough: Bool {
+        get { context.agent ? agentClickThrough : FloatHub.shared.clickThrough }
+        set { if context.agent { agentClickThrough = newValue } else { FloatHub.shared.clickThrough = newValue } }
+    }
+    var pendingSeek: Double? {
+        get { context.agent ? agentPendingSeek : FloatHub.shared.pendingSeek }
+        set { if context.agent { agentPendingSeek = newValue } else { FloatHub.shared.pendingSeek = newValue } }
+    }
+
+    var fill: Bool {
+        get { store.fill }
+        set { store.fill = newValue }
+    }
+    var alpha: Double {
+        get { store.alpha }
+        set { store.alpha = newValue }
+    }
+    var videoBrightness: Double {
+        get { min(2.0, max(0.5, store.videoBrightness)) }
+        set { store.videoBrightness = min(2.0, max(0.5, newValue)) }
+    }
+    var videoContrast: Double {
+        get { min(2.0, max(0.5, store.videoContrast)) }
+        set { store.videoContrast = min(2.0, max(0.5, newValue)) }
+    }
+    var hotkeyKeys: String {
+        get { store.hotkeyKeys }
+        set { store.hotkeyKeys = newValue }
+    }
+    var peekTrigger: String {
+        get { store.peekTrigger }
+        set { store.peekTrigger = newValue }
+    }
+    var peekAlpha: Double {
+        get { min(0.95, max(0.15, store.peekAlpha)) }
+        set { store.peekAlpha = min(0.95, max(0.15, newValue)) }
+    }
+    var peekHotkeyKeys: String {
+        get { store.peekHotkeyKeys }
+        set { store.peekHotkeyKeys = newValue }
+    }
+    var peekHold: Bool {
+        get { store.peekHold }
+        set { store.peekHold = newValue }
+    }
+
+    private var activeBrowser: FloatBrowserInstance? {
+        browser ?? (context.agent ? nil : FloatHub.shared.primaryBrowser)
+    }
 
     required init(context: ExactModuleContext) {
-        store = FloatStore(agent: context.agent, dataDir: context.data)
-        fill = store.fill
-        alpha = store.alpha
-        videoBrightness = min(2.0, max(0.5, store.videoBrightness))
-        videoContrast = min(2.0, max(0.5, store.videoContrast))
-        peekTrigger = store.peekTrigger
-        peekAlpha = min(0.95, max(0.15, store.peekAlpha))
-        peekHold = store.peekHold
+        store = FloatHub.shared.store(for: context)
         super.init(context: context)
         if !context.agent {
-            FloatHotKeyCenter.shared.active = self
-            FloatHotKeyCenter.shared.installIfNeeded()
-            registerHotKey()
-            installPeekTrigger()
-            activeObserver = NotificationCenter.default.addObserver(
-                forName: NSApplication.didBecomeActiveNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                guard let self, self.openingMorph == nil else { return }
-                self.installPeekTrigger()
-                self.notifyChanged()
-            }
+            FloatHub.shared.register(self)
         }
     }
 
     override func destroy() {
-        openingMorph?.cancel(restoreHost: false)
-        openingMorph = nil
         homeBackdropView?.removeFromSuperview()
         homeBackdropView = nil
         lastBackdropIsHome = nil
-        settingsWindow?.close()
-        settingsWindow = nil
-        shortcutsWindow?.close()
-        shortcutsWindow = nil
-        unregisterHotKey()
-        teardownPeekTrigger()
-        if let obs = activeObserver {
-            NotificationCenter.default.removeObserver(obs)
-            activeObserver = nil
-        }
-        if let mon = shortcutsKeyMonitor {
-            NSEvent.removeMonitor(mon)
-            shortcutsKeyMonitor = nil
-        }
-        if FloatHotKeyCenter.shared.active === self {
-            FloatHotKeyCenter.shared.active = nil
+        if !context.agent {
+            FloatHub.shared.unregister(self)
         }
     }
 
@@ -2187,107 +847,85 @@ final class FloatModule: ExactModule {
     }
 
     func notifyChanged() {
-        syncWindowBackdrop()
-        settingsWindow?.refresh()
-        shortcutsWindow?.refresh()
-        context.changed("float")
+        FloatHub.shared.broadcastChange(from: self)
     }
 
     // MARK: Window & Element Hatches
 
-    private var shouldAnimateOpening: Bool {
+    private var shouldDeferGlassForMorph: Bool {
         !context.agent
             && ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1"
             && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
-    private var effectiveTargetAlpha: CGFloat {
-        CGFloat(peeking ? min(alpha, peekAlpha) : alpha)
-    }
-
-    /// Suppresses the initial raw window flash before Exact's first draw connects window hatches.
-    fileprivate func prepareOpeningAnimation(for w: NSWindow) {
-        guard !openingPrepared, !openingPlayed, shouldAnimateOpening else { return }
-        openingPrepared = true
+    /// Runs before the main window's first paint so macOS never flashes an opaque backing rectangle
+    /// or default window shadow before the GPU WGSL morph draws its first frame.
+    fileprivate func prepareWindowForMorph(_ w: NSWindow) {
+        guard w.identifier?.rawValue == "Exact.MainWindow" else { return }
+        guard !morphPrepared, shouldDeferGlassForMorph else { return }
+        morphPrepared = true
+        mainWindow = w
         w.animationBehavior = .none
+        w.isOpaque = false
+        w.backgroundColor = .clear
         w.hasShadow = false
         w.alphaValue = 0.001
-        // Failsafe in case window(_:) never arrives
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak w] in
-            guard let self, let w, !self.openingPlayed, self.openingMorph == nil else { return }
-            w.hasShadow = true
-            w.alphaValue = self.effectiveTargetAlpha
-            w.invalidateShadow()
+        if !context.agent {
+            w.setFrameUsingName("FloatWindow")
+        }
+        // Failsafe in case GPU presentation never fires
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.showMorphWindow()
         }
     }
 
-    private func startOpeningMorph(for w: NSWindow) {
-        guard !openingPlayed, shouldAnimateOpening else { return }
-        openingPlayed = true
-        openingHostRevealing = false
-        w.animationBehavior = .none
-        w.hasShadow = false
-        w.alphaValue = 0.001
-        let morph = FloatOpeningMorphController(
-            hostWindow: w,
-            targetAlphaProvider: { [weak self] in self?.effectiveTargetAlpha ?? 1.0 },
-            isHomeProvider: { [weak self] in (self?.mode ?? "home") == "home" },
-            onBeforeReveal: { [weak self] in
-                guard let self else { return }
-                self.openingHostRevealing = true
-                self.syncWindowBackdrop()
-            },
-            onComplete: { [weak self] in
-                guard let self else { return }
-                self.openingMorph = nil
-                self.openingHostRevealing = false
-                self.syncWindowBackdrop()
-                if !self.context.agent {
-                    FloatUpdater.shared.start()
-                    self.notifyChanged()
-                }
-            }
-        )
-        openingMorph = morph
-        syncWindowBackdrop()
-        morph.start()
+    private func showMorphWindow() {
+        guard !morphWindowShown else { return }
+        morphWindowShown = true
+        guard let w = mainWindow else { return }
+        w.alphaValue = CGFloat(alpha)
     }
 
     override func window(_ exactWindow: ExactWindow) {
         guard let w = exactWindow.window else { return }
         hostWindow = w
-        // Only apply initial window chrome and restore saved frame once — never on resize callbacks!
-        if exactWindow.isNew {
-            let willMorph = !openingPlayed && shouldAnimateOpening
-            configureChromelessWindow(w, deferVisibility: willMorph)
-            installShortcutsKeyMonitor()
-            if !cliHandled, !context.agent, ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1" {
-                cliHandled = true
-                if let arg = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
-                    load(arg)
+        let isMain = w.identifier?.rawValue == "Exact.MainWindow"
+        if isMain {
+            mainWindow = w
+            // Only apply initial window chrome and restore saved frame once — never on resize callbacks!
+            if exactWindow.isNew {
+                let deferGlass = shouldDeferGlassForMorph
+                glassReady = !deferGlass
+                configureChromelessWindow(w, deferGlass: deferGlass)
+                if !cliHandled, !context.agent, ProcessInfo.processInfo.environment["EXACT_SMOKE"] != "1" {
+                    cliHandled = true
+                    if let arg = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
+                        load(arg)
+                    }
                 }
-            }
-            if willMorph {
-                startOpeningMorph(for: w)
-            } else {
-                if openingPrepared && !openingPlayed {
-                    w.hasShadow = true
-                    w.alphaValue = effectiveTargetAlpha
-                    w.invalidateShadow()
-                }
-                if !context.agent {
+                if deferGlass {
+                    // Failsafe in case shader never presents on an unsupported GPU; normally triggered by revealGlass at t=380ms.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                        self?.showMorphWindow()
+                        self?.revealHomeGlass()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                        guard let self, !self.context.agent else { return }
+                        FloatUpdater.shared.start()
+                        self.notifyChanged()
+                    }
+                } else if !context.agent {
                     FloatUpdater.shared.start()
                 }
+            } else {
+                syncWindowBackdrop()
             }
-        } else {
-            syncWindowBackdrop()
+        } else if exactWindow.isNew {
+            configureSecondaryWindow(w)
         }
     }
 
-    override func windowEnded(_ exactWindow: ExactWindow) {
-        openingMorph?.cancel(restoreHost: false)
-        openingMorph = nil
-    }
+    override func windowEnded(_ exactWindow: ExactWindow) {}
 
     override func element(_ element: ExactElement) {
         guard element.hatch == .urlInput else { return }
@@ -2307,24 +945,50 @@ final class FloatModule: ExactModule {
         }
     }
 
-    private func configureChromelessWindow(_ w: NSWindow, deferVisibility: Bool = false) {
+    private func configureChromelessWindow(_ w: NSWindow, deferGlass: Bool = false) {
         if !w.styleMask.contains(.fullSizeContentView) { w.styleMask.insert(.fullSizeContentView) }
         w.titlebarAppearsTransparent = true
         w.titleVisibility = .hidden
         if #available(macOS 11.0, *) { w.titlebarSeparatorStyle = .none }
         [.closeButton, .miniaturizeButton, .zoomButton].forEach { w.standardWindowButton($0)?.isHidden = true }
         w.appearance = NSAppearance(named: .darkAqua)
-        w.hasShadow = !deferVisibility
+        w.animationBehavior = deferGlass ? .none : .default
+        w.hasShadow = !deferGlass
         w.level = onTop ? .floating : .normal
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         w.minSize = NSSize(width: 160, height: 90)
-        w.alphaValue = deferVisibility ? 0.001 : CGFloat(alpha)
+        w.alphaValue = (deferGlass && !morphWindowShown) ? 0.001 : CGFloat(alpha)
         w.ignoresMouseEvents = clickThrough
         syncWindowBackdrop()
         if !context.agent {
             // Preserve existing Float users' saved window position & size
             w.setFrameUsingName("FloatWindow")
             w.setFrameAutosaveName("FloatWindow")
+        }
+    }
+
+    /// Secondary windows (Settings window and Shortcuts HUD RoutePanel) stay dark-aqua and float
+    /// cleanly above Float's always-on-top main window with a balanced first-open size.
+    private func configureSecondaryWindow(_ w: NSWindow) {
+        w.appearance = NSAppearance(named: .darkAqua)
+        let isPanel = w is NSPanel
+        if !isPanel {
+            w.level = .floating
+            w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        }
+        guard !context.agent else { return }
+        let savedKey = w.frameAutosaveName.isEmpty ? nil : "NSWindow Frame \(w.frameAutosaveName)"
+        let hasSavedFrame = savedKey.map { UserDefaults.standard.object(forKey: $0) != nil } ?? false
+        if !hasSavedFrame {
+            let targetSize = isPanel ? NSSize(width: 760, height: 320) : NSSize(width: 480, height: 520)
+            w.setContentSize(targetSize)
+            if let vis = (FloatHub.shared.primaryWindow?.screen ?? NSScreen.main)?.visibleFrame {
+                let s = w.frame.size
+                w.setFrameOrigin(NSPoint(
+                    x: (vis.midX - s.width / 2).rounded(),
+                    y: (vis.midY - s.height / 2).rounded()
+                ))
+            }
         }
     }
 
@@ -2350,13 +1014,12 @@ final class FloatModule: ExactModule {
         homeBackdropView = backdrop
     }
 
-    private func syncWindowBackdrop() {
+    fileprivate func syncWindowBackdrop() {
         let isHome = (mode == "home")
         browser?.web.isHidden = isHome
-        guard let w = hostWindow else { return }
+        guard let w = mainWindow else { return }
         installHomeBackdrop(in: w)
-        let suppressBackdrop = openingMorph != nil && !openingHostRevealing
-        homeBackdropView?.isHidden = !isHome || suppressBackdrop
+        homeBackdropView?.isHidden = !isHome || !glassReady
         if let content = w.contentView {
             for sub in content.subviews {
                 if let scroll = sub as? NSScrollView {
@@ -2364,6 +1027,8 @@ final class FloatModule: ExactModule {
                         scroll.drawsBackground = !isHome
                     }
                     scroll.backgroundColor = isHome ? .clear : .black
+                    if scroll.hasVerticalScroller { scroll.hasVerticalScroller = false }
+                    if scroll.hasHorizontalScroller { scroll.hasHorizontalScroller = false }
                 }
             }
         }
@@ -2380,25 +1045,18 @@ final class FloatModule: ExactModule {
         }
     }
 
-    private func installShortcutsKeyMonitor() {
-        guard shortcutsKeyMonitor == nil else { return }
-        shortcutsKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else { return event }
-            let isHost = self.hostWindow != nil && event.window === self.hostWindow
-            let isShortcuts = self.shortcutsWindow?.window != nil && event.window === self.shortcutsWindow?.window
-            guard isHost || isShortcuts else { return event }
-            let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
-            if self.shortcutsOpen, event.keyCode == UInt16(kVK_Escape), mods.isEmpty {
-                self.setShortcutsOpen(false)
-                return nil
-            }
-            if event.characters == "?", mods.intersection([.command, .control, .option]).isEmpty {
-                if isHost, let win = self.hostWindow, win.firstResponder is NSText { return event }
-                if isHost, self.mode == "web", self.webEditingText { return event }
-                self.setShortcutsOpen(!self.shortcutsOpen)
-                return nil
-            }
-            return event
+    private func revealHomeGlass() {
+        showMorphWindow()
+        guard !glassReady else { return }
+        glassReady = true
+        guard let w = mainWindow else { return }
+        homeBackdropView?.alphaValue = 0
+        syncWindowBackdrop()
+        w.hasShadow = true
+        w.invalidateShadow()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            self.homeBackdropView?.animator().alphaValue = 1
         }
     }
 
@@ -2419,10 +1077,9 @@ final class FloatModule: ExactModule {
         case "removeSite":
             store.removeSite(arg)
             notifyChanged()
-        case "openClipboard": openClipboard()
         case "reloadPage": reloadPage()
-        case "back": browser?.web.goBack()
-        case "forward": browser?.web.goForward()
+        case "back": activeBrowser?.web.goBack()
+        case "forward": activeBrowser?.web.goForward()
         case "toggleFill": toggleFill()
         case "toggleExpand": toggleExpand()
         case "toggleAspectLock": setAspectLocked(!aspectLocked)
@@ -2433,20 +1090,23 @@ final class FloatModule: ExactModule {
         case "fadeIn": fadeIn()
         case "playPause": playPause()
         case "dock": dock(Int(arg) ?? 0)
-        case "openSettings": openSettings()
-        case "closeSettings": closeSettings()
-        case "toggleShortcuts": setShortcutsOpen(!shortcutsOpen)
-        case "closeShortcuts": setShortcutsOpen(false)
-        case "recordHotKey": recordHotKey()
+        case "setHotkeyKeys":
+            hotkeyKeys = arg
+            notifyChanged()
         case "setPeekTrigger": setPeekTrigger(arg)
         case "setPeekAlpha": setPeekAlpha(Double(arg) ?? peekAlpha)
-        case "setPeekHold": setPeekHold(arg == "true")
-        case "setPeeking": setPeeking(arg == "true")
+        case "setPeekHotkeyKeys":
+            peekHotkeyKeys = arg
+            notifyChanged()
+        case "setPeekHold":
+            peekHold = (arg == "true")
+            notifyChanged()
         case "setVideoBrightness": setVideoBrightness(Double(arg) ?? videoBrightness)
         case "setVideoContrast": setVideoContrast(Double(arg) ?? videoContrast)
         case "resetVideoFilters": resetVideoFilters()
-        case "recordPeekHotKey": recordPeekHotKey()
         case "requestPeekPermission": requestPeekPermission()
+        case "showMorphWindow": showMorphWindow()
+        case "revealGlass": revealHomeGlass()
         case "checkForUpdates":
             if !context.agent { FloatUpdater.shared.checkForUpdates() }
         case "focusWeb": focusWeb()
@@ -2466,7 +1126,7 @@ final class FloatModule: ExactModule {
             return
         }
         DispatchQueue.main.async { [weak self] in
-            guard let self, let web = self.browser?.web else {
+            guard let self, let web = self.activeBrowser?.web else {
                 reply.send(["ok": false, "ratio": 0.0])
                 return
             }
@@ -2523,15 +1183,13 @@ final class FloatModule: ExactModule {
             "alpha": (alpha * 100).rounded() / 100,
             "videoBrightness": (videoBrightness * 100).rounded() / 100,
             "videoContrast": (videoContrast * 100).rounded() / 100,
-            "hotkeyLabel": store.hotKey?.label ?? "",
+            "hotkeyKeys": hotkeyKeys,
+            "hotkeyLabel": floatFormatChordLabel(hotkeyKeys),
             "peekTrigger": peekTrigger,
             "peekAlpha": (peekAlpha * 100).rounded() / 100,
-            "peekHotkeyLabel": store.peekHotKey?.label ?? "",
+            "peekHotkeyKeys": peekHotkeyKeys,
+            "peekHotkeyLabel": floatFormatChordLabel(peekHotkeyKeys),
             "peekHold": peekHold,
-            "peeking": peeking,
-            "settingsOpen": settingsOpen,
-            "shortcutsOpen": shortcutsOpen,
-            "peekPermissionGranted": peekPermissionGranted,
             "canCheckUpdates": context.agent ? false : FloatUpdater.shared.canCheckForUpdates,
             "nativeBackdrop": true,
             "browserFrame": "",
@@ -2569,10 +1227,10 @@ final class FloatModule: ExactModule {
             : url.absoluteString
         mode = "web"
         currentUrl = normalized
-        if let browser {
+        if let targetBrowser = activeBrowser {
             if !context.agent {
-                browser.loadRequest(url)
-                hostWindow?.makeFirstResponder(browser.web)
+                targetBrowser.loadRequest(url)
+                (mainWindow ?? FloatHub.shared.primaryWindow)?.makeFirstResponder(targetBrowser.web)
             }
         } else {
             pendingUrlLoad = url.absoluteString
@@ -2581,14 +1239,15 @@ final class FloatModule: ExactModule {
     }
 
     func focusWeb() {
-        if let browser { hostWindow?.makeFirstResponder(browser.web) }
+        if let targetBrowser = activeBrowser {
+            (mainWindow ?? FloatHub.shared.primaryWindow)?.makeFirstResponder(targetBrowser.web)
+        }
     }
 
     func showHome() {
         mode = "home"
-        webEditingText = false
         pendingSeek = nil
-        if !context.agent { browser?.loadBlank() }
+        if !context.agent { activeBrowser?.loadBlank() }
         notifyChanged()
     }
 
@@ -2599,14 +1258,8 @@ final class FloatModule: ExactModule {
         pendingSeek = r.time > 0 ? r.time : nil
     }
 
-    func openClipboard() {
-        if let str = NSPasteboard.general.string(forType: .string) {
-            load(str)
-        }
-    }
-
     func reloadPage() {
-        if mode == "web", let web = browser?.web, web.url?.scheme?.hasPrefix("http") == true {
+        if mode == "web", let web = activeBrowser?.web, web.url?.scheme?.hasPrefix("http") == true {
             web.reload()
         } else {
             showHome()
@@ -2615,8 +1268,7 @@ final class FloatModule: ExactModule {
 
     func toggleFill() {
         fill.toggle()
-        store.fill = fill
-        browser?.applyFill(fill, brightness: videoBrightness, contrast: videoContrast)
+        activeBrowser?.applyFill(fill, brightness: videoBrightness, contrast: videoContrast)
         notifyChanged()
     }
 
@@ -2624,8 +1276,7 @@ final class FloatModule: ExactModule {
         let clamped = (min(2.0, max(0.5, value)) * 100).rounded() / 100
         guard abs(clamped - videoBrightness) >= 0.005 else { return }
         videoBrightness = clamped
-        store.videoBrightness = clamped
-        browser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        activeBrowser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
         notifyChanged()
     }
 
@@ -2633,17 +1284,14 @@ final class FloatModule: ExactModule {
         let clamped = (min(2.0, max(0.5, value)) * 100).rounded() / 100
         guard abs(clamped - videoContrast) >= 0.005 else { return }
         videoContrast = clamped
-        store.videoContrast = clamped
-        browser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        activeBrowser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
         notifyChanged()
     }
 
     func resetVideoFilters() {
         videoBrightness = 1.0
         videoContrast = 1.0
-        store.videoBrightness = 1.0
-        store.videoContrast = 1.0
-        browser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
+        activeBrowser?.applyVideoFilter(fill: fill, brightness: videoBrightness, contrast: videoContrast)
         notifyChanged()
     }
 
@@ -2672,223 +1320,38 @@ final class FloatModule: ExactModule {
         }
     }
 
-    /// Used by global Quick Fade (`peeking`), which still runs via Carbon/NSEvent when Float is inactive.
-    private func applyEffectiveAlpha(animated: Bool = true) {
-        guard let window = hostWindow else { return }
-        if openingMorph != nil { return }
-        let target = effectiveTargetAlpha
-        if !animated || context.agent || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            window.alphaValue = target
-        } else {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.16
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                window.animator().alphaValue = target
-            }
-        }
-    }
-
     func setAlpha(_ value: Double) {
         alpha = min(1.0, max(0.15, value))
-        store.alpha = alpha
         notifyChanged()
     }
 
     func fadeOut() { setAlpha(alpha - 0.1) }
     func fadeIn() { setAlpha(alpha + 0.1) }
 
-    func openSettings() {
-        setShortcutsOpen(false)
-        settingsOpen = true
-        if !context.agent {
-            if settingsWindow == nil {
-                settingsWindow = FloatSettingsWindowController(module: self)
-            }
-            settingsWindow?.show(relativeTo: hostWindow)
-        }
-        notifyChanged()
-    }
-
-    func setShortcutsOpen(_ open: Bool) {
-        guard shortcutsOpen != open else { return }
-        shortcutsOpen = open
-        if !context.agent {
-            if open {
-                if shortcutsWindow == nil {
-                    shortcutsWindow = FloatShortcutsWindowController(module: self)
-                }
-                shortcutsWindow?.show(relativeTo: hostWindow)
-            } else {
-                shortcutsWindow?.hideAnimated()
-            }
-        }
-        notifyChanged()
-    }
-
-    func shortcutsWindowDidClose() {
-        guard shortcutsOpen else { return }
-        shortcutsOpen = false
-        notifyChanged()
-    }
-
-    func closeSettings() {
-        settingsOpen = false
-        if !context.agent {
-            settingsWindow?.close()
-        }
-        notifyChanged()
-    }
-
-    func settingsWindowDidClose() {
-        guard settingsOpen else { return }
-        settingsOpen = false
-        notifyChanged()
-    }
-
-    func setPeeking(_ active: Bool) {
-        guard peeking != active else { return }
-        peeking = active
-        applyEffectiveAlpha()
-        notifyChanged()
-    }
-
     func setPeekTrigger(_ trigger: String) {
         let valid = ["rightCommand", "rightOption", "hotkey", "none"]
         guard valid.contains(trigger) else { return }
         peekTrigger = trigger
-        store.peekTrigger = trigger
-        if peeking {
-            peeking = false
-            applyEffectiveAlpha()
-        }
-        if !context.agent {
-            installPeekTrigger()
-        }
         notifyChanged()
     }
 
     func setPeekAlpha(_ value: Double) {
-        let clamped = (min(0.95, max(0.15, value)) * 100).rounded() / 100
-        peekAlpha = clamped
-        store.peekAlpha = clamped
-        if peeking {
-            applyEffectiveAlpha()
-        }
+        peekAlpha = (min(0.95, max(0.15, value)) * 100).rounded() / 100
         notifyChanged()
-    }
-
-    func setPeekHold(_ hold: Bool) {
-        peekHold = hold
-        store.peekHold = hold
-        if peeking {
-            peeking = false
-            applyEffectiveAlpha()
-        }
-        notifyChanged()
-    }
-
-    func peekHotKeyPressed() {
-        guard peekTrigger == "hotkey" else { return }
-        if peekHold {
-            setPeeking(true)
-        } else {
-            setPeeking(!peeking)
-        }
-    }
-
-    func peekHotKeyReleased() {
-        guard peekTrigger == "hotkey", peekHold else { return }
-        setPeeking(false)
-    }
-
-    private func hasInputMonitoringPermission() -> Bool {
-        CGPreflightListenEventAccess() || AXIsProcessTrusted()
     }
 
     func requestPeekPermission() {
         guard !context.agent else { return }
-        _ = CGRequestListenEventAccess()
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
         notifyChanged()
     }
 
-    private func teardownPeekTrigger() {
-        if let r = peekHotKeyRef { UnregisterEventHotKey(r) }
-        peekHotKeyRef = nil
-        if let m = peekGlobalFlagsMonitor {
-            NSEvent.removeMonitor(m)
-            peekGlobalFlagsMonitor = nil
-        }
-        if let m = peekLocalFlagsMonitor {
-            NSEvent.removeMonitor(m)
-            peekLocalFlagsMonitor = nil
-        }
-    }
-
-    private func installPeekTrigger() {
-        teardownPeekTrigger()
-        switch peekTrigger {
-        case "rightCommand", "rightOption":
-            let mask: UInt = peekTrigger == "rightCommand" ? floatRightCommandMask : floatRightOptionMask
-            peekGlobalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-                let held = (event.modifierFlags.rawValue & mask) != 0
-                DispatchQueue.main.async { self?.setPeeking(held) }
-            }
-            peekLocalFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-                let held = (event.modifierFlags.rawValue & mask) != 0
-                self?.setPeeking(held)
-                return event
-            }
-        case "hotkey":
-            guard let k = store.peekHotKey else { return }
-            let st = RegisterEventHotKey(
-                k.code, k.mods,
-                EventHotKeyID(signature: OSType(0x464C5454), id: 2),
-                GetApplicationEventTarget(), 0, &peekHotKeyRef
-            )
-            if st != noErr, !context.agent {
-                let a = NSAlert()
-                a.messageText = "\(k.label) is taken by another app"
-                a.informativeText = "Pick another Quick Fade shortcut in Float › Settings…"
-                a.runModal()
-            }
-        default:
-            break
-        }
-    }
-
-    func recordPeekHotKey() {
-        guard !context.agent else { return }
-        teardownPeekTrigger()
-        let a = NSAlert()
-        a.messageText = "Press the new quick-fade shortcut"
-        a.informativeText = "Current: \(store.peekHotKey?.label ?? "None"). Use ⌘, ⌃ or ⌥. ⌫ clears, Esc cancels."
-        a.addButton(withTitle: "Cancel")
-        let mon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self else { return nil }
-            switch Int(e.keyCode) {
-            case kVK_Escape:
-                NSApp.stopModal()
-            case kVK_Delete where e.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty:
-                self.store.peekHotKey = nil
-                NSApp.stopModal()
-            default:
-                guard let k = FloatHotKey(e) else { NSSound.beep(); return nil }
-                self.store.peekHotKey = k
-                NSApp.stopModal()
-            }
-            return nil
-        }
-        a.runModal()
-        if let mon { NSEvent.removeMonitor(mon) }
-        installPeekTrigger()
-        notifyChanged()
-    }
-
     func playPause() {
-        browser?.web.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v){ v.paused ? v.play() : v.pause(); } })()")
+        activeBrowser?.web.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v){ v.paused ? v.play() : v.pause(); } })()")
     }
 
     // tag 0–2: top left/center/right, 3–5: bottom left/center/right
@@ -2898,69 +1361,6 @@ final class FloatModule: ExactModule {
             expanded = false
             notifyChanged()
         }
-    }
-
-    func toggleShown() {
-        guard let window = hostWindow else { return }
-        if NSApp.isHidden || !window.isVisible {
-            NSApp.unhide(nil)
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-        } else {
-            NSApp.hide(nil)
-        }
-    }
-
-    // MARK: Global Hotkey
-
-    private func unregisterHotKey() {
-        if let r = hotKeyRef { UnregisterEventHotKey(r) }
-        hotKeyRef = nil
-    }
-
-    private func registerHotKey() {
-        unregisterHotKey()
-        guard let k = store.hotKey else { return }
-        let st = RegisterEventHotKey(
-            k.code, k.mods,
-            EventHotKeyID(signature: OSType(0x464C5454), id: 1),
-            GetApplicationEventTarget(), 0, &hotKeyRef
-        )
-        if st != noErr, !context.agent {
-            let a = NSAlert()
-            a.messageText = "\(k.label) is taken by another app"
-            a.informativeText = "Pick another in Float › Show/Hide Hotkey…"
-            a.runModal()
-        }
-    }
-
-    // Next ⌘/⌃/⌥ combo becomes the hotkey; ⌫ clears it, Esc cancels
-    func recordHotKey() {
-        guard !context.agent else { return }
-        unregisterHotKey()
-        let a = NSAlert()
-        a.messageText = "Press the new show/hide shortcut"
-        a.informativeText = "Current: \(store.hotKey?.label ?? "None"). Use ⌘, ⌃ or ⌥. ⌫ clears, Esc cancels."
-        a.addButton(withTitle: "Cancel")
-        let mon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self else { return nil }
-            switch Int(e.keyCode) {
-            case kVK_Escape:
-                NSApp.stopModal()
-            case kVK_Delete where e.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty:
-                self.store.hotKey = nil
-                NSApp.stopModal()
-            default:
-                guard let k = FloatHotKey(e) else { NSSound.beep(); return nil }
-                self.store.hotKey = k
-                NSApp.stopModal()
-            }
-            return nil
-        }
-        a.runModal()
-        if let mon { NSEvent.removeMonitor(mon) }
-        registerHotKey()
-        notifyChanged()
     }
 
     // MARK: Playback Recording

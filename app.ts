@@ -1,4 +1,5 @@
 import type { Answer, Result, Sources, Storage } from './app.contract.d.ts';
+import { readText } from '@exact/clipboard';
 
 export const appId = 'com.sethwebster.float';
 export const grants = [
@@ -7,6 +8,8 @@ export const grants = [
   'fs.read app:/data/linux-bridge.txt',
   'net.fetch http://127.0.0.1:17420',
   'device.window-management',
+  'clipboard.read',
+  'device.global-shortcuts',
 ].join('\n');
 
 type FloatState = Result<'loadFloatState'>;
@@ -38,14 +41,11 @@ interface PersistedFallback {
   alpha: number;
   videoBrightness: number;
   videoContrast: number;
-  hotkeyLabel: string;
+  hotkeyKeys: string;
   peekTrigger: string;
   peekAlpha: number;
-  peekHotkeyLabel: string;
+  peekHotkeyKeys: string;
   peekHold: boolean;
-  peeking: boolean;
-  settingsOpen: boolean;
-  shortcutsOpen: boolean;
   lastDock: number;
   resume: { url: string; title: string; time: number; duration: number } | null;
   sites: { host: string; url: string; icon: string; last: number; count: number }[];
@@ -64,18 +64,40 @@ const DEFAULT_FALLBACK: PersistedFallback = {
   alpha: 1,
   videoBrightness: 1,
   videoContrast: 1,
-  hotkeyLabel: '⌃⌥⌘F',
+  hotkeyKeys: 'Control+Alt+Meta+F',
   peekTrigger: 'rightCommand',
   peekAlpha: 0.5,
-  peekHotkeyLabel: '⌃⌥⌘D',
+  peekHotkeyKeys: 'Control+Alt+Meta+D',
   peekHold: true,
-  peeking: false,
-  settingsOpen: false,
-  shortcutsOpen: false,
   lastDock: -1,
   resume: null,
   sites: [],
 };
+
+function formatChordLabel(keys: string): string {
+  if (!keys) return 'None';
+  if (keys === 'MetaRight') return 'Right ⌘';
+  if (keys === 'AltRight') return 'Right ⌥';
+  const parts = keys.split('+').filter(Boolean);
+  const key = parts.pop() ?? '';
+  const mods = new Set(parts);
+  const named: Record<string, string> = {
+    Space: 'Space',
+    Enter: '↩',
+    Tab: '⇥',
+    ArrowLeft: '←',
+    ArrowRight: '→',
+    ArrowUp: '↑',
+    ArrowDown: '↓',
+  };
+  return (
+    (mods.has('Control') ? '⌃' : '') +
+    (mods.has('Alt') ? '⌥' : '') +
+    (mods.has('Shift') ? '⇧' : '') +
+    (mods.has('Meta') ? '⌘' : '') +
+    (named[key] ?? (key.length === 1 ? key.toUpperCase() : key))
+  );
+}
 
 function siteName(host: string): string {
   const skip = new Set(['www', 'm', 'watch', 'play', 'app']);
@@ -210,15 +232,13 @@ function toFloatState(p: PersistedFallback): FloatState {
     alpha: p.alpha,
     videoBrightness: p.videoBrightness,
     videoContrast: p.videoContrast,
-    hotkeyLabel: p.hotkeyLabel,
+    hotkeyKeys: p.hotkeyKeys,
+    hotkeyLabel: formatChordLabel(p.hotkeyKeys),
     peekTrigger: p.peekTrigger,
     peekAlpha: p.peekAlpha,
-    peekHotkeyLabel: p.peekHotkeyLabel,
+    peekHotkeyKeys: p.peekHotkeyKeys,
+    peekHotkeyLabel: formatChordLabel(p.peekHotkeyKeys),
     peekHold: p.peekHold,
-    peeking: p.peeking,
-    settingsOpen: p.settingsOpen,
-    shortcutsOpen: p.shortcutsOpen,
-    peekPermissionGranted: true,
     canCheckUpdates: false,
     nativeBackdrop: false,
     browserFrame: '',
@@ -306,10 +326,12 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
     case 'fadeIn':
       data.alpha = Math.round(Math.min(1, data.alpha + 0.1) * 100) / 100;
       break;
+    case 'setHotkeyKeys':
+      data.hotkeyKeys = arg;
+      break;
     case 'setPeekTrigger':
       if (['rightCommand', 'rightOption', 'hotkey', 'none'].includes(arg)) {
         data.peekTrigger = arg;
-        data.peeking = false;
       }
       break;
     case 'setPeekAlpha': {
@@ -319,12 +341,11 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       }
       break;
     }
+    case 'setPeekHotkeyKeys':
+      data.peekHotkeyKeys = arg;
+      break;
     case 'setPeekHold':
       data.peekHold = arg === 'true';
-      data.peeking = false;
-      break;
-    case 'setPeeking':
-      data.peeking = arg === 'true';
       break;
     case 'setVideoBrightness': {
       const n = Number(arg);
@@ -343,18 +364,6 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
     case 'resetVideoFilters':
       data.videoBrightness = 1;
       data.videoContrast = 1;
-      break;
-    case 'openSettings':
-      data.settingsOpen = true;
-      break;
-    case 'closeSettings':
-      data.settingsOpen = false;
-      break;
-    case 'toggleShortcuts':
-      data.shortcutsOpen = !data.shortcutsOpen;
-      break;
-    case 'closeShortcuts':
-      data.shortcutsOpen = false;
       break;
     case 'back':
       if (data.historyIndex > 0) {
@@ -435,7 +444,15 @@ const sources: Sources = {
     if (bridge) {
       try {
         const res = await fetch(`${bridge}/state`);
-        if (res.ok) return (await res.json()) as FloatState;
+        if (res.ok) {
+          const raw = (await res.json()) as Record<string, unknown>;
+          return {
+            ...toFloatState(DEFAULT_FALLBACK),
+            ...raw,
+            hotkeyKeys: typeof raw.hotkeyKeys === 'string' ? raw.hotkeyKeys : DEFAULT_FALLBACK.hotkeyKeys,
+            peekHotkeyKeys: typeof raw.peekHotkeyKeys === 'string' ? raw.peekHotkeyKeys : DEFAULT_FALLBACK.peekHotkeyKeys,
+          } as FloatState;
+        }
       } catch {
         // Bridge unavailable; fall back to local store.
       }
@@ -464,6 +481,50 @@ const sources: Sources = {
       }
     }
     return runFallbackCommand(op, arg, storage);
+  },
+  readClipboardUrl: async (_args, _store, storage, native) => {
+    let text = '';
+    try {
+      text = (await readText()).trim();
+    } catch {
+      // Linux host does not support @exact/clipboard readText(); fall back to bridge wl-paste.
+      const bridge = await readBridgeUrl(storage);
+      if (bridge) {
+        try {
+          const res = await fetch(`${bridge}/cmd`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ op: 'openClipboard', arg: '' }),
+          });
+          if (res.ok) return (await res.json()) as Result<'readClipboardUrl'>;
+        } catch {
+          // Bridge unavailable.
+        }
+      }
+      return { ok: false };
+    }
+    if (!text) return { ok: false };
+    if (native?.available) {
+      try {
+        return native.call({ op: 'load', arg: text }) as Result<'readClipboardUrl'>;
+      } catch {
+        // Fall through on web without native call.
+      }
+    }
+    const bridge = await readBridgeUrl(storage);
+    if (bridge) {
+      try {
+        const res = await fetch(`${bridge}/cmd`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ op: 'load', arg: text }),
+        });
+        if (res.ok) return (await res.json()) as Result<'readClipboardUrl'>;
+      } catch {
+        // Bridge unavailable.
+      }
+    }
+    return runFallbackCommand('load', text, storage);
   },
   queryVideoAspect: async (_args, _store, _storage, native) => {
     if (native?.available) {

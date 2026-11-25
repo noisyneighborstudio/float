@@ -111,17 +111,11 @@ test "incoming protocol_handlers URL loads the page and returns route to root"
   clock data
   expect state st.mode == "home"
 
-test "settings configures global quick-fade trigger and opacity and persists across reload"
+test "settings route configures global quick-fade trigger and opacity and persists across reload"
   clock data
-  expect state st.settingsOpen == false
   expect state st.peekTrigger == "rightCommand"
   expect state st.peekAlpha == 0.5
   expect state st.peekHold == true
-
-  tap "cmd-settings"
-  clock data
-  expect state st.settingsOpen == true
-  expect tree missing "settings-card"
 
   tap "cmd-peek-25"
   clock data
@@ -139,29 +133,26 @@ test "settings configures global quick-fade trigger and opacity and persists acr
   clock data
   expect state st.peekHold == false
 
-  tap "cmd-settings-close"
-  clock data
-  expect state st.settingsOpen == false
-
   reload
   clock data
   expect state st.peekTrigger == "hotkey"
   expect state st.peekAlpha == 0.3
   expect state st.peekHold == false
 
-test "glassy keyboard shortcuts display opens as a separate window and closes cleanly"
+test "settings route renders native Contract controls"
+  at "/settings"
   clock data
-  expect state st.shortcutsOpen == false
-  expect tree missing "shortcuts-panel"
+  expect tree has "settings-view"
+  expect tree has "settings-brightness-slider"
+  expect tree has "settings-contrast-slider"
+  expect tree has "settings-peek-slider"
 
-  tap "cmd-shortcuts"
+test "shortcuts route renders native Contract HUD with live global shortcuts"
+  at "/shortcuts"
   clock data
-  expect state st.shortcutsOpen == true
-  expect tree missing "shortcuts-panel"
-
-  tap "cmd-shortcuts-close"
-  clock data
-  expect state st.shortcutsOpen == false
+  expect tree has "shortcuts-view"
+  expect text "hud-show-hide-key" == "⌃⌥⌘F"
+  expect text "hud-peek-key" == "Right ⌘"
 
 test "video brightness and contrast filters persist across reload and reset cleanly"
   clock data
