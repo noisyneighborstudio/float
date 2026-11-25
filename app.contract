@@ -309,7 +309,7 @@ component Float
   task onRestore when isMainWindow and page.restores > 0 key=page.restores
     after(1, clearWindowHidden)
 
-  task onBrowserTick when isMainWindow
+  task onBrowserTick when isMainWindow and not isHome and not st.nativeBackdrop
     every(120, pollBrowserFrame)
 
   action pollBrowserFrame
