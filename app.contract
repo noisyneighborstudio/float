@@ -41,6 +41,10 @@ shape FloatState
   alpha: number
   videoBrightness: number
   videoContrast: number
+  revealStyle: string
+  openStyle: string
+  preloadedHost: string
+  webContentReady: bool
   hotkeyKeys: string
   hotkeyLabel: string
   peekTrigger: string
@@ -75,8 +79,11 @@ fn fmtTime(sec: number): string = (
   : `${floor(sec / 60)}:${pad2(floor(sec) - floor(sec / 60) * 60)}`
 )
 
-fn tileX(idx: number, cols: number): number = (idx - floor(idx / cols) * cols) * 140
-fn tileY(idx: number, cols: number): number = floor(idx / cols) * 92
+fn tileCol(idx: number, cols: number): number = idx - floor(idx / cols) * cols
+fn tileRow(idx: number, cols: number): number = floor(idx / cols)
+fn tileX(idx: number, cols: number): number = tileCol(idx, cols) * 140
+fn tileY(idx: number, cols: number): number = tileRow(idx, cols) * 92
+fn tileWaveDelayMs(idx: number, cols: number, hasRes: bool): number = (hasRes ? 60 : 0) + min(tileCol(idx, cols) + tileRow(idx, cols), 7) * 42
 
 style TileButton
   position="relative"
@@ -230,6 +237,21 @@ component Float
   state morphActive = true
   state morphShown = false
   state morphRevealing = false
+  state fxKind = 0
+  state fxSeq = 0
+  state fxSlot = 0
+  state fxOriginCx = 320
+  state fxOriginCy = 180
+  state fxOriginW = 128
+  state fxOriginH = 80
+  state fxOriginR = 12
+  state fxStartMs = 0
+  state fxReleaseAt = -1
+  state pendingOpenKind = ""
+  state pendingOpenUrl = ""
+  state openVeilCovered = false
+  state hoveredPreloadUrl = ""
+  state homeItemsShown = false
   state recordingTarget = ""
   state recordingNote = ""
   state pendingHotKeyTarget = ""
@@ -239,7 +261,7 @@ component Float
   resource vp = exactViewport() as shape Viewport
   resource morphFx = exactSurface("shader") as shape ShaderState
   resource screens = getScreenDetails() as shape ScreenDetails else empty()
-  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, videoContrast=1, hotkeyKeys="Control+Alt+Meta+F", hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyKeys="Control+Alt+Meta+D", peekHotkeyLabel="⌃⌥⌘D", peekHold=true)
+  resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, videoContrast=1, revealStyle="wave", openStyle="lens", webContentReady=true, hotkeyKeys="Control+Alt+Meta+F", hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyKeys="Control+Alt+Meta+D", peekHotkeyLabel="⌃⌥⌘D", peekHold=true)
   resource shortcutStatus = globalShortcutStatus() as shape GlobalShortcutStatus else empty()
 
   derive isMainWindow = page.name == "main"
@@ -290,6 +312,12 @@ component Float
   derive hotkeyMenuTitle = `Show/Hide Hotkey: ${showHideHudKey}…`
   derive isShortcutsPanel = page.name == "shortcuts"
   derive showOpeningMorph = isMainWindow and morphActive and not vp.prefersReducedMotion and morphFx.error == ""
+  derive useGlassFx = isMainWindow and not vp.prefersReducedMotion and morphFx.error == ""
+  derive resumeEstH = st.resumeDuration > 0 ? 88 : 78
+  derive gridTopY = st.hasResume ? (30 + resumeEstH + 14) : 30
+  derive revealStyleCode = st.revealStyle == "curtain" ? 2 : 1
+  derive showHomeFx = useGlassFx and fxKind > 0
+  derive tileConcealed = not homeItemsShown and not vp.prefersReducedMotion and st.revealStyle != "curtain"
 
   task onLaunch when isMainWindow
     after(1, checkInitialRoute)
@@ -305,6 +333,36 @@ component Float
 
   task onMorphFallback when showOpeningMorph
     after(1600, finishOpeningMorph)
+
+  task onFxEndWave when fxKind == 1 key=fxSeq
+    after(980, finishFx)
+
+  task onFxEndCurtain when fxKind == 2 key=fxSeq
+    after(760, finishFx)
+
+  task onFxEndOpenReleased when (fxKind == 3 or fxKind == 4) and fxReleaseAt >= 0 key=fxSeq
+    after(360, finishFx)
+
+  task onFxEndReverse when fxKind == 5 key=fxSeq
+    after(1060, finishFx)
+
+  task onOpenSwap when pendingOpenKind != "" key=fxSeq
+    after(215, commitPendingOpen)
+
+  task onWebOpenCover when (fxKind == 3 or fxKind == 4) and not openVeilCovered and not st.nativeBackdrop key=fxSeq
+    after(215, markVeilCovered)
+
+  task onOpenVeilRelease when (fxKind == 3 or fxKind == 4) and fxReleaseAt < 0 and openVeilCovered and not isHome and st.webContentReady key=fxSeq
+    after(16, releaseOpenVeil)
+
+  task onOpenVeilTimeout when (fxKind == 3 or fxKind == 4) and fxReleaseAt < 0 key=fxSeq
+    after(3600, releaseOpenVeil)
+
+  task onHoverPreload when isMainWindow and isHome and hoveredPreloadUrl != "" key=hoveredPreloadUrl
+    after(140, triggerHoverPreload)
+
+  task onHomeItemsReveal when isHome and not homeItemsShown and not showOpeningMorph key=fxSeq
+    after(32, showHomeItems)
 
   task onRestore when isMainWindow and page.restores > 0 key=page.restores
     after(1, clearWindowHidden)
@@ -381,7 +439,13 @@ component Float
   action revealAfterMorph
     morphShown = true
     morphRevealing = true
+    homeItemsShown = true
     send cmd = runFloatCommand("revealGlass", "")
+    if isHome and not isEmpty and useGlassFx
+      fxKind = revealStyleCode
+      fxReleaseAt = -1
+      fxSlot = 1 - fxSlot
+      fxSeq = fxSeq + 1
 
   action finishOpeningMorph
     if not morphRevealing
@@ -389,6 +453,38 @@ component Float
     morphShown = true
     morphRevealing = true
     morphActive = false
+    homeItemsShown = true
+
+  action finishFx
+    fxKind = 0
+    fxReleaseAt = -1
+    openVeilCovered = false
+
+  action markVeilCovered
+    openVeilCovered = true
+
+  action releaseOpenVeil
+    if (fxKind == 3 or fxKind == 4) and fxReleaseAt < 0
+      openVeilCovered = false
+      fxReleaseAt = max(0.22, (performanceNow() - fxStartMs) / 1000)
+
+  action showHomeItems
+    homeItemsShown = true
+
+  action triggerHoverPreload
+    if isHome and hoveredPreloadUrl != ""
+      send cmd = runFloatCommand("preloadSite", hoveredPreloadUrl)
+
+  action commitPendingOpen
+    let kind = pendingOpenKind
+    let target = pendingOpenUrl
+    pendingOpenKind = ""
+    pendingOpenUrl = ""
+    openVeilCovered = true
+    if kind == "site" and target != ""
+      send cmd = runFloatCommand("commitLoad", target)
+    else if kind == "resume"
+      send cmd = runFloatCommand("commitResume", "")
 
   action onGlobalShortcut(id: string)
     if id == "show-hide"
@@ -413,15 +509,63 @@ component Float
       setWindowOpacity(st.alpha, 160)
 
   action showHome
+    let wasWeb = not isHome
     urlOpen = false
     browserDragging = false
+    pendingOpenKind = ""
+    pendingOpenUrl = ""
+    openVeilCovered = false
+    hoveredPreloadUrl = ""
     prevFrame = ""
     shownFrame = ""
+    if wasWeb and useGlassFx
+      homeItemsShown = false
+      fxKind = 5
+      fxReleaseAt = -1
+      fxSlot = 1 - fxSlot
+      fxSeq = fxSeq + 1
+    else
+      homeItemsShown = true
     send cmd = runFloatCommand("showHome", "")
 
   action resumeLast
     urlOpen = false
+    hoveredPreloadUrl = ""
     send cmd = runFloatCommand("resumeLast", "")
+
+  action openResumeCard
+    urlOpen = false
+    hoveredPreloadUrl = ""
+    fxOriginCx = vpW / 2
+    fxOriginCy = 30 + resumeEstH / 2
+    fxOriginW = max(128, vpW - 32)
+    fxOriginH = resumeEstH
+    fxOriginR = 14
+    if useGlassFx and st.nativeBackdrop
+      fxStartMs = performanceNow()
+      fxReleaseAt = -1
+      fxKind = st.openStyle == "diagonal" ? 4 : 3
+      openVeilCovered = false
+      fxSlot = 1 - fxSlot
+      fxSeq = fxSeq + 1
+      pendingOpenKind = "resume"
+      pendingOpenUrl = st.resumeUrl
+      send cmd = runFloatCommand("prepareResume", "")
+    else
+      if useGlassFx
+        fxStartMs = performanceNow()
+        fxReleaseAt = -1
+        fxKind = st.openStyle == "diagonal" ? 4 : 3
+        openVeilCovered = false
+        fxSlot = 1 - fxSlot
+        fxSeq = fxSeq + 1
+      send cmd = runFloatCommand("resumeLast", "")
+
+  action setRevealStyle(style: string)
+    send cmd = runFloatCommand("setRevealStyle", style)
+
+  action setOpenStyle(style: string)
+    send cmd = runFloatCommand("setOpenStyle", style)
 
   action openUrlBar
     let nextDraft = st.mode == "web" ? st.currentUrl : ""
@@ -568,19 +712,52 @@ component Float
     else if e.metaKey and k == "ArrowRight"
       setSelectionRange("url-input", urlDraft.length, urlDraft.length)
 
-  action openSite(url: string)
+  action openSite(url: string, idx: number)
     urlOpen = false
-    send cmd = runFloatCommand("load", url)
+    hoveredPreloadUrl = ""
+    fxOriginCx = 16 + tileX(idx, gridCols) + 64
+    fxOriginCy = gridTopY + tileY(idx, gridCols) + 40
+    fxOriginW = 128
+    fxOriginH = 80
+    fxOriginR = 12
+    if useGlassFx and st.nativeBackdrop
+      fxStartMs = performanceNow()
+      fxReleaseAt = -1
+      fxKind = st.openStyle == "diagonal" ? 4 : 3
+      openVeilCovered = false
+      fxSlot = 1 - fxSlot
+      fxSeq = fxSeq + 1
+      pendingOpenKind = "site"
+      pendingOpenUrl = url
+      send cmd = runFloatCommand("prepareLoad", url)
+    else
+      if useGlassFx
+        fxStartMs = performanceNow()
+        fxReleaseAt = -1
+        fxKind = st.openStyle == "diagonal" ? 4 : 3
+        openVeilCovered = false
+        fxSlot = 1 - fxSlot
+        fxSeq = fxSeq + 1
+      send cmd = runFloatCommand("load", url)
+
+  action prewarmTile(url: string, _e: PointerEvent)
+    if isHome and url != ""
+      send cmd = runFloatCommand("prewarmUrl", url)
 
   action removeSite(host: string)
+    if hoveredHost == host
+      hoveredHost = ""
+      hoveredPreloadUrl = ""
     send cmd = runFloatCommand("removeSite", host)
 
-  action hoverTile(host: string, inside: bool)
+  action hoverTile(host: string, url: string, inside: bool)
     if inside
       hoveredHost = host
+      hoveredPreloadUrl = url
     else
       if hoveredHost == host
         hoveredHost = ""
+        hoveredPreloadUrl = ""
 
   action hoverDragStrip(inside: bool)
     dragStripHovered = inside
@@ -867,53 +1044,59 @@ component Float
                 else
                   column width="100%"
                     if st.hasResume
-                      button appearance="none"
-                        class=ResumeCard
-                        press=resumeLast
-                        testId="resume-card"
-                        aria-label=`Resume ${st.resumeTitle}`
-                        if st.resumeIcon != ""
-                          image st.resumeIcon width=40
-                            height=40
-                            border-radius=9
-                            object-fit="contain"
+                      view width="100%"
+                        opacity=(tileConcealed ? 0 : 1)
+                        scale=(tileConcealed ? 0.94 : 1)
+                        translate=(tileConcealed ? "0px 8px" : "0px 0px")
+                        filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
+                        transition=(tileConcealed or vp.prefersReducedMotion ? "none" : "opacity 340ms ease-out, scale 340ms cubic-bezier(0.22, 1, 0.36, 1), translate 340ms cubic-bezier(0.22, 1, 0.36, 1), filter 340ms ease-out")
+                        button appearance="none"
+                          class=ResumeCard
+                          press=openResumeCard
+                          testId="resume-card"
+                          aria-label=`Resume ${st.resumeTitle}`
+                          if st.resumeIcon != ""
+                            image st.resumeIcon width=40
+                              height=40
+                              border-radius=9
+                              object-fit="contain"
+                              flex-shrink=0
+                          column flex=1 min-width=0 gap=2 align-items="flex-start"
+                            text "RESUME" font-size=11
+                              letter-spacing=0.88
+                              color="-exact-system-teal"
+                              font-weight=500
+                            text st.resumeTitle font-size=15
+                              font-weight=600
+                              color="-exact-label"
+                              line-clamp=1
+                              testId="resume-title"
+                            text resumeSubtitle font-size=12
+                              color="-exact-secondary-label"
+                              line-clamp=1
+                              testId="resume-sub"
+                            if st.resumeDuration > 0
+                              view width="100%"
+                                height=3
+                                border-radius=2
+                                background-color="-exact-secondary-fill"
+                                margin-top=6
+                                overflow="hidden"
+                                view height="100%"
+                                  width=`${resumeProgress}%`
+                                  background-color="AccentColor"
+                                  testId="resume-progress"
+                          view width=34
+                            height=34
+                            border-radius=17
+                            background-color="AccentColor"
                             flex-shrink=0
-                        column flex=1 min-width=0 gap=2 align-items="flex-start"
-                          text "RESUME" font-size=11
-                            letter-spacing=0.88
-                            color="-exact-system-teal"
-                            font-weight=500
-                          text st.resumeTitle font-size=15
-                            font-weight=600
-                            color="-exact-label"
-                            line-clamp=1
-                            testId="resume-title"
-                          text resumeSubtitle font-size=12
-                            color="-exact-secondary-label"
-                            line-clamp=1
-                            testId="resume-sub"
-                          if st.resumeDuration > 0
-                            view width="100%"
-                              height=3
-                              border-radius=2
-                              background-color="-exact-secondary-fill"
-                              margin-top=6
-                              overflow="hidden"
-                              view height="100%"
-                                width=`${resumeProgress}%`
-                                background-color="AccentColor"
-                                testId="resume-progress"
-                        view width=34
-                          height=34
-                          border-radius=17
-                          background-color="AccentColor"
-                          flex-shrink=0
-                          display="flex"
-                          align-items="center"
-                          justify-content="center"
-                          padding-left=3
-                          box-sizing="border-box"
-                          text "▶" font-size=14 color="AccentColorText"
+                            display="flex"
+                            align-items="center"
+                            justify-content="center"
+                            padding-left=3
+                            box-sizing="border-box"
+                            text "▶" font-size=14 color="AccentColorText"
 
                     if hasSites
                       view testId="site-grid" position="relative" width="100%" height=gridHeight
@@ -925,40 +1108,49 @@ component Float
                             height=80
                             translate=`${tileX(idx, gridCols)}px ${tileY(idx, gridCols)}px`
                             transition=(vp.prefersReducedMotion ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
-                            hover=hoverTile(site.host)
+                            hover=hoverTile(site.host, site.url)
                             testId=`tile-wrap-${site.host}`
-                            button appearance="none"
-                              class=TileButton
-                              press=openSite(site.url)
-                              scale=(hoveredHost == site.host ? 1.03 : 1)
-                              title=site.host
-                              aria-label=site.name
-                              testId=`tile-${site.host}`
-                              if site.icon != ""
-                                image site.icon width=40 height=40 border-radius=9 object-fit="contain"
-                              else
-                                view width=40
-                                  height=40
-                                  border-radius=9
-                                  background-color="-exact-secondary-fill"
-                                  display="flex"
-                                  align-items="center"
-                                  justify-content="center"
-                                  text site.initial font-size=20 font-weight=600 color="-exact-label"
-                              text site.name font-weight=500
-                                font-size=13
-                                color="-exact-label"
-                                max-width="90%"
-                                line-clamp=1
-                                testId=`tile-name-${site.host}`
-                            button appearance="none"
-                              class=RemoveBtn
-                              press=removeSite(site.host)
-                              opacity=(hoveredHost == site.host ? 1 : 0)
-                              aria-label=`Remove ${site.name}`
-                              title="Remove"
-                              testId=`remove-${site.host}`
-                              text "×"
+                            view position="relative"
+                              width="100%"
+                              height="100%"
+                              opacity=(tileConcealed ? 0 : 1)
+                              scale=(tileConcealed ? 0.94 : 1)
+                              translate=(tileConcealed ? "0px 8px" : "0px 0px")
+                              filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
+                              transition=(tileConcealed or vp.prefersReducedMotion ? "none" : `opacity 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, scale 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, translate 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, filter 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms`)
+                              button appearance="none"
+                                class=TileButton
+                                pointerdown=prewarmTile(site.url)
+                                press=openSite(site.url, idx)
+                                scale=(hoveredHost == site.host ? 1.03 : 1)
+                                title=site.host
+                                aria-label=site.name
+                                testId=`tile-${site.host}`
+                                if site.icon != ""
+                                  image site.icon width=40 height=40 border-radius=9 object-fit="contain"
+                                else
+                                  view width=40
+                                    height=40
+                                    border-radius=9
+                                    background-color="-exact-secondary-fill"
+                                    display="flex"
+                                    align-items="center"
+                                    justify-content="center"
+                                    text site.initial font-size=20 font-weight=600 color="-exact-label"
+                                text site.name font-weight=500
+                                  font-size=13
+                                  color="-exact-label"
+                                  max-width="90%"
+                                  line-clamp=1
+                                  testId=`tile-name-${site.host}`
+                              button appearance="none"
+                                class=RemoveBtn
+                                press=removeSite(site.host)
+                                opacity=(hoveredHost == site.host ? 1 : 0)
+                                aria-label=`Remove ${site.name}`
+                                title="Remove"
+                                testId=`remove-${site.host}`
+                                text "×"
 
             // Top-edge 18px drag strip: hover reveals, drag moves window, double-click locks video aspect
             view id="drag-strip"
@@ -1005,6 +1197,29 @@ component Float
                 pointer-events="none"
                 aria-hidden=true
                 testId="opening-morph"
+
+            // GPU WGSL home reveal & site wipe transition shader (dual-slot mount resets u.time to 0 on new gesture)
+            if showHomeFx and fxSlot == 0
+              canvas surface=shader(src="assets/home-transition.wgsl", alphaMode="premultiplied", effectKind=fxKind, siteCount=st.sites.length, gridCols=gridCols, hasResume=(st.hasResume ? 1 : 0), resumeH=resumeEstH, originCx=fxOriginCx, originCy=fxOriginCy, originW=fxOriginW, originH=fxOriginH, originRadius=fxOriginR, releaseAt=fxReleaseAt, revealStyle=revealStyleCode)
+                position="absolute"
+                inset=0
+                width="100%"
+                height="100%"
+                z-index=51
+                pointer-events="none"
+                aria-hidden=true
+                testId="home-transition-fx"
+
+            if showHomeFx and fxSlot == 1
+              canvas surface=shader(src="assets/home-transition.wgsl", alphaMode="premultiplied", effectKind=fxKind, siteCount=st.sites.length, gridCols=gridCols, hasResume=(st.hasResume ? 1 : 0), resumeH=resumeEstH, originCx=fxOriginCx, originCy=fxOriginCy, originW=fxOriginW, originH=fxOriginH, originRadius=fxOriginR, releaseAt=fxReleaseAt, revealStyle=revealStyleCode)
+                position="absolute"
+                inset=0
+                width="100%"
+                height="100%"
+                z-index=51
+                pointer-events="none"
+                aria-hidden=true
+                testId="home-transition-fx"
 
         // Dedicated Settings window (macOS: named `settings` window via ⌘,; web/Linux: in-place route)
         if e.name == "settings"
@@ -1185,7 +1400,51 @@ component Float
 
                 hr width="100%"
 
-                // Section 3: Show / Hide Window global shortcut
+                // Section 3: Motion & Glass Transitions
+                column width="100%" gap=10
+                  column gap=2
+                    text "Motion & Transitions" font-size=13 font-weight=600
+                    text "GPU shader effects for revealing saved sites and opening videos." font-size=11 color="-exact-secondary-label"
+
+                  column width="100%" gap=6
+                    text "Saved Item Reveal" font-size=12 font-weight=500
+                    row role="radiogroup" aria-label="Saved Item Reveal Style" class=SegmentedWrap
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=(st.revealStyle != "curtain")
+                        class=(st.revealStyle != "curtain" ? SegmentedBtnActive : SegmentedBtn)
+                        press=setRevealStyle("wave")
+                        testId="reveal-style-wave"
+                        text "Wave + Bevel"
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=(st.revealStyle == "curtain")
+                        class=(st.revealStyle == "curtain" ? SegmentedBtnActive : SegmentedBtn)
+                        press=setRevealStyle("curtain")
+                        testId="reveal-style-curtain"
+                        text "Glass Curtain"
+
+                  column width="100%" gap=6
+                    text "Open Site Wipe" font-size=12 font-weight=500
+                    row role="radiogroup" aria-label="Open Site Wipe Style" class=SegmentedWrap
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=(st.openStyle != "diagonal")
+                        class=(st.openStyle != "diagonal" ? SegmentedBtnActive : SegmentedBtn)
+                        press=setOpenStyle("lens")
+                        testId="open-style-lens"
+                        text "Tile Lens"
+                      button appearance="none"
+                        role="radio"
+                        aria-checked=(st.openStyle == "diagonal")
+                        class=(st.openStyle == "diagonal" ? SegmentedBtnActive : SegmentedBtn)
+                        press=setOpenStyle("diagonal")
+                        testId="open-style-diagonal"
+                        text "Diagonal Wipe"
+
+                hr width="100%"
+
+                // Section 4: Show / Hide Window global shortcut
                 row width="100%" align-items="center" justify-content="space-between" gap=8
                   column flex=1 min-width=0 gap=2
                     text "Show / Hide Window" font-size=13 font-weight=600
@@ -1634,3 +1893,35 @@ component Float
             -exact-menu="none"
             aria-label="Reset Video Filters"
             testId="cmd-filters-reset"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setRevealStyle("curtain")
+            -exact-menu="none"
+            aria-label="Reveal Curtain"
+            testId="cmd-reveal-curtain"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setRevealStyle("wave")
+            -exact-menu="none"
+            aria-label="Reveal Wave"
+            testId="cmd-reveal-wave"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setOpenStyle("diagonal")
+            -exact-menu="none"
+            aria-label="Open Diagonal"
+            testId="cmd-open-diagonal"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=setOpenStyle("lens")
+            -exact-menu="none"
+            aria-label="Open Lens"
+            testId="cmd-open-lens"

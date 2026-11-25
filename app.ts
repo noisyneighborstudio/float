@@ -41,6 +41,8 @@ interface PersistedFallback {
   alpha: number;
   videoBrightness: number;
   videoContrast: number;
+  revealStyle: string;
+  openStyle: string;
   hotkeyKeys: string;
   peekTrigger: string;
   peekAlpha: number;
@@ -64,6 +66,8 @@ const DEFAULT_FALLBACK: PersistedFallback = {
   alpha: 1,
   videoBrightness: 1,
   videoContrast: 1,
+  revealStyle: 'wave',
+  openStyle: 'lens',
   hotkeyKeys: 'Control+Alt+Meta+F',
   peekTrigger: 'rightCommand',
   peekAlpha: 0.5,
@@ -232,6 +236,10 @@ function toFloatState(p: PersistedFallback): FloatState {
     alpha: p.alpha,
     videoBrightness: p.videoBrightness,
     videoContrast: p.videoContrast,
+    revealStyle: p.revealStyle || 'wave',
+    openStyle: p.openStyle || 'lens',
+    preloadedHost: '',
+    webContentReady: true,
     hotkeyKeys: p.hotkeyKeys,
     hotkeyLabel: formatChordLabel(p.hotkeyKeys),
     peekTrigger: p.peekTrigger,
@@ -364,6 +372,37 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
     case 'resetVideoFilters':
       data.videoBrightness = 1;
       data.videoContrast = 1;
+      break;
+    case 'setRevealStyle':
+      if (arg === 'wave' || arg === 'curtain') data.revealStyle = arg;
+      break;
+    case 'setOpenStyle':
+      if (arg === 'lens' || arg === 'diagonal') data.openStyle = arg;
+      break;
+    case 'prepareLoad':
+    case 'preloadSite':
+    case 'prewarmUrl':
+      break;
+    case 'commitLoad': {
+      const url = parseWebUrl(arg);
+      if (url) {
+        data.mode = 'web';
+        data.currentUrl = url;
+        data.history = data.history.slice(0, data.historyIndex + 1).concat([url]);
+        data.historyIndex = data.history.length - 1;
+      }
+      break;
+    }
+    case 'prepareResume':
+      break;
+    case 'commitResume':
+      if (data.resume) {
+        const url = parseWebUrl(appleTVResumeUrl(data.resume.url));
+        if (url) {
+          data.mode = 'web';
+          data.currentUrl = url;
+        }
+      }
       break;
     case 'back':
       if (data.historyIndex > 0) {
