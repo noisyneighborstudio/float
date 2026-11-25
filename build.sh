@@ -9,6 +9,14 @@ NAME=${1:-Float}
 ID=com.sethwebster.${NAME:l}
 APP=${OUT:-build}/$NAME.app
 SIGN=${SIGN:-Developer ID Application: Seth Webster (P8ZBH5878Q)}
+# Resolve common-name signing identities to their 40-char SHA-1 thumbprint, which
+# Exact's signingOrder requires for `codesign --verify -R '=certificate leaf = H"<sha1>"'`.
+if [[ $SIGN != - && ! $SIGN =~ ^[0-9A-Fa-f]{40}$ ]]; then
+  RESOLVED_SIGN=$(security find-identity -v -p codesigning 2>/dev/null | awk -v name="$SIGN" 'index($0, "\"" name "\"") { print $2; exit }')
+  if [[ -n $RESOLVED_SIGN ]]; then
+    SIGN="$RESOLVED_SIGN"
+  fi
+fi
 VERSION=${VERSION:-0.1.0} BUILD=${BUILD:-1}
 EXACT2=${EXACT:-${EXACT2:-}}
 if [[ -z ${EXACT2:-} ]]; then
