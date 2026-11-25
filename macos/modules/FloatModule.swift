@@ -987,11 +987,14 @@ private func floatSameLoadTarget(_ a: URL, _ b: URL) -> Bool {
 }
 
 /// WKWebView subclass that suppresses initial opaque backing-store flash before the GPU morph presents
-/// and balances WebKit's reference-counted media suspension API.
+/// and balances WebKit's reference-counted media suspension API across cross-origin process swaps.
 private final class FloatWebView: WKWebView {
     weak var module: FloatModule?
     var triggersMorphPrepare = false
-    private(set) var isMediaSuspended = false
+    private(set) var wantsMediaSuspended = false
+    private(set) var webkitMediaSuspended = false
+    private var provisionalNavigations: Set<ObjectIdentifier> = []
+    private var pendingResumeCompletions: [() -> Void] = []
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -1000,15 +1003,71 @@ private final class FloatWebView: WKWebView {
         }
     }
 
-    /// Balances WebKit's reference-counted `setAllMediaPlaybackSuspended(_:)` calls so
-    /// repeated suspends on warm/hidden views never stack past 1 and lock playback.
+    @discardableResult
+    func loadTracked(_ request: URLRequest) -> WKNavigation? {
+        let nav = load(request)
+        noteProvisionalNavigationStarted(nav)
+        return nav
+    }
+
+    func noteProvisionalNavigationStarted(_ navigation: WKNavigation?) {
+        guard let navigation else { return }
+        provisionalNavigations.insert(ObjectIdentifier(navigation))
+    }
+
+    func noteProvisionalNavigationSettled(_ navigation: WKNavigation?) {
+        if let navigation {
+            provisionalNavigations.remove(ObjectIdentifier(navigation))
+        }
+        guard provisionalNavigations.isEmpty, !wantsMediaSuspended, webkitMediaSuspended else { return }
+        webkitMediaSuspended = false
+        let completions = pendingResumeCompletions
+        pendingResumeCompletions.removeAll()
+        setAllMediaPlaybackSuspended(false) {
+            completions.forEach { $0() }
+        }
+    }
+
+    func resetNavigationTracking() {
+        provisionalNavigations.removeAll()
+        pendingResumeCompletions.removeAll()
+    }
+
+    /// Balances WebKit's reference-counted `setAllMediaPlaybackSuspended(_:)` calls and defers
+    /// unsuspending while a provisional cross-origin navigation is in flight (WebKit does not
+    /// forward `ResumeAllMediaPlayback` to `ProvisionalPageProxy`, which would otherwise commit
+    /// permanently suspended).
     func setMediaSuspended(_ suspended: Bool, completion: (() -> Void)? = nil) {
-        guard isMediaSuspended != suspended else {
+        wantsMediaSuspended = suspended
+        if suspended {
+            pendingResumeCompletions.removeAll()
+            guard !webkitMediaSuspended else {
+                completion?()
+                return
+            }
+            webkitMediaSuspended = true
+            setAllMediaPlaybackSuspended(true) {
+                completion?()
+            }
+            return
+        }
+
+        if webkitMediaSuspended && !provisionalNavigations.isEmpty {
+            if let completion {
+                pendingResumeCompletions.append(completion)
+            }
+            return
+        }
+
+        guard webkitMediaSuspended else {
             completion?()
             return
         }
-        isMediaSuspended = suspended
-        setAllMediaPlaybackSuspended(suspended) {
+        webkitMediaSuspended = false
+        let completions = pendingResumeCompletions
+        pendingResumeCompletions.removeAll()
+        setAllMediaPlaybackSuspended(false) {
+            completions.forEach { $0() }
             completion?()
         }
     }
@@ -1071,7 +1130,16 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
         decisionHandler(.cancel)
     }
 
+    func webView(_ w: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        (w as? FloatWebView)?.noteProvisionalNavigationStarted(navigation)
+    }
+
+    func webView(_ w: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        (w as? FloatWebView)?.noteProvisionalNavigationSettled(navigation)
+    }
+
     func webView(_ w: WKWebView, didCommit navigation: WKNavigation!) {
+        (w as? FloatWebView)?.noteProvisionalNavigationSettled(navigation)
         guard let instance else { return }
         if instance.isWarmSlot(w) {
             instance.handleWarmSlotCommitted(w)
@@ -1255,6 +1323,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         w.configuration.userContentController.removeScriptMessageHandler(forName: "fpPlay", contentWorld: trackWorld)
         w.navigationDelegate = nil
         w.uiDelegate = nil
+        w.resetNavigationTracking()
         w.stopLoading()
         w.setMediaSuspended(true)
         w.removeFromSuperview()
@@ -1438,7 +1507,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             existing.contentReady = false
             existing.probeToken += 1
             existing.web.setMediaSuspended(true)
-            existing.web.load(URLRequest(url: url))
+            existing.web.loadTracked(URLRequest(url: url))
             return
         }
 
@@ -1482,7 +1551,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         let slot = FloatWarmSlot(hostKey: key, web: w, requestedUrl: url)
         warmPool[key] = slot
         w.setMediaSuspended(true)
-        w.load(URLRequest(url: url))
+        w.loadTracked(URLRequest(url: url))
     }
 
     private func matchingWarmSlot(for url: URL) -> FloatWarmSlot? {
@@ -1515,14 +1584,20 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             return
         }
 
-        // 3. Cold navigation directly into activeWeb behind the breathing glass veil
+        // 3. Cold navigation directly into activeWeb behind the breathing glass veil.
+        // Unsuspend BEFORE starting the navigation so any cross-origin ProvisionalPageProxy is
+        // created unsuspended (WebKit does not forward ResumeAllMediaPlayback to provisional pages).
         parkActiveIfHomepage()
         pausedHomeUrl = nil
         pausedRequestedUrl = nil
         activeNavigationToken += 1
         activeContentReady = false
-        web.setMediaSuspended(true)
-        web.load(URLRequest(url: url))
+        let token = activeNavigationToken
+        let targetWeb = web
+        targetWeb.setMediaSuspended(false) { [weak self] in
+            guard let self, self.web === targetWeb, self.activeNavigationToken == token else { return }
+            targetWeb.loadTracked(URLRequest(url: url))
+        }
         module?.notifyChanged()
     }
 
@@ -1563,33 +1638,38 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         pausedRequestedUrl = nil
         web.isHidden = false
         let activeWeb = web
-        activeWeb.setMediaSuspended(false) { [weak self] in
-            guard let self, self.web === activeWeb, resumeIfPaused else { return }
-            activeWeb.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v && v.paused){ v.play().catch(()=>{}); } })()")
-        }
-        if wasPrepared, let mod = module {
-            web.evaluateJavaScript(floatMediaHookScript(preferSdr: mod.preferSdr))
-            web.evaluateJavaScript(floatFillScript(mod.fill))
-            web.evaluateJavaScript(floatVideoFilterScript(
-                brightness: mod.videoBrightness,
-                hdrBrightness: mod.hdrVideoBrightness,
-                contrast: mod.videoContrast,
-                streamBrightness: mod.streamBrightness,
-                preferSdr: mod.preferSdr
-            ))
-        }
         if !wasPrepared {
             activeNavigationToken += 1
             activeContentReady = false
-            web.load(URLRequest(url: url))
             let token = activeNavigationToken
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                self?.probeActiveContentReady(token: token, attemptsLeft: 32)
+            activeWeb.setMediaSuspended(false) { [weak self] in
+                guard let self, self.web === activeWeb, self.activeNavigationToken == token else { return }
+                activeWeb.loadTracked(URLRequest(url: url))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                    self?.probeActiveContentReady(token: token, attemptsLeft: 32)
+                }
             }
-        } else if !activeContentReady {
-            // Ensure active readiness polling continues after unhiding (for SPAs that waited on visibility)
-            let token = activeNavigationToken
-            probeActiveContentReady(token: token, attemptsLeft: 32)
+        } else {
+            activeWeb.setMediaSuspended(false) { [weak self] in
+                guard let self, self.web === activeWeb, resumeIfPaused else { return }
+                activeWeb.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v && v.paused){ v.play().catch(()=>{}); } })()")
+            }
+            if let mod = module {
+                web.evaluateJavaScript(floatMediaHookScript(preferSdr: mod.preferSdr))
+                web.evaluateJavaScript(floatFillScript(mod.fill))
+                web.evaluateJavaScript(floatVideoFilterScript(
+                    brightness: mod.videoBrightness,
+                    hdrBrightness: mod.hdrVideoBrightness,
+                    contrast: mod.videoContrast,
+                    streamBrightness: mod.streamBrightness,
+                    preferSdr: mod.preferSdr
+                ))
+            }
+            if !activeContentReady {
+                // Ensure active readiness polling continues after unhiding (for SPAs that waited on visibility)
+                let token = activeNavigationToken
+                probeActiveContentReady(token: token, attemptsLeft: 32)
+            }
         }
     }
 
@@ -1701,7 +1781,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         activeContentReady = true
         web.isHidden = true
         web.setMediaSuspended(true)
-        web.load(URLRequest(url: URL(string: "about:blank")!))
+        web.loadTracked(URLRequest(url: URL(string: "about:blank")!))
     }
 }
 
