@@ -305,11 +305,16 @@ let frameSeq = 1;
 let lastHash = 0;
 let latestPng = null;
 
+function normHost(host) {
+  const lower = String(host || '').toLowerCase();
+  return lower.startsWith('www.') ? lower.slice(4) : lower;
+}
+
 function buildFloatState() {
   const sites = [...data.sites]
     .sort((a, b) => b.last - a.last)
     .map((s) => {
-      const name = siteName(s.host);
+      const name = s.name && String(s.name).trim() ? String(s.name).trim() : siteName(s.host);
       return {
         host: s.host,
         url: s.url,
@@ -337,7 +342,7 @@ function buildFloatState() {
         resumeUrl = data.resume.url;
         resumeHost = host;
         resumeTitle = data.resume.title || siteName(host);
-        const matched = sites.find((s) => s.host === host);
+        const matched = sites.find((s) => normHost(s.host) === normHost(host));
         resumeIcon = matched ? matched.icon : `https://${host}/favicon.ico`;
         resumeTime = data.resume.time;
         resumeDuration = data.resume.duration;
@@ -443,12 +448,12 @@ function recordSite(urlStr, icon) {
     const u = new URL(urlStr);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
     const host = u.host;
-    const existing = data.sites.find((s) => s.host === host);
+    const existing = data.sites.find((s) => normHost(s.host) === normHost(host));
     const stamp = Math.floor(Date.now() / 1000);
     if (existing) {
       existing.last = stamp;
       existing.count += 1;
-      if (icon) existing.icon = icon;
+      if (icon && !(existing.icon || '').startsWith('assets/providers/')) existing.icon = icon;
     } else {
       data.sites.push({
         host,
@@ -709,8 +714,45 @@ async function handleCommand(op, arg) {
       setTimeout(() => captureNow(true), 50);
       break;
     }
+    case 'addSite': {
+      let urlRaw = arg;
+      let name;
+      let icon;
+      try {
+        const parsed = JSON.parse(arg);
+        if (parsed && typeof parsed === 'object' && typeof parsed.url === 'string') {
+          urlRaw = parsed.url;
+          if (typeof parsed.name === 'string' && parsed.name.trim()) name = parsed.name.trim();
+          if (typeof parsed.icon === 'string' && parsed.icon.trim()) icon = parsed.icon.trim();
+        }
+      } catch {}
+      const url = parseWebUrl(urlRaw);
+      if (url) {
+        const u = new URL(url);
+        const host = u.host;
+        const stamp = Math.floor(Date.now() / 1000);
+        const existing = data.sites.find((s) => normHost(s.host) === normHost(host));
+        if (existing) {
+          existing.url = url;
+          existing.last = stamp;
+          if (name) existing.name = name;
+          if (icon) existing.icon = icon;
+        } else {
+          data.sites.push({
+            host,
+            url,
+            icon: icon || `${u.protocol}//${host}/favicon.ico`,
+            name,
+            last: stamp,
+            count: 1,
+          });
+        }
+        saveState(data);
+      }
+      break;
+    }
     case 'removeSite':
-      data.sites = data.sites.filter((s) => s.host !== arg);
+      data.sites = data.sites.filter((s) => normHost(s.host) !== normHost(arg));
       saveState(data);
       break;
     case 'toggleExpand':

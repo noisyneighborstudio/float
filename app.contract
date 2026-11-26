@@ -5,6 +5,7 @@ use ShaderState from "@exact/shader"
 
 routes nav
   home "/"
+    providers "/providers"
     settings "/settings"
     shortcuts "/shortcuts"
   open "/open"
@@ -75,6 +76,21 @@ shape AspectReply
   ok: bool
   ratio: number
 
+shape StreamingProvider
+  id: string
+  name: string
+  host: string
+  normHost: string
+  url: string
+  icon: string
+  category: string
+
+shape ProviderCatalog
+  items: StreamingProvider[]
+  total: number
+
+fn normHost(h: string): string = h.toLowerCase().startsWith("www.") ? h.toLowerCase().slice(4) : h.toLowerCase()
+
 fn pad2(n: number): string = n < 10 ? `0${n}` : `${n}`
 
 fn fmtTime(sec: number): string = (
@@ -109,6 +125,124 @@ style TileButton
   transition="scale 150ms ease, background-color 150ms ease"
   :hover
     background-color="-exact-fill"
+
+style AddTileButton
+  position="relative"
+  width="100%"
+  height="100%"
+  border-radius=12
+  background-color="rgba(255, 255, 255, 0.04)"
+  border-width=1
+  border-style="dashed"
+  border-color="-exact-separator"
+  display="flex"
+  flex-direction="column"
+  align-items="center"
+  justify-content="center"
+  gap=6
+  padding=8
+  box-sizing="border-box"
+  color="-exact-secondary-label"
+  transition="scale 150ms ease, background-color 150ms ease, border-color 150ms ease"
+  :hover
+    background-color="-exact-tertiary-fill"
+    border-color="AccentColor"
+
+style ProviderCard
+  position="relative"
+  width=112
+  height=84
+  flex-shrink=0
+  border-radius=12
+  background-color="-exact-tertiary-fill"
+  border-width=1
+  border-style="solid"
+  border-color="-exact-separator"
+  display="flex"
+  flex-direction="column"
+  align-items="center"
+  justify-content="center"
+  gap=6
+  padding=8
+  box-sizing="border-box"
+  color="-exact-label"
+  transition="scale 150ms ease, background-color 150ms ease, border-color 150ms ease"
+
+style ProviderCardAdded
+  position="relative"
+  width=112
+  height=84
+  flex-shrink=0
+  border-radius=12
+  background-color="rgba(20, 160, 160, 0.16)"
+  border-width=1
+  border-style="solid"
+  border-color="AccentColor"
+  display="flex"
+  flex-direction="column"
+  align-items="center"
+  justify-content="center"
+  gap=6
+  padding=8
+  box-sizing="border-box"
+  color="-exact-label"
+  transition="scale 150ms ease, background-color 150ms ease, border-color 150ms ease"
+
+style FilterPill
+  padding-top=4
+  padding-bottom=4
+  padding-left=10
+  padding-right=10
+  border-radius=14
+  background-color="-exact-tertiary-fill"
+  border-width=1
+  border-style="solid"
+  border-color="-exact-separator"
+  font-size=11
+  font-weight=500
+  color="-exact-secondary-label"
+
+style FilterPillActive
+  padding-top=4
+  padding-bottom=4
+  padding-left=10
+  padding-right=10
+  border-radius=14
+  background-color="AccentColor"
+  border-width=1
+  border-style="solid"
+  border-color="AccentColor"
+  font-size=11
+  font-weight=600
+  color="AccentColorText"
+
+style HeaderBtn
+  padding-top=4
+  padding-bottom=4
+  padding-left=10
+  padding-right=10
+  border-radius=8
+  background-color="-exact-tertiary-fill"
+  border-width=1
+  border-style="solid"
+  border-color="-exact-separator"
+  font-size=12
+  font-weight=500
+  color="-exact-label"
+
+style HeaderDoneBtn
+  padding-top=4
+  padding-bottom=4
+  padding-left=12
+  padding-right=12
+  border-radius=8
+  background-color="AccentColor"
+  border-width=1
+  border-style="solid"
+  border-color="AccentColor"
+  font-size=12
+  font-weight=600
+  color="AccentColorText"
 
 style ResumeCard
   display="flex"
@@ -260,12 +394,17 @@ component Float
   state recordingNote = ""
   state pendingHotKeyTarget = ""
   state pendingHotKeyChord = ""
+  state providerCategory = "all"
+  state providerQuery = ""
+  state hoveredProviderId = ""
+  state addTileHovered = false
 
   resource page = exactPage() as shape Page
   resource vp = exactViewport() as shape Viewport
   resource morphFx = exactSurface("shader") as shape ShaderState
   resource screens = getScreenDetails() as shape ScreenDetails else empty()
   resource st = loadFloatState() as shape FloatState else empty(mode="home", fill=true, onTop=true, alpha=1, videoBrightness=1, hdrVideoBrightness=1, videoContrast=1, revealStyle="wave", openStyle="lens", webContentReady=true, preferSdr=false, streamBrightness=false, activeVideoStream="", hotkeyKeys="Control+Alt+Meta+F", hotkeyLabel="⌃⌥⌘F", peekTrigger="rightCommand", peekAlpha=0.5, peekHotkeyKeys="Control+Alt+Meta+D", peekHotkeyLabel="⌃⌥⌘D", peekHold=true)
+  resource providers = listStreamingProviders(providerCategory, providerQuery) as shape ProviderCatalog else empty()
   resource shortcutStatus = globalShortcutStatus() as shape GlobalShortcutStatus else empty()
 
   derive isMainWindow = page.name == "main"
@@ -286,14 +425,17 @@ component Float
   mutation shortcutCheck as shape GlobalShortcutCheck then finishHotKeyCheck
 
   derive isHome = st.mode == "home"
+  derive onHomeRoute = top(nav).name == "home"
   derive hasSites = st.sites.length > 0
+  derive addedHosts = st.sites.map(s => normHost(s.host))
   derive isEmpty = not st.hasResume and not hasSites
   derive vpW = vp.width > 0 ? vp.width : 640
   derive vpH = vp.height > 0 ? vp.height : 360
   derive gridInnerW = max(128, vpW - 32)
   derive gridCols = max(1, floor((gridInnerW + 12) / 140))
-  derive gridRows = st.sites.length > 0 ? floor((st.sites.length + gridCols - 1) / gridCols) : 0
-  derive gridHeight = gridRows > 0 ? gridRows * 80 + (gridRows - 1) * 12 : 0
+  derive gridTotalTiles = st.sites.length + 1
+  derive gridRows = floor((gridTotalTiles + gridCols - 1) / gridCols)
+  derive gridHeight = gridRows * 80 + (gridRows - 1) * 12
   derive resumeProgress = st.resumeDuration > 0 ? min(100, (st.resumeTime / st.resumeDuration) * 100) : 0
   derive resumeSubtitle = (
     st.resumeDuration > 0
@@ -525,6 +667,10 @@ component Float
     hoveredPreloadUrl = ""
     prevFrame = ""
     shownFrame = ""
+    if top(nav).name == "providers"
+      providerQuery = ""
+      hoveredProviderId = ""
+      nav = back(nav)
     if wasWeb and useGlassFx
       homeItemsShown = false
       fxKind = 5
@@ -538,6 +684,10 @@ component Float
   action resumeLast
     urlOpen = false
     hoveredPreloadUrl = ""
+    if top(nav).name == "providers"
+      providerQuery = ""
+      hoveredProviderId = ""
+      nav = back(nav)
     send cmd = runFloatCommand("resumeLast", "")
 
   action openResumeCard
@@ -575,12 +725,76 @@ component Float
     send cmd = runFloatCommand("setOpenStyle", style)
 
   action openUrlBar
+    if top(nav).name == "providers"
+      providerQuery = ""
+      hoveredProviderId = ""
+      nav = back(nav)
     let nextDraft = st.mode == "web" ? st.currentUrl : ""
     urlDraft = nextDraft
     urlOpen = true
     selectSeq = selectSeq + 1
     focus("url-input")
     setSelectionRange("url-input", 0, nextDraft.length)
+
+  action openProviders
+    urlOpen = false
+    hoveredHost = ""
+    hoveredPreloadUrl = ""
+    addTileHovered = false
+    providerCategory = "all"
+    providerQuery = ""
+    hoveredProviderId = ""
+    if not isHome
+      send cmd = runFloatCommand("showHome", "")
+    if top(nav).name != "providers"
+      nav = push(nav, "/providers")
+
+  action closeProviders
+    providerQuery = ""
+    hoveredProviderId = ""
+    if top(nav).name == "providers"
+      nav = back(nav)
+
+  action setProviderCategory(cat: string)
+    providerCategory = cat
+
+  action editProviderQuery(v: string)
+    providerQuery = v
+
+  action hoverProvider(id: string, inside: bool)
+    if inside
+      hoveredProviderId = id
+    else
+      if hoveredProviderId == id
+        hoveredProviderId = ""
+
+  action hoverAddTile(inside: bool)
+    addTileHovered = inside
+
+  action providerKeyDown(k: string, _e: KeyboardEvent)
+    if k == "Escape"
+      if providerQuery != ""
+        providerQuery = ""
+      else
+        closeProviders()
+
+  action toggleProvider(name: string, url: string, host: string, icon: string)
+    if addedHosts.includes(normHost(host))
+      send cmd = runFloatCommand("removeSite", host)
+    else
+      send cmd = runFloatCommand("addSite", `{"url":"${url}","name":"${name}","icon":"${icon}"}`)
+
+  action openUrlBarFromProviders
+    let q = providerQuery.trim()
+    providerQuery = ""
+    hoveredProviderId = ""
+    if top(nav).name == "providers"
+      nav = back(nav)
+    urlDraft = q
+    urlOpen = true
+    selectSeq = selectSeq + 1
+    focus("url-input")
+    setSelectionRange("url-input", 0, q.length)
 
   action setPeekTrigger(trigger: string)
     peeking = false
@@ -793,6 +1007,10 @@ component Float
 
   action openClipboard
     urlOpen = false
+    if top(nav).name == "providers"
+      providerQuery = ""
+      hoveredProviderId = ""
+      nav = back(nav)
     send cmd = readClipboardUrl()
 
   action reloadPage
@@ -1035,8 +1253,8 @@ component Float
                     font-size=12
                     text-align="center"
 
-            // Home screen: Resume card + Site mosaic grid + Empty state (over native macOS Liquid Glass backdrop)
-            if isHome
+            // Home screen: Resume card + Site mosaic grid (with trailing + card) + Empty guidance (over native macOS Liquid Glass backdrop)
+            if isHome and onHomeRoute
               scroll testId="home-screen"
                 position="absolute"
                 inset=0
@@ -1054,132 +1272,171 @@ component Float
                 padding-bottom=16
                 box-sizing="border-box"
 
-                if isEmpty
-                  column testId="empty-state"
-                    position="absolute"
-                    inset=0
-                    align-items="center"
-                    justify-content="center"
-                    gap=4
-                    padding=16
-                    text "Video sites you watch will show up here." color="-exact-secondary-label"
-                      font-size=13
-                      text-align="center"
-                    row align-items="center" justify-content="center" gap=4
-                      text "Press" color="-exact-secondary-label" font-size=13
-                      view class=KeyBadge
-                        text "⌘L" color="-exact-label" font-size=13 testId="empty-shortcut"
-                      text "to open a URL." color="-exact-secondary-label" font-size=13
-                else
-                  column width="100%"
-                    if st.hasResume
-                      view width="100%"
+                column width="100%"
+                  if st.hasResume
+                    view width="100%"
+                      opacity=(tileConcealed ? 0 : 1)
+                      scale=(tileConcealed ? 0.94 : 1)
+                      translate=(tileConcealed ? "0px 8px" : "0px 0px")
+                      filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
+                      transition=(tileConcealed or vp.prefersReducedMotion ? "none" : "opacity 340ms ease-out, scale 340ms cubic-bezier(0.22, 1, 0.36, 1), translate 340ms cubic-bezier(0.22, 1, 0.36, 1), filter 340ms ease-out")
+                      button appearance="none"
+                        class=ResumeCard
+                        press=openResumeCard
+                        testId="resume-card"
+                        aria-label=`Resume ${st.resumeTitle}`
+                        if st.resumeIcon != ""
+                          image st.resumeIcon width=40
+                            height=40
+                            border-radius=9
+                            object-fit="contain"
+                            flex-shrink=0
+                        column flex=1 min-width=0 gap=2 align-items="flex-start"
+                          text "RESUME" font-size=11
+                            letter-spacing=0.88
+                            color="-exact-system-teal"
+                            font-weight=500
+                          text st.resumeTitle font-size=15
+                            font-weight=600
+                            color="-exact-label"
+                            line-clamp=1
+                            testId="resume-title"
+                          text resumeSubtitle font-size=12
+                            color="-exact-secondary-label"
+                            line-clamp=1
+                            testId="resume-sub"
+                          if st.resumeDuration > 0
+                            view width="100%"
+                              height=3
+                              border-radius=2
+                              background-color="-exact-secondary-fill"
+                              margin-top=6
+                              overflow="hidden"
+                              view height="100%"
+                                width=`${resumeProgress}%`
+                                background-color="AccentColor"
+                                testId="resume-progress"
+                        view width=34
+                          height=34
+                          border-radius=17
+                          background-color="AccentColor"
+                          flex-shrink=0
+                          display="flex"
+                          align-items="center"
+                          justify-content="center"
+                          padding-left=3
+                          box-sizing="border-box"
+                          text "▶" font-size=14 color="AccentColorText"
+
+                  view testId="site-grid" position="relative" width="100%" height=gridHeight
+                    for site, idx in st.sites key=site.host
+                      view position="absolute"
+                        top=0
+                        left=0
+                        width=128
+                        height=80
+                        translate=`${tileX(idx, gridCols)}px ${tileY(idx, gridCols)}px`
+                        transition=(vp.prefersReducedMotion or not homeItemsShown ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
+                        hover=hoverTile(site.host, site.url)
+                        testId=`tile-wrap-${site.host}`
+                        view position="relative"
+                          width="100%"
+                          height="100%"
+                          opacity=(tileConcealed ? 0 : 1)
+                          scale=(tileConcealed ? 0.94 : 1)
+                          translate=(tileConcealed ? "0px 8px" : "0px 0px")
+                          filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
+                          transition=(tileConcealed or vp.prefersReducedMotion ? "none" : `opacity 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, scale 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, translate 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, filter 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms`)
+                          button appearance="none"
+                            class=TileButton
+                            pointerdown=prewarmTile(site.url)
+                            press=openSite(site.url, idx)
+                            scale=(hoveredHost == site.host ? 1.03 : 1)
+                            title=site.host
+                            aria-label=site.name
+                            testId=`tile-${site.host}`
+                            if site.icon != ""
+                              image site.icon width=40 height=40 border-radius=9 object-fit="contain"
+                            else
+                              view width=40
+                                height=40
+                                border-radius=9
+                                background-color="-exact-secondary-fill"
+                                display="flex"
+                                align-items="center"
+                                justify-content="center"
+                                text site.initial font-size=20 font-weight=600 color="-exact-label"
+                            text site.name font-weight=500
+                              font-size=13
+                              color="-exact-label"
+                              max-width="90%"
+                              line-clamp=1
+                              testId=`tile-name-${site.host}`
+                          button appearance="none"
+                            class=RemoveBtn
+                            press=removeSite(site.host)
+                            opacity=(hoveredHost == site.host ? 1 : 0)
+                            aria-label=`Remove ${site.name}`
+                            title="Remove"
+                            testId=`remove-${site.host}`
+                            text "×"
+
+                    // Trailing "+" card in the mosaic: opens the streaming provider picker
+                    view position="absolute"
+                      top=0
+                      left=0
+                      width=128
+                      height=80
+                      translate=`${tileX(st.sites.length, gridCols)}px ${tileY(st.sites.length, gridCols)}px`
+                      transition=(vp.prefersReducedMotion or not homeItemsShown ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
+                      hover=hoverAddTile
+                      testId="add-provider-wrap"
+                      view position="relative"
+                        width="100%"
+                        height="100%"
                         opacity=(tileConcealed ? 0 : 1)
                         scale=(tileConcealed ? 0.94 : 1)
                         translate=(tileConcealed ? "0px 8px" : "0px 0px")
                         filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
-                        transition=(tileConcealed or vp.prefersReducedMotion ? "none" : "opacity 340ms ease-out, scale 340ms cubic-bezier(0.22, 1, 0.36, 1), translate 340ms cubic-bezier(0.22, 1, 0.36, 1), filter 340ms ease-out")
+                        transition=(tileConcealed or vp.prefersReducedMotion ? "none" : `opacity 340ms ease-out ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms, scale 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms, translate 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms, filter 340ms ease-out ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms`)
                         button appearance="none"
-                          class=ResumeCard
-                          press=openResumeCard
-                          testId="resume-card"
-                          aria-label=`Resume ${st.resumeTitle}`
-                          if st.resumeIcon != ""
-                            image st.resumeIcon width=40
-                              height=40
-                              border-radius=9
-                              object-fit="contain"
-                              flex-shrink=0
-                          column flex=1 min-width=0 gap=2 align-items="flex-start"
-                            text "RESUME" font-size=11
-                              letter-spacing=0.88
-                              color="-exact-system-teal"
-                              font-weight=500
-                            text st.resumeTitle font-size=15
-                              font-weight=600
-                              color="-exact-label"
-                              line-clamp=1
-                              testId="resume-title"
-                            text resumeSubtitle font-size=12
-                              color="-exact-secondary-label"
-                              line-clamp=1
-                              testId="resume-sub"
-                            if st.resumeDuration > 0
-                              view width="100%"
-                                height=3
-                                border-radius=2
-                                background-color="-exact-secondary-fill"
-                                margin-top=6
-                                overflow="hidden"
-                                view height="100%"
-                                  width=`${resumeProgress}%`
-                                  background-color="AccentColor"
-                                  testId="resume-progress"
+                          class=AddTileButton
+                          press=openProviders
+                          scale=(addTileHovered ? 1.03 : 1)
+                          aria-label="Add streaming service"
+                          title="Add streaming service"
+                          testId="add-provider-card"
                           view width=34
                             height=34
                             border-radius=17
-                            background-color="AccentColor"
-                            flex-shrink=0
+                            background-color="-exact-secondary-fill"
                             display="flex"
                             align-items="center"
                             justify-content="center"
-                            padding-left=3
-                            box-sizing="border-box"
-                            text "▶" font-size=14 color="AccentColorText"
+                            text "+" font-size=22 font-weight=400 color=(addTileHovered ? "-exact-label" : "-exact-secondary-label")
+                          text "Add Service" font-weight=500
+                            font-size=12
+                            color=(addTileHovered ? "-exact-label" : "-exact-secondary-label")
 
-                    if hasSites
-                      view testId="site-grid" position="relative" width="100%" height=gridHeight
-                        for site, idx in st.sites key=site.host
-                          view position="absolute"
-                            top=0
-                            left=0
-                            width=128
-                            height=80
-                            translate=`${tileX(idx, gridCols)}px ${tileY(idx, gridCols)}px`
-                            transition=(vp.prefersReducedMotion ? "none" : "translate 220ms cubic-bezier(0.22, 1, 0.36, 1)")
-                            hover=hoverTile(site.host, site.url)
-                            testId=`tile-wrap-${site.host}`
-                            view position="relative"
-                              width="100%"
-                              height="100%"
-                              opacity=(tileConcealed ? 0 : 1)
-                              scale=(tileConcealed ? 0.94 : 1)
-                              translate=(tileConcealed ? "0px 8px" : "0px 0px")
-                              filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
-                              transition=(tileConcealed or vp.prefersReducedMotion ? "none" : `opacity 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, scale 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, translate 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, filter 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms`)
-                              button appearance="none"
-                                class=TileButton
-                                pointerdown=prewarmTile(site.url)
-                                press=openSite(site.url, idx)
-                                scale=(hoveredHost == site.host ? 1.03 : 1)
-                                title=site.host
-                                aria-label=site.name
-                                testId=`tile-${site.host}`
-                                if site.icon != ""
-                                  image site.icon width=40 height=40 border-radius=9 object-fit="contain"
-                                else
-                                  view width=40
-                                    height=40
-                                    border-radius=9
-                                    background-color="-exact-secondary-fill"
-                                    display="flex"
-                                    align-items="center"
-                                    justify-content="center"
-                                    text site.initial font-size=20 font-weight=600 color="-exact-label"
-                                text site.name font-weight=500
-                                  font-size=13
-                                  color="-exact-label"
-                                  max-width="90%"
-                                  line-clamp=1
-                                  testId=`tile-name-${site.host}`
-                              button appearance="none"
-                                class=RemoveBtn
-                                press=removeSite(site.host)
-                                opacity=(hoveredHost == site.host ? 1 : 0)
-                                aria-label=`Remove ${site.name}`
-                                title="Remove"
-                                testId=`remove-${site.host}`
-                                text "×"
+                  if isEmpty
+                    column testId="empty-state"
+                      width="100%"
+                      align-items="center"
+                      justify-content="center"
+                      gap=4
+                      padding-top=28
+                      padding-bottom=12
+                      padding-left=16
+                      padding-right=16
+                      box-sizing="border-box"
+                      text "Click + to add streaming services, or watch any video site." color="-exact-secondary-label"
+                        font-size=13
+                        text-align="center"
+                      row align-items="center" justify-content="center" gap=4
+                        text "Press" color="-exact-secondary-label" font-size=13
+                        view class=KeyBadge
+                          text "⌘L" color="-exact-label" font-size=13 testId="empty-shortcut"
+                        text "to open a URL." color="-exact-secondary-label" font-size=13
 
             // Top-edge 18px drag strip: hover reveals, drag moves window, double-click locks video aspect
             view id="drag-strip"
@@ -1229,7 +1486,7 @@ component Float
 
             // GPU WGSL home reveal & site wipe transition shader (dual-slot mount resets u.time to 0 on new gesture)
             if showHomeFx and fxSlot == 0
-              canvas surface=shader(src="assets/home-transition.wgsl", alphaMode="premultiplied", effectKind=fxKind, siteCount=st.sites.length, gridCols=gridCols, hasResume=(st.hasResume ? 1 : 0), resumeH=resumeEstH, originCx=fxOriginCx, originCy=fxOriginCy, originW=fxOriginW, originH=fxOriginH, originRadius=fxOriginR, releaseAt=fxReleaseAt, revealStyle=revealStyleCode)
+              canvas surface=shader(src="assets/home-transition.wgsl", alphaMode="premultiplied", effectKind=fxKind, siteCount=gridTotalTiles, gridCols=gridCols, hasResume=(st.hasResume ? 1 : 0), resumeH=resumeEstH, originCx=fxOriginCx, originCy=fxOriginCy, originW=fxOriginW, originH=fxOriginH, originRadius=fxOriginR, releaseAt=fxReleaseAt, revealStyle=revealStyleCode)
                 position="absolute"
                 inset=0
                 width="100%"
@@ -1240,7 +1497,7 @@ component Float
                 testId="home-transition-fx"
 
             if showHomeFx and fxSlot == 1
-              canvas surface=shader(src="assets/home-transition.wgsl", alphaMode="premultiplied", effectKind=fxKind, siteCount=st.sites.length, gridCols=gridCols, hasResume=(st.hasResume ? 1 : 0), resumeH=resumeEstH, originCx=fxOriginCx, originCy=fxOriginCy, originW=fxOriginW, originH=fxOriginH, originRadius=fxOriginR, releaseAt=fxReleaseAt, revealStyle=revealStyleCode)
+              canvas surface=shader(src="assets/home-transition.wgsl", alphaMode="premultiplied", effectKind=fxKind, siteCount=gridTotalTiles, gridCols=gridCols, hasResume=(st.hasResume ? 1 : 0), resumeH=resumeEstH, originCx=fxOriginCx, originCy=fxOriginCy, originW=fxOriginW, originH=fxOriginH, originRadius=fxOriginR, releaseAt=fxReleaseAt, revealStyle=revealStyleCode)
                 position="absolute"
                 inset=0
                 width="100%"
@@ -1249,6 +1506,153 @@ component Float
                 pointer-events="none"
                 aria-hidden=true
                 testId="home-transition-fx"
+
+        // Streaming providers directory page (opened from the trailing "+" card in the Home mosaic)
+        if e.name == "providers"
+          column navigationKey=`${e.id}`
+            navigationBar="none"
+            testId="providers-view"
+            position="absolute"
+            inset=0
+            width="100%"
+            height="100%"
+            z-index=35
+            background-color=(st.nativeBackdrop ? "transparent" : "-exact-background")
+            background-image=(st.nativeBackdrop ? "none" : "linear-gradient(180deg, #1c1d22 0%, #0b0b0d 70%)")
+            box-sizing="border-box"
+
+            head title="Add Streaming Service"
+
+            // Top-edge 18px drag strip so the chromeless window remains draggable on the Providers page
+            view app-region="drag"
+              hover=hoverDragStrip
+              position="absolute"
+              top=0
+              left=0
+              right=0
+              height=18
+              z-index=20
+              background-color="light-dark(rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.45))"
+              opacity=(dragStripHovered ? 1 : 0)
+              transition=(vp.prefersReducedMotion ? "none" : "opacity 160ms ease")
+
+            column flex-shrink=0 width="100%" padding-top=24 padding-left=16 padding-right=16 padding-bottom=10 gap=8 box-sizing="border-box"
+              row width="100%" align-items="center" justify-content="space-between" gap=8
+                row flex=1 min-width=0 align-items="center" gap=8
+                  button appearance="none"
+                    class=HeaderBtn
+                    press=closeProviders
+                    aria-label="Back to Home"
+                    testId="providers-back"
+                    text "←"
+                  text "Streaming Services" role="heading" aria-level=1 font-size=15 font-weight=600 color="-exact-label" line-clamp=1
+                button appearance="none"
+                  class=(st.sites.length > 0 ? HeaderDoneBtn : HeaderBtn)
+                  press=closeProviders
+                  aria-label="Done"
+                  testId="providers-done"
+                  text (st.sites.length > 0 ? `Done (${st.sites.length})` : "Done")
+
+              input type="search"
+                id="providers-search"
+                testId="providers-search"
+                value=providerQuery
+                input=editProviderQuery
+                key=providerKeyDown
+                placeholder="Search streaming providers (Netflix, Apple TV+, Twitch…)"
+                aria-label="Search streaming providers"
+                width="100%"
+                box-sizing="border-box"
+
+              row role="tablist" aria-label="Provider categories" width="100%" gap=6 flex-wrap="wrap"
+                button appearance="none"
+                  role="tab"
+                  aria-selected=(providerCategory == "all")
+                  class=(providerCategory == "all" ? FilterPillActive : FilterPill)
+                  press=setProviderCategory("all")
+                  testId="provider-cat-all"
+                  text "All"
+                button appearance="none"
+                  role="tab"
+                  aria-selected=(providerCategory == "streaming")
+                  class=(providerCategory == "streaming" ? FilterPillActive : FilterPill)
+                  press=setProviderCategory("streaming")
+                  testId="provider-cat-streaming"
+                  text "Streaming"
+                button appearance="none"
+                  role="tab"
+                  aria-selected=(providerCategory == "video")
+                  class=(providerCategory == "video" ? FilterPillActive : FilterPill)
+                  press=setProviderCategory("video")
+                  testId="provider-cat-video"
+                  text "Video & Live"
+                button appearance="none"
+                  role="tab"
+                  aria-selected=(providerCategory == "live")
+                  class=(providerCategory == "live" ? FilterPillActive : FilterPill)
+                  press=setProviderCategory("live")
+                  testId="provider-cat-live"
+                  text "Live & Sports"
+                button appearance="none"
+                  role="tab"
+                  aria-selected=(providerCategory == "anime")
+                  class=(providerCategory == "anime" ? FilterPillActive : FilterPill)
+                  press=setProviderCategory("anime")
+                  testId="provider-cat-anime"
+                  text "Anime & Indie"
+                button appearance="none"
+                  role="tab"
+                  aria-selected=(providerCategory == "free")
+                  class=(providerCategory == "free" ? FilterPillActive : FilterPill)
+                  press=setProviderCategory("free")
+                  testId="provider-cat-free"
+                  text "Free"
+
+            scroll flex=1 min-height=0 width="100%" scrollbar-width="none"
+              column width="100%" padding-top=4 padding-left=16 padding-right=16 padding-bottom=16 gap=12 box-sizing="border-box"
+                if providers.items.length == 0
+                  column testId="providers-empty" width="100%" align-items="center" justify-content="center" gap=8 padding-top=28 padding-bottom=20
+                    text "No matching streaming providers." font-size=13 color="-exact-secondary-label" text-align="center"
+                    button appearance="none"
+                      class=HeaderDoneBtn
+                      press=openUrlBarFromProviders
+                      testId="providers-open-url"
+                      text (providerQuery.trim() != "" ? `Open "${providerQuery.trim()}" in URL Bar` : "Open URL Bar (⌘L)")
+                else
+                  row testId="providers-grid" width="100%" flex-wrap="wrap" gap=10
+                    for p in providers.items key=p.id
+                      button appearance="none"
+                        class=(addedHosts.includes(p.normHost) ? ProviderCardAdded : ProviderCard)
+                        press=toggleProvider(p.name, p.url, p.host, p.icon)
+                        hover=hoverProvider(p.id)
+                        scale=(hoveredProviderId == p.id ? 1.03 : 1)
+                        background-color=(addedHosts.includes(p.normHost) ? (hoveredProviderId == p.id ? "rgba(20, 160, 160, 0.24)" : "rgba(20, 160, 160, 0.16)") : (hoveredProviderId == p.id ? "-exact-fill" : "-exact-tertiary-fill"))
+                        title=`${p.name} (${p.host})`
+                        aria-label=(addedHosts.includes(p.normHost) ? `Remove ${p.name}` : `Add ${p.name}`)
+                        aria-pressed=addedHosts.includes(p.normHost)
+                        testId=`provider-${p.id}`
+                        image p.icon width=40 height=40 border-radius=9 object-fit="contain"
+                        text p.name font-size=12
+                          font-weight=500
+                          color="-exact-label"
+                          max-width="92%"
+                          line-clamp=1
+                          text-align="center"
+                        if addedHosts.includes(p.normHost)
+                          view position="absolute"
+                            top=5
+                            right=5
+                            width=18
+                            height=18
+                            border-radius=9
+                            background-color="AccentColor"
+                            display="flex"
+                            align-items="center"
+                            justify-content="center"
+                            testId=`provider-added-${p.id}`
+                            text "✓" font-size=11 font-weight=700 color="AccentColorText"
+
+                  text "Click any logo to add a card to Home, then open the card to sign in." font-size=11 color="-exact-secondary-label" text-align="center" width="100%" padding-top=4
 
         // Dedicated Settings window (macOS: named `settings` window via ⌘,; web/Linux: in-place route)
         if e.name == "settings"
@@ -1617,6 +2021,10 @@ component Float
                   view class=KeyBadge
                     text "⇧⌘H" font-size=11
                 row width="100%" align-items="center" justify-content="space-between" gap=8
+                  text "Add Streaming Service" font-size=12
+                  view class=KeyBadge
+                    text "⇧⌘P" font-size=11
+                row width="100%" align-items="center" justify-content="space-between" gap=8
                   text "Resume Last Video" font-size=12
                   view class=KeyBadge
                     text "⇧⌘R" font-size=11
@@ -1728,6 +2136,15 @@ component Float
             aria-keyshortcuts="Meta+Shift+H"
             aria-label="Home"
             testId="cmd-home"
+          button appearance="none"
+            width=4
+            height=4
+            overflow="hidden"
+            press=openProviders
+            -exact-menu="view"
+            aria-keyshortcuts="Meta+Shift+P"
+            aria-label="Add Streaming Service…"
+            testId="cmd-providers"
           button appearance="none"
             width=4
             height=4

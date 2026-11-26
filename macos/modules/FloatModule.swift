@@ -11,6 +11,7 @@ struct FloatSite: Codable {
     var host: String
     var url: String
     var icon: String?
+    var name: String?
     var last: Date
     var count: Int
 }
@@ -43,6 +44,11 @@ private func floatFormatChordLabel(_ keys: String) -> String {
 
 private func floatIsWeb(_ u: URL) -> Bool {
     ["http", "https"].contains(u.scheme?.lowercased() ?? "")
+}
+
+private func floatNormalizedHost(_ host: String) -> String {
+    let lower = host.lowercased()
+    return lower.hasPrefix("www.") ? String(lower.dropFirst(4)) : lower
 }
 
 private func floatSiteName(_ host: String) -> String {
@@ -861,18 +867,45 @@ private final class FloatStore {
     func recordSite(_ url: URL, icon: String?) {
         guard let host = url.host, let scheme = url.scheme, scheme.hasPrefix("http") else { return }
         var list = allSites()
-        if let idx = list.firstIndex(where: { $0.host == host }) {
+        let norm = floatNormalizedHost(host)
+        if let idx = list.firstIndex(where: { floatNormalizedHost($0.host) == norm }) {
             list[idx].last = Date()
             list[idx].count += 1
-            if let icon, !icon.isEmpty { list[idx].icon = icon }
+            let keepBundled = list[idx].icon?.hasPrefix("assets/providers/") == true
+            if let icon, !icon.isEmpty, !keepBundled { list[idx].icon = icon }
         } else {
-            list.append(FloatSite(host: host, url: "\(scheme)://\(host)", icon: icon, last: Date(), count: 1))
+            list.append(FloatSite(host: host, url: "\(scheme)://\(host)", icon: icon, name: nil, last: Date(), count: 1))
+        }
+        saveSites(list)
+    }
+
+    func addSite(url: URL, name: String?, icon: String?) {
+        guard let host = url.host, let scheme = url.scheme, scheme.hasPrefix("http") else { return }
+        var list = allSites()
+        let norm = floatNormalizedHost(host)
+        let cleanName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanIcon = icon?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let idx = list.firstIndex(where: { floatNormalizedHost($0.host) == norm }) {
+            list[idx].url = url.absoluteString
+            list[idx].last = Date()
+            if let cleanName, !cleanName.isEmpty { list[idx].name = cleanName }
+            if let cleanIcon, !cleanIcon.isEmpty { list[idx].icon = cleanIcon }
+        } else {
+            list.append(FloatSite(
+                host: host,
+                url: url.absoluteString,
+                icon: (cleanIcon?.isEmpty == false ? cleanIcon : nil),
+                name: (cleanName?.isEmpty == false ? cleanName : nil),
+                last: Date(),
+                count: 1
+            ))
         }
         saveSites(list)
     }
 
     func removeSite(_ host: String) {
-        saveSites(allSites().filter { $0.host != host })
+        let norm = floatNormalizedHost(host)
+        saveSites(allSites().filter { floatNormalizedHost($0.host) != norm })
     }
 
     func loadResume() -> FloatResume? {
@@ -2328,7 +2361,12 @@ final class FloatModule: ExactModule {
         case "load": load(arg)
         case "showHome": showHome()
         case "resumeLast": resumeLast()
+        case "addSite": addSite(arg)
         case "removeSite":
+            let norm = floatNormalizedHost(arg)
+            for existing in store.allSites() where floatNormalizedHost(existing.host) == norm {
+                activeBrowser?.removeWarmSite(existing.host)
+            }
             store.removeSite(arg)
             activeBrowser?.removeWarmSite(arg)
             notifyChanged()
@@ -2412,7 +2450,8 @@ final class FloatModule: ExactModule {
     private func snapshotState() -> [String: Any] {
         let sitesList = store.allSites().sorted { $0.last > $1.last }
         let sites: [[String: Any]] = sitesList.map { s in
-            let name = floatSiteName(s.host)
+            let customName = s.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = (customName?.isEmpty == false ? customName! : floatSiteName(s.host))
             return [
                 "host": s.host,
                 "url": s.url,
@@ -2435,7 +2474,8 @@ final class FloatModule: ExactModule {
             resumeUrl = r.url
             resumeHost = host
             resumeTitle = r.title.isEmpty ? floatSiteName(host) : r.title
-            resumeIcon = sitesList.first(where: { $0.host == host }).flatMap { $0.icon ?? "\($0.url)/favicon.ico" }
+            let normResume = floatNormalizedHost(host)
+            resumeIcon = sitesList.first(where: { floatNormalizedHost($0.host) == normResume }).flatMap { $0.icon ?? "\($0.url)/favicon.ico" }
                 ?? "https://\(host)/favicon.ico"
             resumeTime = r.time
             resumeDuration = r.duration
@@ -2809,6 +2849,22 @@ final class FloatModule: ExactModule {
 
     func recordSite(_ url: URL, icon: String?) {
         store.recordSite(url, icon: icon)
+        notifyChanged()
+    }
+
+    func addSite(_ raw: String) {
+        var urlStr = raw
+        var name: String?
+        var icon: String?
+        if let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let parsedUrl = obj["url"] as? String {
+            urlStr = parsedUrl
+            name = obj["name"] as? String
+            icon = obj["icon"] as? String
+        }
+        guard let url = resolveWebURL(urlStr) else { return }
+        store.addSite(url: url, name: name, icon: icon)
         notifyChanged()
     }
 

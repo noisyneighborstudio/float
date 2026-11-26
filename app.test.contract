@@ -280,3 +280,97 @@ test "glass reveal and open transition styles persist across reload and reverse 
   clock +1100
   expect state fxKind == 0
   expect tree missing "home-transition-fx"
+
+test "trailing + card opens streaming providers page, adds cards to mosaic, and opens card to sign in"
+  clock data
+  expect tree has "site-grid"
+  expect tree has "add-provider-card"
+
+  // Clicking the + card opens the streaming providers page
+  tap "add-provider-card"
+  clock data
+  expect tree has "providers-view"
+  expect tree has "providers-grid"
+  expect tree has "provider-netflix"
+  expect tree has "provider-appletv"
+  expect tree has "provider-youtube"
+  expect tree missing "provider-added-netflix"
+
+  // Clicking a provider logo adds a card and marks it added
+  tap "provider-netflix"
+  clock data
+  expect tree has "provider-added-netflix"
+  expect state st.sites.length == 1
+
+  // Filtering by category narrows the directory
+  tap "provider-cat-anime"
+  clock data
+  expect tree has "provider-crunchyroll"
+  expect tree missing "provider-netflix"
+
+  tap "provider-cat-all"
+  clock data
+
+  // Search matches aliases as well as provider names
+  type "providers-search" "apple"
+  clock data
+  expect tree has "provider-appletv"
+  expect tree missing "provider-netflix"
+
+  // Add Apple TV+ while filtered
+  tap "provider-appletv"
+  clock data
+  expect tree has "provider-added-appletv"
+  expect state st.sites.length == 2
+
+  // Toggle off and back on verifies add/remove
+  tap "provider-appletv"
+  clock data
+  expect tree missing "provider-added-appletv"
+  expect state st.sites.length == 1
+  tap "provider-appletv"
+  clock data
+  expect tree has "provider-added-appletv"
+  expect state st.sites.length == 2
+
+  // Return to Home: both provider cards and the trailing + card appear in the mosaic
+  tap "providers-done"
+  clock data
+  expect tree missing "providers-view"
+  expect tree has "home-screen"
+  expect tree has "tile-www.netflix.com"
+  expect tree has "tile-tv.apple.com"
+  expect tree has "add-provider-card"
+  expect text "tile-name-www.netflix.com" == "Netflix"
+  expect text "tile-name-tv.apple.com" == "Apple TV+"
+
+  // Added provider cards persist across reload
+  reload
+  clock data
+  expect tree has "tile-www.netflix.com"
+  expect tree has "tile-tv.apple.com"
+  expect tree has "add-provider-card"
+
+  // Clicking a card opens that provider so the user can sign in
+  tap "tile-tv.apple.com"
+  clock +250
+  clock data
+  expect state st.mode == "web"
+  expect state st.currentUrl == "https://tv.apple.com/"
+
+test "providers search empty state can open URL bar with the typed query"
+  clock data
+  tap "add-provider-card"
+  clock data
+  expect tree has "providers-view"
+
+  type "providers-search" "example.org"
+  clock data
+  expect tree has "providers-empty"
+  expect tree has "providers-open-url"
+
+  tap "providers-open-url"
+  clock data
+  expect tree missing "providers-view"
+  expect tree has "url-bar"
+  expect state urlDraft == "example.org"

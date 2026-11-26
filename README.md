@@ -54,8 +54,8 @@ On by default. Float detects the main playing `<video>` on any page and pins its
 ### Native Liquid Glass UI
 Both the Home window and the floating `?` Keyboard Shortcuts HUD use native macOS 26 **Liquid Glass** (`NSGlassEffectView`), falling back seamlessly to a translucent `.hudWindow` backdrop (`NSVisualEffectView`) on earlier macOS versions.
 
-### Smart Home Mosaic & One-Click Resume (`⇧⌘H` / `⇧⌘R`)
-Float automatically builds a clean tile mosaic from the video sites you actually watch (hover any tile to remove it). A glowing **Resume** card remembers your last video's title (pulled from player overlays, Media Session, or page metadata) and exact timestamp with a live progress bar — automatically skipping trailers, previews, and ads under 3 minutes.
+### Smart Home Mosaic, Streaming Providers & One-Click Resume (`⇧⌘H` / `⇧⌘P` / `⇧⌘R`)
+Float automatically builds a clean tile mosaic from the video sites you watch — or click the trailing **`+`** card (`⇧⌘P`) to pick from 40+ built-in video streaming providers (Netflix, Apple TV+, Prime Video, Disney+, HBO Max, Hulu, YouTube, Twitch, Plex, Crunchyroll, and more), add cards to your mosaic with a click, and sign in directly via each card (hover any tile to remove it). A glowing **Resume** card remembers your last video's title (pulled from player overlays, Media Session, or page metadata) and exact timestamp with a live progress bar — automatically skipping trailers, previews, and ads under 3 minutes.
 
 ### Global Quick Fade (Hold `Right ⌘`)
 Peek right through Float from **any** app without losing your spot. Holding `Right ⌘` smoothly fades the window to your configured opacity (default `50%`) and restores it on release, respecting macOS Reduce Motion. Customize everything in **Float › Settings…** (`⌘,`):
@@ -95,6 +95,7 @@ Release builds automatically stay up to date via **Sparkle** (**Float › Check 
 | <kbd>⌘</kbd><kbd>L</kbd> | Open URL or search YouTube |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd> | Open URL from clipboard |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>H</kbd> | Home mosaic |
+| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>P</kbd> | Add streaming service (provider directory) |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>R</kbd> | Resume last video at saved timestamp |
 | <kbd>⌃</kbd><kbd>Space</kbd> | Play / Pause active video |
 | <kbd>⌘</kbd><kbd>R</kbd> | Reload page |
