@@ -90,23 +90,32 @@ jobs:
           keychain="$RUNNER_TEMP/float.keychain-db"
           failed=0
           
-          # Check Rust toolchain availability (Exact builds with Rust)
-          if ! command -v cargo >/dev/null 2>&1; then
-            echo "::error::cargo not found — Exact requires Rust. Install via 'rustup-init' or 'brew install rust'."
+          # Check Rust toolchain availability (Exact builds with Rust and pins a specific version)
+          if ! command -v rustup >/dev/null 2>&1; then
+            echo "::error::rustup not found — Exact requires Rust with the pinned toolchain. Install via 'curl --proto \"=https\" --tlsv1.2 -sSf https://sh.rustup.rs | sh'."
             failed=1
           else
-            rust_version=$(rustc --version 2>&1 | awk '{print $2}')
-            echo "Found Rust toolchain: $rust_version"
-            # Verify rustc can compile (guards against incomplete/broken installations)
-            if ! rustc --version >/dev/null 2>&1; then
-              echo "::error::rustc is present but not functional. Reinstall the Rust toolchain."
-              failed=1
-            fi
-            # Read the pinned version from Exact's rust-toolchain.toml if available
+            # Parse the pinned toolchain from Exact's rust-toolchain.toml or rust-toolchain
+            required=""
             if [[ -f "$EXACT/rust-toolchain.toml" ]]; then
-              required=$(awk -F'"' '/^channel = / {print $2}' "$EXACT/rust-toolchain.toml")
-              if [[ -n $required && $rust_version != "$required" ]]; then
-                echo "::warning::Rust $rust_version found, but Exact pins $required. Run 'rustup install $required && rustup default $required'."
+              required=$(awk -F'["\047]' '/^channel[[:space:]]*=[[:space:]]*["\047]/ {for(i=2;i<=NF;i++) if($i ~ /[0-9]/) {print $i; exit}}' "$EXACT/rust-toolchain.toml")
+            elif [[ -f "$EXACT/rust-toolchain" ]]; then
+              required=$(head -n1 "$EXACT/rust-toolchain" | tr -d '[:space:]')
+            fi
+            
+            if [[ -z $required ]]; then
+              echo "::error::No rust-toolchain or rust-toolchain.toml found in $EXACT — cannot verify pinned Rust version."
+              failed=1
+            else
+              echo "Exact pins Rust toolchain: $required"
+              # Verify the pinned toolchain is installed and functional from within Exact's directory
+              # (rustup resolves toolchains per-directory based on rust-toolchain files)
+              if ! (cd "$EXACT" && rustc --version >/dev/null 2>&1); then
+                echo "::error::Pinned Rust toolchain $required is not installed or not functional. Run 'rustup install $required'."
+                failed=1
+              else
+                installed_version=$(cd "$EXACT" && rustc --version 2>&1 | awk '{print $2}')
+                echo "Pinned Rust toolchain $required is installed and functional (rustc $installed_version)."
               fi
             fi
           fi
@@ -154,13 +163,18 @@ jobs:
             [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
           done
           
-          # Re-unlock build keychain before signing to guard against timeout locks
-          # (macOS may lock keychains after inactivity even with extended timeout settings)
-          if [[ -f "$keychain" ]]; then
-            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-            security set-keychain-settings -lut 21600 "$keychain"
-            echo "Build keychain re-unlocked before release signing."
+          # Re-unlock build keychain before signing to guard against timeout locks.
+          # The keychainLocked error named the *default* keychain, so also re-assert that
+          # the default keychain is still the unlocked build keychain, not the login keychain.
+          if [[ ! -f "$keychain" ]]; then
+            echo "::error::Build keychain disappeared before release signing. Check workflow steps."
+            exit 1
           fi
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          echo "Build keychain re-unlocked and re-asserted as default before release signing."
           
           mkdir -p .exact
           ln -sfn "$EXACT" .exact/checkout
