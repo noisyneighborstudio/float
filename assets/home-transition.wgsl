@@ -212,22 +212,58 @@ fn renderCurtainReveal(p: vec2f, size: vec2f, t: f32) -> vec4f {
     return vec4f(clamp(rgb * a, vec3f(0.0), vec3f(a)), a);
 }
 
-// Shared breathing liquid-glass veil base color (seamless handoff between cover & wipe-open)
+// Shared alive liquid-glass holding surface: flows continuously with layered emerald-teal
+// caustics and smooth periodic prismatic sheen sweeps while waiting for page TTI.
 fn veilSurface(uv: vec2f, t: f32) -> vec3f {
     let diag = uv.x * 0.65 + uv.y * 0.35;
-    let breathe = 0.5 + 0.5 * sin(t * 4.5);
-    var rgb = mix(vec3f(0.03, 0.14, 0.17), vec3f(0.05, 0.28, 0.32), diag * 0.65 + 0.10 * breathe);
-    let sheenShift = mix(-0.35, 1.35, fract(t * 0.68));
-    let sheen = exp(-pow((diag - sheenShift) * 5.5, 2.0)) * 0.24;
-    rgb = mix(rgb, vec3f(0.80, 1.0, 0.99), sheen);
+    let anti = uv.x * 0.38 - uv.y * 0.62;
+
+    // Slow organic liquid-glass caustic interference (continuous, no wrap discontinuity)
+    let waveA = sin(diag * 7.2 - t * 2.15 + sin(anti * 4.4 + t * 1.15) * 0.85);
+    let waveB = cos(anti * 6.0 + t * 1.65 + cos(diag * 5.2 - t * 1.35) * 0.75);
+    let caustic = clamp01(0.5 + 0.5 * (waveA * 0.58 + waveB * 0.42));
+    let causticHighlight = pow(caustic, 3.0);
+
+    let breathe = 0.5 + 0.5 * sin(t * 2.4);
+    var rgb = mix(
+        vec3f(0.025, 0.115, 0.145),
+        vec3f(0.045, 0.255, 0.295),
+        clamp01(diag * 0.58 + 0.14 * breathe + 0.18 * caustic)
+    );
+    rgb = rgb + vec3f(0.06, 0.32, 0.34) * causticHighlight * 0.42;
+
+    // Smooth periodic diagonal specular sheen with subtle prismatic dispersion (1.75s cycle,
+    // bell-enveloped offscreen so wrap-around is completely invisible)
+    let cycle = fract(t / 1.75);
+    let sweepEnv = sin(cycle * 3.14159265);
+    let sheenPos = mix(-0.42, 1.42, easeInOutCubic(cycle));
+    let dSheen = diag - sheenPos;
+    let core = exp(-pow(dSheen * 6.5, 2.0));
+    let rSplit = exp(-pow((dSheen - 0.024) * 7.2, 2.0));
+    let bSplit = exp(-pow((dSheen + 0.026) * 7.2, 2.0));
+    let sheenCol = vec3f(
+        0.58 * rSplit + 0.42 * core,
+        0.95 * core + 0.18 * rSplit,
+        0.98 * bSplit + 0.25 * core
+    );
+    let sheenAmt = clamp01((core * 0.30 + (rSplit + bSplit) * 0.09) * sweepEnv);
+    rgb = mix(rgb, sheenCol, sheenAmt);
+
+    // Subtle opposing undercurrent glow so the glass stays visibly alive between primary sweeps
+    let backCycle = fract(t / 2.6 + 0.5);
+    let backEnv = sin(backCycle * 3.14159265);
+    let backPos = mix(1.30, -0.30, easeInOutCubic(backCycle));
+    let backBand = exp(-pow((diag - backPos) * 4.2, 2.0)) * backEnv * 0.14;
+    rgb = mix(rgb, vec3f(0.26, 0.90, 0.92), backBand);
+
     return rgb;
 }
 
-// Effect 3: Tile-origin liquid-glass lens morph -> breathing veil -> seamless caustic wipe-open
+// Effect 3: Tile-origin liquid-glass lens morph -> alive flowing glass cycle -> seamless wipe-open
 // Stays on the same GPU surface when u.releaseAt transitions from -1 to >= 0 (zero swap blink).
 fn renderLensOpen(p: vec2f, size: vec2f, t: f32, aa: f32) -> vec4f {
     let expandDur = 0.22;
-    let wipeDur = 0.30;
+    let wipeDur = 0.34;
     let releasing = u.releaseAt >= 0.0;
     let wipeStart = max(expandDur, u.releaseAt);
     if (releasing && t >= wipeStart + wipeDur + 0.04) {
@@ -256,13 +292,36 @@ fn renderLensOpen(p: vec2f, size: vec2f, t: f32, aa: f32) -> vec4f {
     let uv = clamp((p - curCenter + curHalf) / max(curSize, vec2f(1.0, 1.0)), vec2f(0.0), vec2f(1.0));
     let diag = uv.x * 0.65 + uv.y * 0.35;
     var glassRgb = veilSurface(uv, t);
-    var veilA = mix(0.68, 0.97, easeOutCubic(expU));
+    // Reach full 1.0 opacity once expanded so zero blank page flash can bleed through behind the veil
+    var veilA = mix(0.72, 1.0, easeOutCubic(expU));
 
-    let rimW = mix(2.8, 1.4, expE);
+    // Smoothly blend from entrance bevel into a living orbiting Fresnel rim + gentle concentric ripple while waiting
+    let holdIn = smoothstep(0.60, 1.0, expU);
+    var holdFade = 1.0;
+    if (releasing && t > wipeStart) {
+        holdFade = 1.0 - smoothstep(0.0, 0.14, t - wipeStart);
+    }
+
+    // Concentric refractive liquid-glass ripple expanding gently from center during hold (1.75s cycle)
+    let holdT = max(0.0, t - expandDur * 0.5);
+    let pulsePhase = fract(holdT / 1.75);
+    let pulseEnv = sin(pulsePhase * 3.14159265) * holdIn * holdFade;
+    let normR = length((uv - vec2f(0.5, 0.5)) * vec2f(1.0, size.y / max(size.x, 1.0)));
+    let ringR = mix(0.04, 0.72, easeOutCubic(pulsePhase));
+    let pulseRing = exp(-pow((normR - ringR) * 16.0, 2.0)) * pulseEnv * 0.18;
+    glassRgb = mix(glassRgb, vec3f(0.42, 0.98, 0.98), pulseRing);
+
+    // Living Fresnel perimeter rim: bright on expand, then softly breathing with an orbiting cyan-white glint
+    let rimW = mix(2.8, 1.8, expE);
     let rimM = smoothstep(-rimW - aa, -rimW + aa, dist) * (1.0 - smoothstep(-aa, aa, dist));
-    let rimFade = 1.0 - smoothstep(0.65, 1.0, expU);
-    glassRgb = mix(glassRgb, vec3f(0.66, 1.0, 0.99), rimM * 0.95 * rimFade);
-    veilA = max(veilA, rimM * rimFade);
+    let enterRim = 1.0 - smoothstep(0.65, 1.0, expU);
+    let angle = atan2(p.y - curCenter.y, p.x - curCenter.x);
+    let orbitGlint = pow(0.5 + 0.5 * cos(angle - t * 2.1), 4.0);
+    let holdRim = holdIn * holdFade * (0.28 + 0.52 * orbitGlint);
+    let rimStrength = clamp01(enterRim * 0.95 + holdRim);
+    let rimCol = mix(vec3f(0.32, 0.94, 0.96), vec3f(0.84, 1.0, 1.0), orbitGlint * holdIn);
+    glassRgb = mix(glassRgb, rimCol, rimM * rimStrength);
+    veilA = max(veilA, rimM * rimStrength);
 
     var revealMask = 1.0;
     var edgeGlow = 0.0;
@@ -279,10 +338,10 @@ fn renderLensOpen(p: vec2f, size: vec2f, t: f32, aa: f32) -> vec4f {
     return vec4f(clamp(rgb * fa, vec3f(0.0), vec3f(fa)), fa);
 }
 
-// Effect 4: Directional diagonal liquid-glass curtain -> breathing veil -> seamless wipe-open
+// Effect 4: Directional diagonal liquid-glass curtain -> alive flowing glass cycle -> seamless wipe-open
 fn renderDiagOpen(p: vec2f, size: vec2f, t: f32) -> vec4f {
     let coverDur = 0.21;
-    let clearDur = 0.30;
+    let clearDur = 0.34;
     let releasing = u.releaseAt >= 0.0;
     let clearStart = max(coverDur, u.releaseAt);
     if (releasing && t >= clearStart + clearDur + 0.04) {
@@ -307,8 +366,20 @@ fn renderDiagOpen(p: vec2f, size: vec2f, t: f32) -> vec4f {
     }
 
     let veilMask = clamp01(covered - cleared);
-    let veilCol = veilSurface(uv, t);
-    let bodyA = veilMask * 0.97;
+    var veilCol = veilSurface(uv, t);
+
+    // Subtle flowing diagonal caustic ribbon while holding
+    let holdIn = smoothstep(0.75, 1.0, coverU);
+    var holdFade = 1.0;
+    if (releasing && t > clearStart) {
+        holdFade = 1.0 - smoothstep(0.0, 0.14, t - clearStart);
+    }
+    let ribbonCycle = fract(t / 1.75);
+    let ribbonPos = mix(-0.28, 1.28, easeInOutCubic(ribbonCycle));
+    let ribbonBand = exp(-pow((diag - ribbonPos) * 13.0, 2.0)) * sin(ribbonCycle * 3.14159265) * holdIn * holdFade;
+    veilCol = mix(veilCol, vec3f(0.56, 0.99, 0.99), ribbonBand * 0.42);
+
+    let bodyA = veilMask;
     let edge = max(coverEdge, clearEdge);
     let rgb = mix(veilCol, vec3f(0.70, 1.0, 0.99), edge * 0.92);
     let fa = clamp01(max(bodyA, edge * 0.88));

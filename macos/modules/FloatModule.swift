@@ -1136,6 +1136,16 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
 
     func webView(_ w: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         (w as? FloatWebView)?.noteProvisionalNavigationSettled(navigation)
+        let nsErr = error as NSError
+        guard nsErr.domain != NSURLErrorDomain || nsErr.code != NSURLErrorCancelled else { return }
+        instance?.handleActiveFailed(w)
+    }
+
+    func webView(_ w: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        (w as? FloatWebView)?.noteProvisionalNavigationSettled(navigation)
+        let nsErr = error as NSError
+        guard nsErr.domain != NSURLErrorDomain || nsErr.code != NSURLErrorCancelled else { return }
+        instance?.handleActiveFailed(w)
     }
 
     func webView(_ w: WKWebView, didCommit navigation: WKNavigation!) {
@@ -1190,25 +1200,79 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
     }
 }
 
-/// Detects when a client-rendered SPA (like Apple TV+, Netflix, YouTube) has actually painted
-/// real content rather than an empty black #app shell.
+/// Synchronous readiness probe for hidden background warm-pool slots (where rAF may be throttled).
 private let floatContentReadyScript = """
 (() => {
-  if (document.readyState === 'loading') return false;
-  const body = document.body;
-  if (!body) return false;
+  if (!document.body || document.readyState === 'loading') return false;
   const vids = document.querySelectorAll('video');
   for (const v of vids) {
     if (v.readyState >= 2 || v.offsetWidth > 80) return true;
   }
-  const imgs = [...document.querySelectorAll('img')].filter(i => i.complete && i.naturalWidth > 32 && i.offsetWidth > 16);
-  if (imgs.length >= 1) return true;
-  const text = (body.innerText || '').trim();
-  if (text.length >= 60) return true;
-  const graphics = document.querySelectorAll('canvas, svg');
-  if (graphics.length >= 3 && body.offsetHeight > 120) return true;
-  return false;
+  const imgs = [...document.querySelectorAll('img')].filter(i => i.complete && i.naturalWidth > 48 && i.offsetWidth > 16);
+  const text = (document.body.innerText || '').trim();
+  const hasVisual = imgs.length >= 1 || text.length >= 80;
+  if (!hasVisual) return false;
+  const interactive = document.querySelectorAll('a[href], button:not([disabled]), input:not([type="hidden"]), [role="button"], video');
+  return document.readyState === 'complete' && interactive.length >= 1;
 })()
+"""
+
+/// Async TTI + paint readiness probe for the visible active WebView behind the animated glass veil:
+/// confirms the page has painted real visual + clickable content, finished document load (or settled
+/// for >2.2s on long-polling streaming pages), and completed 2 clean animation frames + a quiet timer
+/// without main-thread hydration stalls.
+private let floatInteractiveReadyScript = """
+if (!document.body || document.readyState === 'loading') return false;
+const docComplete = document.readyState === 'complete';
+const navElapsed = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+
+const rootEl = document.getElementById('root') || document.getElementById('app') || document.getElementById('__next') || document.body;
+if (rootEl && rootEl.getAttribute('aria-busy') === 'true' && navElapsed < 4000) return false;
+
+const vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+const isVisibleRect = (el) => {
+  const r = el.getBoundingClientRect();
+  if (r.width < 16 || r.height < 16) return false;
+  if (r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) return false;
+  const cs = getComputedStyle(el);
+  return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity || '1') > 0.1;
+};
+
+const hasReadyVideo = [...document.querySelectorAll('video')].some(v =>
+  (v.readyState >= 2 && isVisibleRect(v)) || (v.offsetWidth >= 160 && v.offsetHeight >= 90 && isVisibleRect(v))
+);
+const hasVisibleImg = [...document.querySelectorAll('img')].some(img =>
+  img.complete && img.naturalWidth > 48 && isVisibleRect(img)
+);
+const hasSizedCanvas = [...document.querySelectorAll('canvas')].some(c => {
+  const r = c.getBoundingClientRect();
+  return r.width >= 120 && r.height >= 80 && isVisibleRect(c);
+});
+const visibleTextLen = (document.body.innerText || '').trim().length;
+const hasVisualContent = hasReadyVideo || hasVisibleImg || hasSizedCanvas || visibleTextLen >= 80;
+
+const interactiveCount = [...document.querySelectorAll('a[href], button:not([disabled]), input:not([type="hidden"]), [role="button"], [tabindex]:not([tabindex="-1"]), video')]
+  .filter(isVisibleRect).length;
+const hasInteractive = hasReadyVideo || interactiveCount >= 1;
+
+if (!hasVisualContent || !hasInteractive) return false;
+if (!docComplete && navElapsed < 2200) return false;
+
+return await new Promise((resolve) => {
+  const t0 = performance.now();
+  requestAnimationFrame(() => {
+    const t1 = performance.now();
+    requestAnimationFrame(() => {
+      const t2 = performance.now();
+      setTimeout(() => {
+        const t3 = performance.now();
+        const frameOk = (t1 - t0) < 120 && (t2 - t1) < 90;
+        const taskOk = (t3 - t2) < 120;
+        resolve(frameOk && taskOk);
+      }, 45);
+    });
+  });
+});
 """
 
 private final class FloatWarmSlot {
@@ -1242,6 +1306,8 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     private var homeIdleCleanup: DispatchWorkItem?
     private var preparedUrl: URL?
     private var activeNavigationToken: Int = 0
+    private var activeNavigationCommitted: Bool = true
+    private var activeProbeToken: Int = 0
     private(set) var activeContentReady: Bool = true
 
     private weak var module: FloatModule?
@@ -1373,27 +1439,49 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     }
 
     func handleActiveCommitted(_ w: WKWebView) {
-        guard w === web, !activeContentReady else { return }
-        let token = activeNavigationToken
-        probeActiveContentReady(token: token, attemptsLeft: 32)
+        guard w === web else { return }
+        activeNavigationCommitted = true
+        guard !activeContentReady, !web.isHidden else { return }
+        startActiveInteractiveProbe(attemptsLeft: 60)
     }
 
     func handleActiveFinished(_ w: WKWebView) {
+        guard w === web else { return }
+        activeNavigationCommitted = true
+        guard !activeContentReady, !web.isHidden else { return }
+        startActiveInteractiveProbe(attemptsLeft: 50)
+    }
+
+    func handleActiveFailed(_ w: WKWebView) {
         guard w === web, !activeContentReady else { return }
+        activeNavigationCommitted = true
+        activeContentReady = true
+        module?.notifyChanged()
+    }
+
+    private func startActiveInteractiveProbe(attemptsLeft: Int) {
+        guard activeNavigationCommitted, !activeContentReady, !web.isHidden else { return }
         let token = activeNavigationToken
-        probeActiveContentReady(token: token, attemptsLeft: 28)
+        guard activeProbeToken != token else { return }
+        activeProbeToken = token
+        probeActiveContentReady(token: token, attemptsLeft: attemptsLeft)
     }
 
     private func probeActiveContentReady(token: Int, attemptsLeft: Int) {
-        guard token == activeNavigationToken, !activeContentReady else { return }
-        web.evaluateJavaScript(floatContentReadyScript) { [weak self] res, _ in
-            guard let self, token == self.activeNavigationToken, !self.activeContentReady else { return }
-            let ready = (res as? Bool) ?? false
+        guard token == activeNavigationToken, activeNavigationCommitted, !activeContentReady, !web.isHidden else { return }
+        web.callAsyncJavaScript(floatInteractiveReadyScript, arguments: [:], in: nil, in: .page) { [weak self] result in
+            guard let self, token == self.activeNavigationToken, self.activeNavigationCommitted, !self.activeContentReady else { return }
+            let ready: Bool
+            if case .success(let val) = result {
+                ready = (val as? Bool) ?? false
+            } else {
+                ready = false
+            }
             if ready || attemptsLeft <= 1 {
                 self.activeContentReady = true
                 self.module?.notifyChanged()
             } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.11) { [weak self] in
                     self?.probeActiveContentReady(token: token, attemptsLeft: attemptsLeft - 1)
                 }
             }
@@ -1573,6 +1661,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             || (resumeIfPaused && pausedHomeUrl?.host?.lowercased() == url.host?.lowercased() && pausedHomeUrl?.path == url.path)
         if matchesPaused {
             activeNavigationToken += 1
+            activeNavigationCommitted = true
             activeContentReady = true
             module?.notifyChanged()
             return
@@ -1591,6 +1680,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         pausedHomeUrl = nil
         pausedRequestedUrl = nil
         activeNavigationToken += 1
+        activeNavigationCommitted = false
         activeContentReady = false
         let token = activeNavigationToken
         let targetWeb = web
@@ -1617,6 +1707,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
             pausedHomeUrl = nil
             pausedRequestedUrl = nil
             activeNavigationToken += 1
+            activeNavigationCommitted = true
             activeContentReady = true
             web.isHidden = false
             let activeWeb = web
@@ -1640,14 +1731,12 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         let activeWeb = web
         if !wasPrepared {
             activeNavigationToken += 1
+            activeNavigationCommitted = false
             activeContentReady = false
             let token = activeNavigationToken
             activeWeb.setMediaSuspended(false) { [weak self] in
                 guard let self, self.web === activeWeb, self.activeNavigationToken == token else { return }
                 activeWeb.loadTracked(URLRequest(url: url))
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                    self?.probeActiveContentReady(token: token, attemptsLeft: 32)
-                }
             }
         } else {
             activeWeb.setMediaSuspended(false) { [weak self] in
@@ -1665,10 +1754,9 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
                     preferSdr: mod.preferSdr
                 ))
             }
-            if !activeContentReady {
-                // Ensure active readiness polling continues after unhiding (for SPAs that waited on visibility)
-                let token = activeNavigationToken
-                probeActiveContentReady(token: token, attemptsLeft: 32)
+            if !activeContentReady, activeNavigationCommitted {
+                // Start TTI + paint probing now that WebView is unhidden behind the opaque glass veil
+                startActiveInteractiveProbe(attemptsLeft: 60)
             }
         }
     }
@@ -1697,6 +1785,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         slot.web.isHidden = !reveal
         web = slot.web
         activeNavigationToken += 1
+        activeNavigationCommitted = slot.committed
         activeContentReady = slot.contentReady
 
         // Park oldWeb back into warmPool if it was sitting cleanly on a different site's browse/home page
@@ -1733,9 +1822,8 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
                 ))
             }
         }
-        if !activeContentReady {
-            let token = activeNavigationToken
-            probeActiveContentReady(token: token, attemptsLeft: 32)
+        if !activeContentReady, reveal, activeNavigationCommitted {
+            startActiveInteractiveProbe(attemptsLeft: 60)
         }
         module?.notifyChanged()
     }
@@ -1748,6 +1836,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     func suspendForHome() {
         preparedUrl = nil
         activeNavigationToken += 1
+        activeNavigationCommitted = true
         activeContentReady = true
         homeIdleCleanup?.cancel()
         homeIdleCleanup = nil
