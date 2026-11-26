@@ -669,7 +669,7 @@ private let floatResumeMetaScript = """
       }
     }
   }
-  return { title: String(title || ''), url: String(atvUrl || '') };
+  return { title: String(title || ''), url: String(atvUrl || ''), pageUrl: String(location.href || '') };
 })()
 """
 
@@ -677,7 +677,10 @@ private let floatIconScript = """
 (() => {
   const size = l => parseInt(((l.sizes && l.sizes.value) || '0').split('x')[0]) || (l.rel.includes('apple') ? 180 : 16);
   const l = [...document.querySelectorAll('link[rel~="icon"],link[rel^="apple-touch-icon"]')].sort((a, b) => size(b) - size(a));
-  return l[0] ? l[0].href : location.origin + '/favicon.ico';
+  const fallback = (location.origin && /^https?:/i.test(location.origin)) ? location.origin + '/favicon.ico' : '';
+  const raw = l[0] ? String(l[0].href || '') : fallback;
+  const icon = /^(?:https?:|data:image\\/)/i.test(raw) ? raw : '';
+  return { url: String(location.href || ''), icon };
 })()
 """
 
@@ -1029,6 +1032,10 @@ private final class FloatWebView: WKWebView {
     private var provisionalNavigations: Set<ObjectIdentifier> = []
     private var pendingResumeCompletions: [() -> Void] = []
 
+    var hasProvisionalNavigation: Bool {
+        !provisionalNavigations.isEmpty
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if triggersMorphPrepare, let win = window {
@@ -1113,12 +1120,18 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
 
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
         guard let module, let instance,
-              let web = m.webView,
+              let web = m.webView as? FloatWebView,
               web === instance.web,
               module.mode == "web",
               !web.isHidden,
+              instance.activeNavigationCommitted,
+              !web.hasProvisionalNavigation,
               let url = web.url, url.scheme?.hasPrefix("http") == true, let host = url.host,
               let b = m.body as? [String: Any] else { return }
+        if m.frameInfo.isMainFrame {
+            let originHost = m.frameInfo.securityOrigin.host
+            if !originHost.isEmpty, originHost.lowercased() != host.lowercased() { return }
+        }
         if let stream = b["stream"] as? String, ["", "sdr", "hdr"].contains(stream), module.activeVideoStream != stream {
             module.activeVideoStream = stream
             module.notifyChanged()
@@ -1127,9 +1140,26 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
         let t = b["t"] as? Double ?? 0
         let d = b["d"] as? Double ?? 0
         guard t.isFinite, d.isFinite, t >= 0, d >= 0 else { return }
+        let navToken = instance.activeNavigationToken
         if b["event"] as? String == "play" {
-            web.evaluateJavaScript(floatIconScript) { [weak module] icon, _ in
-                module?.recordSite(url, icon: icon as? String)
+            web.evaluateJavaScript(floatIconScript) { [weak module, weak instance, weak web] result, _ in
+                guard let module, let instance, let web,
+                      web === instance.web,
+                      module.mode == "web",
+                      !web.isHidden,
+                      instance.activeNavigationToken == navToken,
+                      instance.activeNavigationCommitted,
+                      !web.hasProvisionalNavigation,
+                      let dict = result as? [String: Any],
+                      let pageUrlStr = dict["url"] as? String,
+                      let pageUrl = URL(string: pageUrlStr),
+                      floatIsWeb(pageUrl),
+                      let pageHost = pageUrl.host,
+                      let currentHost = web.url?.host,
+                      pageHost.lowercased() == currentHost.lowercased(),
+                      pageHost.lowercased() == host.lowercased() else { return }
+                let icon = (dict["icon"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                module.recordSite(pageUrl, icon: icon)
             }
         }
         // Skip trailers/previews/ads
@@ -1140,18 +1170,32 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
             }
             module.pendingSeek = nil
         }
-        web.evaluateJavaScript(floatResumeMetaScript) { [weak module] r, _ in
-            let meta = r as? [String: Any]
-            let rawTitle = meta?["title"] as? String ?? (r as? String ?? "")
-            var resumeUrl = url
-            if let candidate = meta?["url"] as? String,
+        web.evaluateJavaScript(floatResumeMetaScript) { [weak module, weak instance, weak web] r, _ in
+            guard let module, let instance, let web,
+                  web === instance.web,
+                  module.mode == "web",
+                  !web.isHidden,
+                  instance.activeNavigationToken == navToken,
+                  instance.activeNavigationCommitted,
+                  !web.hasProvisionalNavigation,
+                  let meta = r as? [String: Any],
+                  let pageUrlStr = meta["pageUrl"] as? String,
+                  let pageUrl = URL(string: pageUrlStr),
+                  floatIsWeb(pageUrl),
+                  let pageHost = pageUrl.host,
+                  let currentHost = web.url?.host,
+                  pageHost.lowercased() == currentHost.lowercased(),
+                  pageHost.lowercased() == host.lowercased() else { return }
+            let rawTitle = meta["title"] as? String ?? ""
+            var resumeUrl = pageUrl
+            if let candidate = meta["url"] as? String,
                !candidate.isEmpty,
                let parsed = URL(string: candidate),
                floatIsWeb(parsed),
-               parsed.host?.lowercased() == host.lowercased() {
+               parsed.host?.lowercased() == pageHost.lowercased() {
                 resumeUrl = parsed
             }
-            module?.recordResume(url: resumeUrl, host: host, rawTitle: rawTitle, time: t, duration: d)
+            module.recordResume(url: resumeUrl, host: pageHost, rawTitle: rawTitle, time: t, duration: d)
         }
     }
 
@@ -1196,6 +1240,7 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
     }
 
     func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
+        (w as? FloatWebView)?.noteProvisionalNavigationSettled(navigation)
         guard let instance else { return }
         if instance.isWarmSlot(w) {
             instance.handleWarmSlotFinished(w)
@@ -1338,8 +1383,8 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     private var pausedRequestedUrl: URL?
     private var homeIdleCleanup: DispatchWorkItem?
     private var preparedUrl: URL?
-    private var activeNavigationToken: Int = 0
-    private var activeNavigationCommitted: Bool = true
+    private(set) var activeNavigationToken: Int = 0
+    private(set) var activeNavigationCommitted: Bool = true
     private var activeProbeToken: Int = 0
     private(set) var activeContentReady: Bool = true
 
@@ -1772,11 +1817,14 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
                 activeWeb.loadTracked(URLRequest(url: url))
             }
         } else {
+            let canTouchActiveDoc = activeNavigationCommitted && !activeWeb.hasProvisionalNavigation
             activeWeb.setMediaSuspended(false) { [weak self] in
-                guard let self, self.web === activeWeb, resumeIfPaused else { return }
+                guard let self, self.web === activeWeb, resumeIfPaused,
+                      self.activeNavigationCommitted, !activeWeb.hasProvisionalNavigation,
+                      activeWeb.url?.host?.lowercased() == url.host?.lowercased() else { return }
                 activeWeb.evaluateJavaScript("(() => { const v=[...document.querySelectorAll('video')].find(v=>v.currentSrc); if(v && v.paused){ v.play().catch(()=>{}); } })()")
             }
-            if let mod = module {
+            if canTouchActiveDoc, let mod = module {
                 web.evaluateJavaScript(floatMediaHookScript(preferSdr: mod.preferSdr))
                 web.evaluateJavaScript(floatFillScript(mod.fill))
                 web.evaluateJavaScript(floatVideoFilterScript(
@@ -1806,6 +1854,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
 
     private func promoteWarmSlot(_ slot: FloatWarmSlot, reveal: Bool) {
         let oldWeb = web
+        let oldWasCommitted = activeNavigationCommitted && !oldWeb.hasProvisionalNavigation
         let oldPausedUrl = pausedHomeUrl ?? oldWeb.url
         let oldWasReady = activeContentReady
         warmPool.removeValue(forKey: slot.hostKey)
@@ -1822,7 +1871,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         activeContentReady = slot.contentReady
 
         // Park oldWeb back into warmPool if it was sitting cleanly on a different site's browse/home page
-        if let oldUrl = oldPausedUrl, floatIsWeb(oldUrl), let oldHost = oldUrl.host {
+        if oldWasCommitted, let oldUrl = oldPausedUrl, floatIsWeb(oldUrl), let oldHost = oldUrl.host {
             let oldKey = oldHost.lowercased()
             let isCleanHome = oldUrl.path.isEmpty || oldUrl.path == "/" || oldUrl.path == "/browse" || oldUrl.path == "/home"
             if oldKey != slot.hostKey, isCleanHome, warmPool[oldKey] == nil, warmPool.count < FloatBrowserInstance.maxWarmPoolSize {
@@ -1867,6 +1916,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
 
     /// Pauses & suspends media when returning Home so jumping back to the active video is 0ms.
     func suspendForHome() {
+        let wasCommitted = activeNavigationCommitted && !web.hasProvisionalNavigation
         preparedUrl = nil
         activeNavigationToken += 1
         activeNavigationCommitted = true
@@ -1874,7 +1924,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         homeIdleCleanup?.cancel()
         homeIdleCleanup = nil
 
-        if let cur = web.url, floatIsWeb(cur) {
+        if wasCommitted, let cur = web.url, floatIsWeb(cur) {
             pausedHomeUrl = cur
             pausedRequestedUrl = cur
             web.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
