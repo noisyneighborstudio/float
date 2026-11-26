@@ -348,7 +348,7 @@ component Float
     after(760, finishFx)
 
   task onFxEndOpenReleased when (fxKind == 3 or fxKind == 4) and fxReleaseAt >= 0 key=fxSeq
-    after(360, finishFx)
+    after(400, finishFx)
 
   task onFxEndReverse when fxKind == 5 key=fxSeq
     after(1060, finishFx)
@@ -363,7 +363,7 @@ component Float
     after(16, releaseOpenVeil)
 
   task onOpenVeilTimeout when (fxKind == 3 or fxKind == 4) and fxReleaseAt < 0 key=fxSeq
-    after(3600, releaseOpenVeil)
+    after(8000, releaseOpenVeil)
 
   task onHoverPreload when isMainWindow and isHome and hoveredPreloadUrl != "" key=hoveredPreloadUrl
     after(140, triggerHoverPreload)
@@ -592,7 +592,7 @@ component Float
     send cmd = runFloatCommand("setPeekAlpha", val)
 
   action onPeekAlphaRange(v: number)
-    let stepped = round(min(0.95, max(0.15, v)) * 20) / 20
+    let stepped = round(min(0.95, max(0.15, v)) * 100) / 100
     send cmd = runFloatCommand("setPeekAlpha", `${stepped}`)
 
   action stepPeekAlpha(delta: number)
@@ -607,7 +607,7 @@ component Float
     send cmd = runFloatCommand("setVideoBrightness", val)
 
   action onBrightnessRange(v: number)
-    let stepped = round(min(2, max(0.5, v)) * 20) / 20
+    let stepped = round(min(2, max(0.5, v)) * 100) / 100
     send cmd = runFloatCommand("setVideoBrightness", `${stepped}`)
 
   action stepVideoBrightness(delta: number)
@@ -618,7 +618,7 @@ component Float
     send cmd = runFloatCommand("setHdrVideoBrightness", val)
 
   action onHdrBrightnessRange(v: number)
-    let stepped = round(min(2, max(0.5, v)) * 20) / 20
+    let stepped = round(min(2, max(0.5, v)) * 100) / 100
     send cmd = runFloatCommand("setHdrVideoBrightness", `${stepped}`)
 
   action brightenVideo
@@ -640,7 +640,7 @@ component Float
     send cmd = runFloatCommand("setVideoContrast", val)
 
   action onContrastRange(v: number)
-    let stepped = round(min(2, max(0.5, v)) * 20) / 20
+    let stepped = round(min(2, max(0.5, v)) * 100) / 100
     send cmd = runFloatCommand("setVideoContrast", `${stepped}`)
 
   action stepVideoContrast(delta: number)
@@ -1387,7 +1387,7 @@ component Float
                       input type="range"
                         min=0.15
                         max=0.95
-                        step=0.05
+                        step="any"
                         value=st.peekAlpha
                         input=onPeekAlphaRange
                         aria-label="Fade Opacity"
@@ -1455,7 +1455,7 @@ component Float
                     input type="range"
                       min=0.5
                       max=2
-                      step=0.05
+                      step="any"
                       value=st.videoBrightness
                       input=onBrightnessRange
                       aria-label=(st.streamBrightness ? "SDR Brightness" : "Brightness")
@@ -1469,7 +1469,7 @@ component Float
                       input type="range"
                         min=0.5
                         max=2
-                        step=0.05
+                        step="any"
                         value=st.hdrVideoBrightness
                         input=onHdrBrightnessRange
                         aria-label="HDR Brightness"
@@ -1482,7 +1482,7 @@ component Float
                     input type="range"
                       min=0.5
                       max=2
-                      step=0.05
+                      step="any"
                       value=st.videoContrast
                       input=onContrastRange
                       aria-label="Contrast"
