@@ -80,6 +80,72 @@ jobs:
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_KEY_ISSUER" \
             --keychain "$keychain"
+      - name: Preflight checks
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
+          SIGN: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          keychain="$RUNNER_TEMP/float.keychain-db"
+          failed=0
+          
+          # Check Rust toolchain availability (Exact builds with Rust and pins a specific version)
+          if ! command -v rustup >/dev/null 2>&1; then
+            echo "::error::rustup not found — Exact requires Rust with the pinned toolchain. Install via 'curl --proto \"=https\" --tlsv1.2 -sSf https://sh.rustup.rs | sh'."
+            failed=1
+          else
+            # Parse the pinned toolchain from Exact's rust-toolchain.toml or rust-toolchain
+            required=""
+            if [[ -f "$EXACT/rust-toolchain.toml" ]]; then
+              required=$(awk -F'["\047]' '/^channel[[:space:]]*=[[:space:]]*["\047]/ {for(i=2;i<=NF;i++) if($i ~ /[0-9]/) {print $i; exit}}' "$EXACT/rust-toolchain.toml")
+            elif [[ -f "$EXACT/rust-toolchain" ]]; then
+              required=$(head -n1 "$EXACT/rust-toolchain" | tr -d '[:space:]')
+            fi
+            
+            if [[ -z $required ]]; then
+              echo "::error::No rust-toolchain or rust-toolchain.toml found in $EXACT — cannot verify pinned Rust version."
+              failed=1
+            else
+              echo "Exact pins Rust toolchain: $required"
+              # Verify the pinned toolchain is installed and functional from within Exact's directory
+              # (rustup resolves toolchains per-directory based on rust-toolchain files)
+              if ! (cd "$EXACT" && rustc --version >/dev/null 2>&1); then
+                echo "::error::Pinned Rust toolchain $required is not installed or not functional. Run 'rustup install $required'."
+                failed=1
+              else
+                installed_version=$(cd "$EXACT" && rustc --version 2>&1 | awk '{print $2}')
+                echo "Pinned Rust toolchain $required is installed and functional (rustc $installed_version)."
+              fi
+            fi
+          fi
+          
+          # Check build keychain state
+          if [[ ! -f "$keychain" ]]; then
+            echo "::error::Build keychain does not exist at $keychain — certificate import step may have failed."
+            failed=1
+          else
+            # Verify keychain is unlocked (security unlock-keychain exits 0 even if already unlocked)
+            if ! security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null 2>&1; then
+              echo "::error::Build keychain exists but cannot be unlocked. Check KEYCHAIN_PASSWORD secret."
+              failed=1
+            else
+              echo "Build keychain is unlocked."
+              # Verify signing identity is present and valid
+              if ! security find-identity -v -p codesigning "$keychain" 2>/dev/null | grep -qF "$SIGN"; then
+                echo "::error::Signing identity '$SIGN' not found in build keychain. Certificate import may have failed."
+                failed=1
+              else
+                echo "Signing identity '$SIGN' found in keychain."
+              fi
+            fi
+          fi
+          
+          if [[ $failed -eq 1 ]]; then
+            echo "::error::Preflight checks failed. Fix the runner environment before retrying."
+            exit 1
+          fi
+          echo "Preflight checks passed."
       - name: Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -88,12 +154,28 @@ jobs:
           SIGN: ${{ secrets.DEVELOPER_ID_APPLICATION }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           EXACT_NOTARY_PROFILE: exact-notary
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          keychain="$RUNNER_TEMP/float.keychain-db"
           for name in SIGN SPARKLE_PRIVATE_KEY; do
             [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
           done
+          
+          # Re-unlock build keychain before signing to guard against timeout locks.
+          # The keychainLocked error named the *default* keychain, so also re-assert that
+          # the default keychain is still the unlocked build keychain, not the login keychain.
+          if [[ ! -f "$keychain" ]]; then
+            echo "::error::Build keychain disappeared before release signing. Check workflow steps."
+            exit 1
+          fi
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          echo "Build keychain re-unlocked and re-asserted as default before release signing."
+          
           mkdir -p .exact
           ln -sfn "$EXACT" .exact/checkout
           npm ci --no-audit --no-fund
