@@ -3,6 +3,9 @@ import WebKit
 #if os(macOS)
 import AppKit
 import ApplicationServices
+import Darwin
+import Metal
+import QuartzCore
 import Sparkle
 
 private let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -695,8 +698,8 @@ private struct AgentSnapshot: Codable {
     var videoBrightness: Double = 1.0
     var hdrVideoBrightness: Double = 1.0
     var videoContrast: Double = 1.0
-    var revealStyle: String = "wave"
-    var openStyle: String = "lens"
+    var revealStyle: String = "ripple"
+    var openStyle: String = "ripple"
     var preferSdr: Bool = false
     var streamBrightness: Bool = false
     var hotkeyKeys: String = "Control+Alt+Meta+F"
@@ -779,7 +782,7 @@ private final class FloatStore {
     }
 
     var revealStyle: String {
-        get { agentFile != nil ? snapshot.revealStyle : (defaults.string(forKey: "revealStyle") ?? "wave") }
+        get { agentFile != nil ? snapshot.revealStyle : (defaults.string(forKey: "revealStyle") ?? "ripple") }
         set {
             if agentFile != nil { snapshot.revealStyle = newValue; flushAgent() }
             else { defaults.set(newValue, forKey: "revealStyle") }
@@ -787,7 +790,7 @@ private final class FloatStore {
     }
 
     var openStyle: String {
-        get { agentFile != nil ? snapshot.openStyle : (defaults.string(forKey: "openStyle") ?? "lens") }
+        get { agentFile != nil ? snapshot.openStyle : (defaults.string(forKey: "openStyle") ?? "ripple") }
         set {
             if agentFile != nil { snapshot.openStyle = newValue; flushAgent() }
             else { defaults.set(newValue, forKey: "openStyle") }
@@ -968,6 +971,8 @@ private final class FloatHub {
     var aspectLocked = false
     var clickThrough = false
     var pendingSeek: Double?
+    var fxDemoSeq = 0
+    var fxDemoKind = 0
 
     func store(for context: ExactModuleContext) -> FloatStore {
         if context.agent {
@@ -996,6 +1001,10 @@ private final class FloatHub {
         sessions.compactMap { $0.value?.mainWindow }.first
     }
 
+    var primaryModule: FloatModule? {
+        sessions.compactMap { $0.value }.first { $0.mainWindow != nil }
+    }
+
     func broadcastChange(from origin: FloatModule) {
         if origin.context.agent {
             origin.syncWindowBackdrop()
@@ -1011,10 +1020,18 @@ private final class FloatHub {
     }
 }
 
+/// Canonical host key ignoring case and optional `www.` prefix so `primevideo.com` and `www.primevideo.com`
+/// share the same live tab slot.
+private func floatCanonicalHost(_ host: String) -> String {
+    let lower = host.lowercased()
+    return lower.hasPrefix("www.") ? String(lower.dropFirst(4)) : lower
+}
+
 /// Compares two http(s) URLs ignoring trailing slash differences on the root path and host casing.
 private func floatSameLoadTarget(_ a: URL, _ b: URL) -> Bool {
     guard (a.scheme?.lowercased() ?? "") == (b.scheme?.lowercased() ?? ""),
-          (a.host?.lowercased() ?? "") == (b.host?.lowercased() ?? ""),
+          let ha = a.host, let hb = b.host,
+          floatCanonicalHost(ha) == floatCanonicalHost(hb),
           a.port == b.port,
           a.query == b.query else { return false }
     let pa = a.path.isEmpty ? "/" : a.path
@@ -1048,6 +1065,11 @@ private final class FloatWebView: WKWebView {
         let nav = load(request)
         noteProvisionalNavigationStarted(nav)
         return nav
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if alphaValue < 0.05 { return nil }
+        return super.hitTest(point)
     }
 
     func noteProvisionalNavigationStarted(_ navigation: WKNavigation?) {
@@ -1279,64 +1301,117 @@ private final class FloatBrowserDelegate: NSObject, WKNavigationDelegate, WKUIDe
 }
 
 /// Synchronous readiness probe for hidden background warm-pool slots (where rAF may be throttled).
+/// Checks the middle band of the viewport (skipping top nav bars) so half-hydrated SPAs like Apple TV+
+/// aren't falsely marked ready before hero/shelf content mounts.
 private let floatContentReadyScript = """
 (() => {
-  if (!document.body || document.readyState === 'loading') return false;
+  if (!document.body || document.readyState !== 'complete') return false;
+  const vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+  const inCenterBand = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 24 || r.height < 24) return false;
+    if (r.bottom <= vh * 0.18 || r.top >= vh * 0.88 || r.right <= 0 || r.left >= vw) return false;
+    if (el.closest('header, nav, [role="banner"], [role="navigation"]')) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity || '1') > 0.1;
+  };
   const vids = document.querySelectorAll('video');
   for (const v of vids) {
-    if (v.readyState >= 2 || v.offsetWidth > 80) return true;
+    if (v.readyState >= 2 && v.videoWidth > 0 && inCenterBand(v)) return true;
   }
-  const imgs = [...document.querySelectorAll('img')].filter(i => i.complete && i.naturalWidth > 48 && i.offsetWidth > 16);
-  const text = (document.body.innerText || '').trim();
-  const hasVisual = imgs.length >= 1 || text.length >= 80;
-  if (!hasVisual) return false;
-  const interactive = document.querySelectorAll('a[href], button:not([disabled]), input:not([type="hidden"]), [role="button"], video');
-  return document.readyState === 'complete' && interactive.length >= 1;
+  const imgs = [...document.querySelectorAll('img')].filter(i =>
+    i.complete && i.naturalWidth > 64 && i.offsetWidth >= 64 && i.offsetHeight >= 44 && inCenterBand(i)
+  );
+  if (imgs.length >= 1) return true;
+  const interactive = document.querySelectorAll('main a[href], main button:not([disabled]), [role="main"] a[href], [role="main"] button:not([disabled])');
+  let centerInteractive = 0;
+  for (const el of interactive) {
+    if (inCenterBand(el)) { centerInteractive++; if (centerInteractive >= 2) break; }
+  }
+  return centerInteractive >= 2 && (document.body.innerText || '').trim().length >= 120;
 })()
 """
 
-/// Async TTI + paint readiness probe for the visible active WebView behind the animated glass veil:
-/// confirms the page has painted real visual + clickable content, finished document load (or settled
-/// for >2.2s on long-polling streaming pages), and completed 2 clean animation frames + a quiet timer
-/// without main-thread hydration stalls.
+/// Async TTI + center-viewport paint readiness probe for the visible active WebView behind the cover:
+/// Returns:
+/// - "video": a visible center <video> has decoded a real frame (bypasses pixel snapshot check for DRM video)
+/// - "dom-ready": real non-nav visual + interactive content is painted in the middle band and rAF is quiet
+///                (Swift then confirms with a fast 32x18 center-rect pixel variance check)
+/// - "not-ready": still loading, empty middle, or main thread busy
 private let floatInteractiveReadyScript = """
-if (!document.body || document.readyState === 'loading') return false;
+if (!document.body || document.readyState === 'loading') return 'not-ready';
 const docComplete = document.readyState === 'complete';
 const navElapsed = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
 
 const rootEl = document.getElementById('root') || document.getElementById('app') || document.getElementById('__next') || document.body;
-if (rootEl && rootEl.getAttribute('aria-busy') === 'true' && navElapsed < 4000) return false;
+if (rootEl && rootEl.getAttribute('aria-busy') === 'true' && navElapsed < 5000) return 'not-ready';
 
 const vw = window.innerWidth || 1, vh = window.innerHeight || 1;
-const isVisibleRect = (el) => {
+const isVisibleRect = (el, minW, minH) => {
   const r = el.getBoundingClientRect();
-  if (r.width < 16 || r.height < 16) return false;
+  if (r.width < minW || r.height < minH) return false;
   if (r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) return false;
   const cs = getComputedStyle(el);
   return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity || '1') > 0.1;
 };
+const inCenterBand = (el, minW, minH) => {
+  const r = el.getBoundingClientRect();
+  if (r.width < minW || r.height < minH) return false;
+  if (r.bottom <= vh * 0.18 || r.top >= vh * 0.86 || r.right <= vw * 0.04 || r.left >= vw * 0.96) return false;
+  if (el.closest('header, nav, [role="banner"], [role="navigation"]')) return false;
+  const cs = getComputedStyle(el);
+  return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity || '1') > 0.1;
+};
 
-const hasReadyVideo = [...document.querySelectorAll('video')].some(v =>
-  (v.readyState >= 2 && isVisibleRect(v)) || (v.offsetWidth >= 160 && v.offsetHeight >= 90 && isVisibleRect(v))
+// 1. Decoded video frame in viewport (handles FairPlay/DRM video whose pixels may read black in snapshots)
+const hasDecodedVideo = [...document.querySelectorAll('video')].some(v =>
+  v.readyState >= 2 && v.videoWidth > 0 && isVisibleRect(v, 100, 60)
 );
-const hasVisibleImg = [...document.querySelectorAll('img')].some(img =>
-  img.complete && img.naturalWidth > 48 && isVisibleRect(img)
-);
-const hasSizedCanvas = [...document.querySelectorAll('canvas')].some(c => {
-  const r = c.getBoundingClientRect();
-  return r.width >= 120 && r.height >= 80 && isVisibleRect(c);
-});
-const visibleTextLen = (document.body.innerText || '').trim().length;
-const hasVisualContent = hasReadyVideo || hasVisibleImg || hasSizedCanvas || visibleTextLen >= 80;
 
+// 2. Real painted imagery or canvas inside the middle band (ignoring top nav bar logos/icons!)
+const hasCenterImg = [...document.querySelectorAll('img')].some(img =>
+  img.complete && img.naturalWidth >= 48 && inCenterBand(img, 64, 44)
+);
+const hasCenterCanvas = [...document.querySelectorAll('canvas')].some(c =>
+  inCenterBand(c, 120, 80)
+);
+
+// 3. CSS background-image artwork or substantial non-nav content sampled across a center 3x3 grid
+let centerMediaHits = 0;
+let centerTextChars = 0;
+if (!hasDecodedVideo && !hasCenterImg && !hasCenterCanvas) {
+  const seen = new Set();
+  for (const fx of [0.25, 0.5, 0.75]) {
+    for (const fy of [0.32, 0.52, 0.70]) {
+      let el = document.elementFromPoint(vw * fx, vh * fy);
+      let hops = 0;
+      while (el && el !== document.body && el !== document.documentElement && hops < 5) {
+        if (!seen.has(el) && !el.closest('header, nav, [role="banner"], [role="navigation"]')) {
+          seen.add(el);
+          const cs = getComputedStyle(el);
+          if (cs.backgroundImage && cs.backgroundImage !== 'none' && cs.backgroundImage.includes('url(')) {
+            const r = el.getBoundingClientRect();
+            if (r.width >= 80 && r.height >= 50) centerMediaHits++;
+          }
+          const t = (el.innerText || '').trim();
+          if (t.length > centerTextChars) centerTextChars = t.length;
+        }
+        el = el.parentElement;
+        hops++;
+      }
+    }
+  }
+}
+
+const hasCenterVisual = hasDecodedVideo || hasCenterImg || hasCenterCanvas || centerMediaHits >= 1 || centerTextChars >= 45;
 const interactiveCount = [...document.querySelectorAll('a[href], button:not([disabled]), input:not([type="hidden"]), [role="button"], [tabindex]:not([tabindex="-1"]), video')]
-  .filter(isVisibleRect).length;
-const hasInteractive = hasReadyVideo || interactiveCount >= 1;
+  .filter(el => isVisibleRect(el, 16, 16)).length;
+const hasInteractive = hasDecodedVideo || interactiveCount >= 1;
 
-if (!hasVisualContent || !hasInteractive) return false;
-if (!docComplete && navElapsed < 2200) return false;
+if (!hasCenterVisual || !hasInteractive) return 'not-ready';
+if (!docComplete && !hasDecodedVideo && navElapsed < 2200) return 'not-ready';
 
-return await new Promise((resolve) => {
+const settled = await new Promise((resolve) => {
   const t0 = performance.now();
   requestAnimationFrame(() => {
     const t1 = performance.now();
@@ -1351,6 +1426,8 @@ return await new Promise((resolve) => {
     });
   });
 });
+if (!settled) return 'not-ready';
+return hasDecodedVideo ? 'video' : 'dom-ready';
 """
 
 private final class FloatWarmSlot {
@@ -1386,6 +1463,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     private(set) var activeNavigationToken: Int = 0
     private(set) var activeNavigationCommitted: Bool = true
     private var activeProbeToken: Int = 0
+    private var activeReadyViaVideo: Bool = false
     private(set) var activeContentReady: Bool = true
 
     private weak var module: FloatModule?
@@ -1493,7 +1571,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         guard let slot = warmSlot(for: w) else { return }
         slot.committed = true
         slot.probeToken += 1
-        probeWarmSlotReadiness(slot, token: slot.probeToken, attemptsLeft: 45)
+        probeWarmSlotReadiness(slot, token: slot.probeToken, attemptsLeft: 60)
     }
 
     private func probeWarmSlotReadiness(_ slot: FloatWarmSlot, token: Int, attemptsLeft: Int) {
@@ -1501,17 +1579,38 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         slot.web.setMediaSuspended(true)
         slot.web.evaluateJavaScript(floatContentReadyScript) { [weak self, weak slot] res, _ in
             guard let self, let slot, slot.probeToken == token, self.warmPool[slot.hostKey] === slot else { return }
-            let ready = (res as? Bool) ?? false
-            if ready || attemptsLeft <= 1 {
-                slot.contentReady = true
-                // Pause any media that bootstrapped during hydration
+            let domReady = (res as? Bool) ?? false
+            let finishSlot = { (isPainted: Bool) in
+                guard slot.probeToken == token, self.warmPool[slot.hostKey] === slot else { return }
+                slot.contentReady = isPainted
+                // Pause any media that bootstrapped during hydration and park hidden to save idle GPU.
                 slot.web.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
+                slot.web.isHidden = true
+                slot.web.alphaValue = 1.0
                 self.module?.notifyChanged()
-            } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self, weak slot] in
+            }
+            let retrySlot = { [weak self, weak slot] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
                     guard let self, let slot else { return }
                     self.probeWarmSlotReadiness(slot, token: token, attemptsLeft: attemptsLeft - 1)
                 }
+            }
+            if domReady {
+                self.verifyCenterPixelsPainted(slot.web) { [weak self, weak slot] painted in
+                    guard let self, let slot, slot.probeToken == token, self.warmPool[slot.hostKey] === slot else { return }
+                    if painted {
+                        finishSlot(true)
+                    } else if attemptsLeft <= 1 {
+                        // Never poison contentReady = true if the center is still blank!
+                        finishSlot(false)
+                    } else {
+                        retrySlot()
+                    }
+                }
+            } else if attemptsLeft <= 1 {
+                finishSlot(false)
+            } else {
+                retrySlot()
             }
         }
     }
@@ -1545,23 +1644,152 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         probeActiveContentReady(token: token, attemptsLeft: attemptsLeft)
     }
 
+    /// Takes a tiny 32x18 snapshot of the center 76% x 66% of the WKWebView (~2-4ms) and verifies
+    /// that the middle actually has painted content rather than a uniform blank/black/dark-gray shell
+    /// (even if a top nav bar or tiny centered loading spinner is visible).
+    private func verifyCenterPixelsPainted(_ targetWeb: WKWebView, completion: @escaping (Bool) -> Void) {
+        let b = targetWeb.bounds
+        guard b.width >= 80, b.height >= 80 else {
+            completion(true)
+            return
+        }
+        let cfg = WKSnapshotConfiguration()
+        cfg.afterScreenUpdates = true
+        cfg.rect = CGRect(
+            x: b.origin.x + b.width * 0.12,
+            y: b.origin.y + b.height * 0.18,
+            width: b.width * 0.76,
+            height: b.height * 0.66
+        )
+        cfg.snapshotWidth = 32
+        targetWeb.takeSnapshot(with: cfg) { image, _ in
+            guard let image else { completion(false); return }
+            var proposed = CGRect(origin: .zero, size: image.size)
+            guard let cg = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else {
+                completion(false)
+                return
+            }
+            let gw = 32, gh = 18
+            var pixels = [UInt8](repeating: 0, count: gw * gh * 4)
+            let ok = pixels.withUnsafeMutableBytes { buf -> Bool in
+                guard let base = buf.baseAddress,
+                      let ctx = CGContext(
+                          data: base,
+                          width: gw,
+                          height: gh,
+                          bitsPerComponent: 8,
+                          bytesPerRow: gw * 4,
+                          space: CGColorSpaceCreateDeviceRGB(),
+                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                      ) else { return false }
+                ctx.interpolationQuality = .low
+                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: gw, height: gh))
+                return true
+            }
+            guard ok else { completion(false); return }
+
+            // Quantize into 4-bit-per-channel RGB buckets (4096 bins) to find the dominant background color.
+            var counts: [Int: Int] = [:]
+            var bucketR: [Int: Int] = [:]
+            var bucketG: [Int: Int] = [:]
+            var bucketB: [Int: Int] = [:]
+            let total = gw * gh
+            for i in 0..<total {
+                let off = i * 4
+                let r = Int(pixels[off]), g = Int(pixels[off + 1]), b = Int(pixels[off + 2])
+                let key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4)
+                counts[key, default: 0] += 1
+                bucketR[key, default: 0] += r
+                bucketG[key, default: 0] += g
+                bucketB[key, default: 0] += b
+            }
+            guard let domEntry = counts.max(by: { $0.value < $1.value }) else {
+                completion(false)
+                return
+            }
+            let domCount = max(1, domEntry.value)
+            let bgR = (bucketR[domEntry.key] ?? 0) / domCount
+            let bgG = (bucketG[domEntry.key] ?? 0) / domCount
+            let bgB = (bucketB[domEntry.key] ?? 0) / domCount
+
+            var nonBg = 0
+            for i in 0..<total {
+                let off = i * 4
+                let diff = abs(Int(pixels[off]) - bgR)
+                    + abs(Int(pixels[off + 1]) - bgG)
+                    + abs(Int(pixels[off + 2]) - bgB)
+                if diff >= 36 { nonBg += 1 }
+            }
+            let nonBgFraction = Double(nonBg) / Double(total)
+            let distinctBuckets = counts.count
+            // Reject empty/black/spinner-only center; pass once real artwork, shelves, or a card paints!
+            let painted = (nonBgFraction >= 0.12 && distinctBuckets >= 6) || nonBgFraction >= 0.24
+            completion(painted)
+        }
+    }
+
     private func probeActiveContentReady(token: Int, attemptsLeft: Int) {
         guard token == activeNavigationToken, activeNavigationCommitted, !activeContentReady, !web.isHidden else { return }
         web.callAsyncJavaScript(floatInteractiveReadyScript, arguments: [:], in: nil, in: .page) { [weak self] result in
             guard let self, token == self.activeNavigationToken, self.activeNavigationCommitted, !self.activeContentReady else { return }
-            let ready: Bool
+            let status: String
             if case .success(let val) = result {
-                ready = (val as? Bool) ?? false
+                status = (val as? String) ?? "not-ready"
             } else {
-                ready = false
+                status = "not-ready"
             }
-            if ready || attemptsLeft <= 1 {
-                self.activeContentReady = true
-                self.module?.notifyChanged()
-            } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.11) { [weak self] in
+            let scheduleRetry = { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
                     self?.probeActiveContentReady(token: token, attemptsLeft: attemptsLeft - 1)
                 }
+            }
+            if status == "video" || attemptsLeft <= 1 {
+                self.activeReadyViaVideo = (status == "video")
+                self.activeContentReady = true
+                self.module?.notifyChanged()
+                return
+            }
+            if status == "dom-ready" {
+                let targetWeb = self.web
+                self.verifyCenterPixelsPainted(targetWeb) { [weak self] painted in
+                    guard let self, token == self.activeNavigationToken, self.activeNavigationCommitted, !self.activeContentReady else { return }
+                    if painted {
+                        self.activeContentReady = true
+                        self.module?.notifyChanged()
+                    } else {
+                        scheduleRetry()
+                    }
+                }
+            } else {
+                scheduleRetry()
+            }
+        }
+    }
+
+    func confirmActiveVisuallyPainted(_ completion: @escaping (Bool) -> Void) {
+        guard activeContentReady else {
+            completion(false)
+            return
+        }
+        if activeReadyViaVideo {
+            completion(true)
+            return
+        }
+        let targetWeb = web
+        let token = activeNavigationToken
+        verifyCenterPixelsPainted(targetWeb) { [weak self] painted in
+            guard let self, token == self.activeNavigationToken else {
+                completion(false)
+                return
+            }
+            if painted {
+                completion(true)
+            } else {
+                // Re-arm the active interactive probe if a promoted slot hadn't finished painting yet
+                self.activeContentReady = false
+                self.activeProbeToken = 0
+                self.startActiveInteractiveProbe(attemptsLeft: 55)
+                completion(false)
             }
         }
     }
@@ -1580,15 +1808,14 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     }
 
     func hasWarmHost(_ host: String) -> Bool {
-        let key = host.lowercased()
-        if pausedHomeUrl?.host?.lowercased() == key || pausedRequestedUrl?.host?.lowercased() == key {
-            return true
-        }
+        let key = floatCanonicalHost(host)
+        if let ph = pausedHomeUrl?.host, floatCanonicalHost(ph) == key { return true }
+        if let pr = pausedRequestedUrl?.host, floatCanonicalHost(pr) == key { return true }
         return warmPool[key] != nil
     }
 
     func removeWarmSite(_ host: String) {
-        let key = host.lowercased()
+        let key = floatCanonicalHost(host)
         if let slot = warmPool.removeValue(forKey: key) {
             slot.probeToken += 1
             teardownWebView(slot.web)
@@ -1658,20 +1885,27 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
     /// Preloads a saved site's homepage into the bounded multi-site warm pool (max 6 slots, LRU).
     func preloadStandby(_ url: URL) {
         guard let module, !module.context.agent, floatIsWeb(url), let rawHost = url.host else { return }
-        let key = rawHost.lowercased()
+        let key = floatCanonicalHost(rawHost)
 
-        // Already paused on this exact target in activeWeb
-        if let paused = pausedHomeUrl, floatSameLoadTarget(paused, url) { return }
-        if let pausedReq = pausedRequestedUrl, floatSameLoadTarget(pausedReq, url) { return }
+        // Already paused in activeWeb on this host (never spawn a duplicate slot or clobber live tab!)
+        if let paused = pausedHomeUrl, let ph = paused.host, floatCanonicalHost(ph) == key {
+            if floatSameLoadTarget(paused, url) || Self.isHomepageTileTarget(url) { return }
+        }
+        if let pausedReq = pausedRequestedUrl, let prh = pausedReq.host, floatCanonicalHost(prh) == key {
+            if floatSameLoadTarget(pausedReq, url) || Self.isHomepageTileTarget(url) { return }
+        }
 
-        // Already warm in pool for this site
+        // Already warm/parked in pool for this site: never wipe a live parked tab when hovering a tile!
         if let existing = warmPool[key] {
             existing.lastUsed = Date()
-            if floatSameLoadTarget(existing.requestedUrl, url) { return }
+            if floatSameLoadTarget(existing.requestedUrl, url) || Self.isHomepageTileTarget(url) { return }
+            if let current = existing.web.url, floatSameLoadTarget(current, url) { return }
             existing.requestedUrl = url
             existing.committed = false
             existing.contentReady = false
             existing.probeToken += 1
+            existing.web.alphaValue = 0.001
+            existing.web.isHidden = false
             existing.web.setMediaSuspended(true)
             existing.web.loadTracked(URLRequest(url: url))
             return
@@ -1702,7 +1936,11 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         )
         w.frame = container.bounds
         w.autoresizingMask = [.width, .height]
-        w.isHidden = true
+        // Mount unhidden at imperceptible 0.001 alpha (rounds to 0/255 on screen, hitTest -> nil)
+        // so WebKit treats the view as visible and actually hydrates SPAs, triggers IntersectionObserver,
+        // decodes hero artwork, and paints pixels BEFORE the user clicks the tile!
+        w.alphaValue = 0.001
+        w.isHidden = false
         installUserScripts(
             on: w,
             fill: module.fill,
@@ -1720,11 +1958,120 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         w.loadTracked(URLRequest(url: url))
     }
 
-    private func matchingWarmSlot(for url: URL) -> FloatWarmSlot? {
-        guard let key = url.host?.lowercased(), let slot = warmPool[key] else { return nil }
+    private static func isHomepageTileTarget(_ url: URL) -> Bool {
+        (url.path.isEmpty || url.path == "/") && url.query == nil && url.fragment == nil
+    }
+
+    private static func sameHostAndPathOrAppleTV(_ a: URL, _ b: URL) -> Bool {
+        guard let ha = a.host, let hb = b.host else { return false }
+        let ca = floatCanonicalHost(ha)
+        let cb = floatCanonicalHost(hb)
+        guard ca == cb else { return false }
+        if a.path == b.path { return true }
+        // Apple TV+ plays video in an overlay on top of /us without changing web.url
+        if ca == "tv.apple.com" { return true }
+        return false
+    }
+
+    private func matchesPausedTarget(_ url: URL, resumeIfPaused: Bool) -> Bool {
+        if pausedHomeUrl.map({ floatSameLoadTarget($0, url) }) ?? false { return true }
+        if pausedRequestedUrl.map({ floatSameLoadTarget($0, url) }) ?? false { return true }
+        if resumeIfPaused, let paused = pausedHomeUrl, Self.sameHostAndPathOrAppleTV(paused, url) {
+            return true
+        }
+        // Clicking a site tile (e.g. https://tv.apple.com) matches a paused session on the same host
+        // even after the SPA redirected to /us, /browse, /storefront, or a show/watch page!
+        if !resumeIfPaused, Self.isHomepageTileTarget(url),
+           let pausedHost = (pausedHomeUrl ?? pausedRequestedUrl)?.host,
+           let targetHost = url.host,
+           floatCanonicalHost(pausedHost) == floatCanonicalHost(targetHost) {
+            return true
+        }
+        return false
+    }
+
+    private func matchingWarmSlot(for url: URL, resumeIfPaused: Bool = false) -> FloatWarmSlot? {
+        guard let rawHost = url.host, let slot = warmPool[floatCanonicalHost(rawHost)] else { return nil }
         if floatSameLoadTarget(slot.requestedUrl, url) { return slot }
         if let current = slot.web.url, floatSameLoadTarget(current, url) { return slot }
+        if Self.isHomepageTileTarget(url) { return slot }
+        if resumeIfPaused, let current = slot.web.url, Self.sameHostAndPathOrAppleTV(current, url) { return slot }
         return nil
+    }
+
+    /// True when the requested target is already loaded & painted in memory (either paused in activeWeb
+    /// or verified painted in warmPool), so opening it can skip all loading states completely.
+    func isTargetAlreadyReady(_ url: URL, resumeIfPaused: Bool) -> Bool {
+        if matchesPausedTarget(url, resumeIfPaused: resumeIfPaused) {
+            return activeContentReady
+        }
+        if let slot = matchingWarmSlot(for: url, resumeIfPaused: resumeIfPaused) {
+            return slot.contentReady
+        }
+        return false
+    }
+
+    /// Parks the current activeWeb into `warmPool` when switching to a different host so returning to it
+    /// later is instant with zero reload.
+    private func parkCurrentWebIfDifferentHost(from targetUrl: URL) {
+        let oldWeb = web
+        guard let oldUrl = pausedHomeUrl ?? oldWeb.url,
+              floatIsWeb(oldUrl),
+              let oldHost = oldUrl.host,
+              let newHost = targetUrl.host else { return }
+        let oldKey = floatCanonicalHost(oldHost)
+        let newKey = floatCanonicalHost(newHost)
+        guard oldKey != newKey else { return }
+
+        // Evict oldest slot if pool is at capacity before parking
+        while warmPool.count >= FloatBrowserInstance.maxWarmPoolSize && warmPool[oldKey] == nil {
+            if let oldest = warmPool.values.min(by: { $0.lastUsed < $1.lastUsed }) {
+                oldest.probeToken += 1
+                teardownWebView(oldest.web)
+                warmPool.removeValue(forKey: oldest.hostKey)
+            } else {
+                break
+            }
+        }
+        // Replace any stale preloaded slot for oldKey with the user's actual visited tab
+        if let existing = warmPool.removeValue(forKey: oldKey) {
+            existing.probeToken += 1
+            teardownWebView(existing.web)
+        }
+        guard let module else { return }
+
+        oldWeb.triggersMorphPrepare = false
+        oldWeb.isHidden = true
+        oldWeb.alphaValue = 1.0
+        oldWeb.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
+        oldWeb.setMediaSuspended(true)
+        let parked = FloatWarmSlot(hostKey: oldKey, web: oldWeb, requestedUrl: URL(string: "\(oldUrl.scheme ?? "https")://\(oldHost)") ?? oldUrl)
+        parked.committed = true
+        parked.contentReady = activeContentReady
+        parked.lastUsed = Date()
+        warmPool[oldKey] = parked
+
+        // Spin up a fresh activeWeb for the new cold target
+        let fresh = FloatBrowserInstance.makeWebView(
+            module: module,
+            delegate: delegate,
+            trackWorld: trackWorld,
+            triggersMorphPrepare: false
+        )
+        fresh.frame = container.bounds
+        fresh.autoresizingMask = [.width, .height]
+        fresh.isHidden = true
+        installUserScripts(
+            on: fresh,
+            fill: module.fill,
+            brightness: module.videoBrightness,
+            hdrBrightness: module.hdrVideoBrightness,
+            contrast: module.videoContrast,
+            streamBrightness: module.streamBrightness,
+            preferSdr: module.preferSdr
+        )
+        container.addSubview(fresh)
+        web = fresh
     }
 
     /// Prepares or promotes the target URL in the background without unhiding yet (used during glass wipe).
@@ -1734,10 +2081,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         preparedUrl = url
 
         // 1. Instant 0ms path: target is already paused in activeWeb from a recent showHome()
-        let matchesPaused = (pausedHomeUrl.map { floatSameLoadTarget($0, url) } ?? false)
-            || (pausedRequestedUrl.map { floatSameLoadTarget($0, url) } ?? false)
-            || (resumeIfPaused && pausedHomeUrl?.host?.lowercased() == url.host?.lowercased() && pausedHomeUrl?.path == url.path)
-        if matchesPaused {
+        if matchesPausedTarget(url, resumeIfPaused: resumeIfPaused) {
             activeNavigationToken += 1
             activeNavigationCommitted = true
             activeContentReady = true
@@ -1746,19 +2090,18 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         }
 
         // 2. Instant pool promotion path: site is already warm/hydrated in warmPool
-        if let slot = matchingWarmSlot(for: url) {
+        if let slot = matchingWarmSlot(for: url, resumeIfPaused: resumeIfPaused) {
             promoteWarmSlot(slot, reveal: false)
             return
         }
 
-        // 3. Cold navigation directly into activeWeb behind the breathing glass veil.
-        // Unsuspend BEFORE starting the navigation so any cross-origin ProvisionalPageProxy is
-        // created unsuspended (WebKit does not forward ResumeAllMediaPlayback to provisional pages).
-        parkActiveIfHomepage()
+        // 3. Cold navigation directly into activeWeb behind the cover (parking previous site in warmPool!).
+        parkCurrentWebIfDifferentHost(from: url)
         pausedHomeUrl = nil
         pausedRequestedUrl = nil
         activeNavigationToken += 1
         activeNavigationCommitted = false
+        activeReadyViaVideo = false
         activeContentReady = false
         let token = activeNavigationToken
         let targetWeb = web
@@ -1778,15 +2121,13 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         preparedUrl = nil
 
         // 1. Instant 0ms resume from paused Home state
-        let matchesPaused = (pausedHomeUrl.map { floatSameLoadTarget($0, url) } ?? false)
-            || (pausedRequestedUrl.map { floatSameLoadTarget($0, url) } ?? false)
-            || (resumeIfPaused && pausedHomeUrl?.host?.lowercased() == url.host?.lowercased() && pausedHomeUrl?.path == url.path)
-        if matchesPaused {
+        if matchesPausedTarget(url, resumeIfPaused: resumeIfPaused) {
             pausedHomeUrl = nil
             pausedRequestedUrl = nil
             activeNavigationToken += 1
             activeNavigationCommitted = true
             activeContentReady = true
+            web.alphaValue = 1.0
             web.isHidden = false
             let activeWeb = web
             activeWeb.setMediaSuspended(false) { [weak self] in
@@ -1797,7 +2138,7 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         }
 
         // 2. Promote matching warm slot if not already promoted in prepareRequest
-        if let slot = matchingWarmSlot(for: url) {
+        if let slot = matchingWarmSlot(for: url, resumeIfPaused: resumeIfPaused) {
             promoteWarmSlot(slot, reveal: true)
             return
         }
@@ -1805,11 +2146,13 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         // 3. Reveal & unsuspend activeWeb (either already prepared or fresh load)
         pausedHomeUrl = nil
         pausedRequestedUrl = nil
+        web.alphaValue = 1.0
         web.isHidden = false
         let activeWeb = web
         if !wasPrepared {
             activeNavigationToken += 1
             activeNavigationCommitted = false
+            activeReadyViaVideo = false
             activeContentReady = false
             let token = activeNavigationToken
             activeWeb.setMediaSuspended(false) { [weak self] in
@@ -1842,16 +2185,6 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         }
     }
 
-    /// Parks the current activeWeb back into warmPool when switching sites if it's a clean site homepage
-    /// so bouncing back to it later is 0ms.
-    private func parkActiveIfHomepage() {
-        guard let cur = web.url, floatIsWeb(cur), let rawHost = cur.host else { return }
-        let key = rawHost.lowercased()
-        let isRootOrBrowse = cur.path.isEmpty || cur.path == "/" || cur.path == "/browse" || cur.path == "/home"
-        guard isRootOrBrowse, warmPool[key] == nil, warmPool.count < FloatBrowserInstance.maxWarmPoolSize else { return }
-        // Caller will swap web out when promoting; only used when replacing activeWeb in promoteWarmSlot.
-    }
-
     private func promoteWarmSlot(_ slot: FloatWarmSlot, reveal: Bool) {
         let oldWeb = web
         let oldWasCommitted = activeNavigationCommitted && !oldWeb.hasProvisionalNavigation
@@ -1864,19 +2197,37 @@ fileprivate final class FloatBrowserInstance: ExactNativeInstance {
         pausedRequestedUrl = nil
 
         slot.web.frame = container.bounds
+        slot.web.alphaValue = 1.0
         slot.web.isHidden = !reveal
         web = slot.web
         activeNavigationToken += 1
         activeNavigationCommitted = slot.committed
+        activeReadyViaVideo = false
         activeContentReady = slot.contentReady
 
-        // Park oldWeb back into warmPool if it was sitting cleanly on a different site's browse/home page
+        // Park oldWeb back into warmPool for ANY committed visited site (including redirected paths like /us or /storefront)
+        // so bouncing between streaming apps literally switches straight back to "that tab" with zero reload!
         if oldWasCommitted, let oldUrl = oldPausedUrl, floatIsWeb(oldUrl), let oldHost = oldUrl.host {
-            let oldKey = oldHost.lowercased()
-            let isCleanHome = oldUrl.path.isEmpty || oldUrl.path == "/" || oldUrl.path == "/browse" || oldUrl.path == "/home"
-            if oldKey != slot.hostKey, isCleanHome, warmPool[oldKey] == nil, warmPool.count < FloatBrowserInstance.maxWarmPoolSize {
+            let oldKey = floatCanonicalHost(oldHost)
+            if oldKey != slot.hostKey {
+                // Replace any stale preloaded slot for oldKey with the user's live visited tab
+                if let existing = warmPool.removeValue(forKey: oldKey) {
+                    existing.probeToken += 1
+                    teardownWebView(existing.web)
+                }
+                while warmPool.count >= FloatBrowserInstance.maxWarmPoolSize {
+                    if let oldest = warmPool.values.min(by: { $0.lastUsed < $1.lastUsed }) {
+                        oldest.probeToken += 1
+                        teardownWebView(oldest.web)
+                        warmPool.removeValue(forKey: oldest.hostKey)
+                    } else {
+                        break
+                    }
+                }
                 oldWeb.triggersMorphPrepare = false
                 oldWeb.isHidden = true
+                oldWeb.alphaValue = 1.0
+                oldWeb.evaluateJavaScript("(() => { document.querySelectorAll('video,audio').forEach(m => { try { m.pause(); } catch {} }); })()")
                 oldWeb.setMediaSuspended(true)
                 let parked = FloatWarmSlot(hostKey: oldKey, web: oldWeb, requestedUrl: URL(string: "\(oldUrl.scheme ?? "https")://\(oldHost)") ?? oldUrl)
                 parked.committed = true
@@ -1967,6 +2318,1307 @@ private final class FloatHomeVisualEffectView: NSVisualEffectView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+private struct FloatSurfaceUniforms {
+    var resolution: SIMD2<Float>
+    var time: Float
+    var duration: Float
+    var effectKind: Int32
+    var releaseAt: Float
+    var isDemo: Int32
+    var hasWindowMask: Int32
+    var origin: SIMD4<Float> // cx, cy, w, h in normalized [0..1] top-left UV
+}
+
+private let floatSurfaceTransitionMSL = """
+#include <metal_stdlib>
+using namespace metal;
+
+struct Uniforms {
+    float2 resolution;
+    float time;
+    float duration;
+    int effectKind;
+    float releaseAt;
+    int isDemo;
+    int hasWindowMask;
+    float4 origin;
+};
+
+struct VSOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex VSOut surfaceVS(uint vid [[vertex_id]]) {
+    constexpr float2 pos[4] = {
+        float2(-1.0, -1.0),
+        float2( 1.0, -1.0),
+        float2(-1.0,  1.0),
+        float2( 1.0,  1.0)
+    };
+    VSOut out;
+    out.position = float4(pos[vid], 0.0, 1.0);
+    out.uv = float2(pos[vid].x * 0.5 + 0.5, 0.5 - pos[vid].y * 0.5);
+    return out;
+}
+
+static inline float clamp01(float x) { return clamp(x, 0.0f, 1.0f); }
+static inline float easeOutCubic(float t) { float i = 1.0f - clamp01(t); return 1.0f - i * i * i; }
+static inline float easeInOutCubic(float t) {
+    t = clamp01(t);
+    return t < 0.5f ? 4.0f * t * t * t : 1.0f - pow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+}
+static inline float hash2(float2 p) {
+    return fract(sin(dot(p, float2(127.1f, 311.7f))) * 43758.5453123f);
+}
+static inline float vnoise(float2 p) {
+    float2 i = floor(p), f = fract(p);
+    float2 u = f * f * (3.0f - 2.0f * f);
+    return mix(mix(hash2(i), hash2(i + float2(1.0f, 0.0f)), u.x),
+               mix(hash2(i + float2(0.0f, 1.0f)), hash2(i + float2(1.0f, 1.0f)), u.x), u.y);
+}
+static inline float fbm(float2 p) {
+    float v = 0.0f, a = 0.52f;
+    for (int i = 0; i < 4; i++) {
+        v += a * vnoise(p);
+        p *= 2.03f;
+        a *= 0.5f;
+    }
+    return v;
+}
+static inline float sdRoundBox(float2 p, float2 b, float r) {
+    float2 q = abs(p) - b + float2(r);
+    return length(max(q, 0.0f)) + min(max(q.x, q.y), 0.0f) - r;
+}
+
+static inline float4 sampleTex(texture2d<float> tex, sampler s, float2 uv) {
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) return float4(0.0f);
+    return tex.sample(s, uv);
+}
+
+static inline float4 sampleBlur(texture2d<float> tex, sampler s, float2 uv, float2 res, float radiusPx) {
+    if (radiusPx < 0.35f) return sampleTex(tex, s, uv);
+    float2 px = radiusPx / max(res, float2(1.0f));
+    float4 acc = sampleTex(tex, s, uv) * 0.24f;
+    acc += sampleTex(tex, s, uv + float2( px.x,  0.0f)) * 0.11f;
+    acc += sampleTex(tex, s, uv + float2(-px.x,  0.0f)) * 0.11f;
+    acc += sampleTex(tex, s, uv + float2( 0.0f,  px.y)) * 0.11f;
+    acc += sampleTex(tex, s, uv + float2( 0.0f, -px.y)) * 0.11f;
+    acc += sampleTex(tex, s, uv + float2( px.x,  px.y) * 0.72f) * 0.08f;
+    acc += sampleTex(tex, s, uv + float2(-px.x,  px.y) * 0.72f) * 0.08f;
+    acc += sampleTex(tex, s, uv + float2( px.x, -px.y) * 0.72f) * 0.08f;
+    acc += sampleTex(tex, s, uv + float2(-px.x, -px.y) * 0.72f) * 0.08f;
+    return acc;
+}
+
+static inline float4 sampleChromatic(texture2d<float> tex, sampler s, float2 uv, float2 res, float2 dir, float amt, float blurPx) {
+    if (amt < 0.0002f) return sampleBlur(tex, s, uv, res, blurPx);
+    float4 cr = sampleBlur(tex, s, uv + dir * amt, res, blurPx);
+    float4 cg = sampleBlur(tex, s, uv, res, blurPx);
+    float4 cb = sampleBlur(tex, s, uv - dir * amt, res, blurPx);
+    float a = clamp01(max(cg.a, max(cr.a, cb.a)));
+    return float4(min(float3(cr.r, cg.g, cb.b), float3(a)), a);
+}
+
+static inline float4 overPremul(float4 top, float4 bot) {
+    return top + bot * (1.0f - top.a);
+}
+
+static inline float4 evaluateSurfaceEffect(
+    float2 uv,
+    float2 res,
+    constant Uniforms& u,
+    texture2d<float> fromTex,
+    texture2d<float> toTex,
+    sampler s
+) {
+    float aspect = res.x / res.y;
+    float2 p = float2((uv.x - 0.5f) * aspect, uv.y - 0.5f);
+    float t = clamp01(u.time / max(u.duration, 0.001f));
+    int kind = u.effectKind;
+    bool demo = (u.isDemo != 0);
+
+    // 0: Pixel-identical hold of outgoing surface while incoming Home layout renders behind overlay
+    if (kind == 0) {
+        return sampleTex(fromTex, s, uv);
+    }
+
+    // 1: Wave + Bevel (diagonal refractive glass wave sweeping across live UI)
+    if (kind == 1) {
+        float diag = uv.x * 0.64f + uv.y * 0.36f;
+        float front = mix(-0.24f, 1.30f, easeInOutCubic(t));
+        float delta = diag - front;
+        float env = exp(-pow(delta * 8.5f, 2.0f)) * smoothstep(0.0f, 0.08f, t) * (1.0f - smoothstep(0.84f, 1.0f, t));
+        float lift = sin(delta * 16.0f) * env;
+        float2 wuv = uv + float2(0.016f / aspect, 0.014f) * lift;
+        float4 surf = sampleChromatic(fromTex, s, wuv, res, float2(0.64f / aspect, 0.36f), env * 0.008f, env * 2.5f);
+        float sheenA = clamp01(exp(-pow(delta * 14.0f, 2.0f)) * env * 0.62f);
+        float4 sheen = float4(float3(0.45f, 0.98f, 0.99f) * sheenA, sheenA);
+        return overPremul(sheen, surf);
+    }
+
+    // 2: Glass Curtain (prismatic frosted-glass curtain gliding across live UI)
+    if (kind == 2) {
+        float diag = uv.x * 0.72f + uv.y * 0.28f;
+        float front = mix(-0.22f, 1.32f, easeInOutCubic(t));
+        float distEdge = diag - front;
+        float fade = smoothstep(0.0f, 0.08f, t) * (1.0f - smoothstep(0.84f, 1.0f, t));
+        float band = exp(-pow(distEdge * 6.0f, 2.0f)) * fade;
+        float2 wuv = uv + float2(0.022f / aspect, 0.010f) * band;
+        float4 surf = sampleChromatic(fromTex, s, wuv, res, float2(0.72f / aspect, 0.28f), band * 0.014f, band * 8.5f);
+        float veilA = band * 0.34f;
+        float4 veil = float4(float3(0.07f, 0.28f, 0.32f) * veilA, veilA);
+        float4 outC = overPremul(veil, surf);
+        float core = exp(-pow(distEdge * 20.0f, 2.0f)) * fade;
+        float prismA = clamp01(core * 0.82f);
+        return overPremul(float4(float3(0.62f, 0.99f, 1.0f) * prismA, prismA), outC);
+    }
+
+    // 11: Liquid Refractive Ripple — center shockwave expands outward, revealing the underlying
+    // page behind the wave front while refracting & bending freshly revealed cards across 3 trailing crests.
+    if (kind == 11) {
+        float2 center = float2(0.0f, -0.02f);
+        float2 d = p - center;
+        float dist = length(d);
+        float2 dir = dist > 0.0001f ? d / dist : float2(1.0f, 0.0f);
+
+        // In Settings demo (already looking at Home), smoothly dissolve the existing UI into bare
+        // Liquid Glass over the first 95ms so the center ripple genuinely reveals it from nothing.
+        // On real Web -> Home return (demo == false), start immediately from bare Liquid Glass!
+        float preFade = demo ? (1.0f - easeOutCubic(clamp01(t / 0.095f))) : 0.0f;
+        float rt = demo ? clamp01((t - 0.075f) / 0.925f) : t;
+
+        float front = mix(-0.05f, 1.44f, easeOutCubic(rt));
+        float delta = dist - front;
+        float intro = smoothstep(0.0f, 0.07f, rt);
+        float outro = 1.0f - smoothstep(0.76f, 1.0f, rt);
+        float fade = intro * outro;
+
+        // Sharp leading shock front + wide trailing wake carrying 3 bold concentric ripples
+        float leadEnv = exp(-pow(max(delta, 0.0f) * 14.0f, 2.0f));
+        float wakeEnv = exp(-pow(max(-delta, 0.0f) * 3.0f, 2.0f));
+        float env = leadEnv * wakeEnv * fade;
+
+        float phase = delta * 24.0f;
+        float waveHeight = sin(phase) * env;
+        float waveSlope = cos(phase) * env;
+
+        // True radial reveal mask: 0.0 (hidden over live Liquid Glass) ahead of front, 1.0 behind front!
+        float revealed = (rt <= 0.0001f) ? 0.0f : (1.0f - smoothstep(-0.055f, 0.035f, delta));
+        float2 radialUv = float2(dir.x / aspect, dir.y);
+        float sc = mix(0.92f, 1.0f, revealed) + waveHeight * 0.085f;
+        float2 wuv = (uv - 0.5f) / sc + 0.5f;
+        wuv += radialUv * (waveSlope * 0.130f + waveHeight * 0.045f);
+
+        float blurPx = (1.0f - revealed) * 5.0f + abs(waveSlope) * 4.5f;
+        float chromAmt = abs(waveSlope) * 0.028f;
+        float4 surf = sampleChromatic(toTex, s, wuv, res, radialUv, chromAmt, blurPx);
+
+        float shade = 1.0f + waveSlope * 0.18f;
+        surf.rgb = min(surf.rgb * max(0.0f, shade), float3(surf.a));
+
+        // Mask the revealed Home surface by the expanding ripple front
+        float4 revealedSurf = surf * revealed;
+        if (demo) {
+            if (preFade > 0.001f) {
+                float4 oldSurf = sampleBlur(fromTex, s, uv, res, (1.0f - preFade) * 5.0f) * preFade;
+                revealedSurf = overPremul(revealedSurf, oldSurf);
+            }
+        } else {
+            // Composited right on top of the outgoing Web view (fromTex): the live Web page stays intact
+            // ahead of the expanding center ripple, bends as the shockwave hits it, and parts cleanly
+            // into live Liquid Glass + Home behind the wave front!
+            float webRemain = 1.0f - revealed;
+            if (webRemain > 0.001f) {
+                float2 webUv = uv + radialUv * (waveSlope * 0.095f);
+                float4 webSurf = sampleChromatic(fromTex, s, webUv, res, radialUv, abs(waveSlope) * 0.024f, abs(waveSlope) * 3.5f);
+                float webShade = 1.0f + waveSlope * 0.14f;
+                webSurf.rgb = min(webSurf.rgb * max(0.0f, webShade), float3(webSurf.a));
+                webSurf *= webRemain;
+                revealedSurf = overPremul(revealedSurf, webSurf);
+            }
+        }
+
+        // Crisp glassy specular caustic glint along the expanding reveal front & trailing crests
+        float spec = pow(clamp01(waveSlope), 2.5f) * 0.36f * revealed + pow(clamp01(-waveSlope), 3.0f) * 0.12f * revealed;
+        float rimGlow = exp(-pow(delta * 16.0f, 2.0f)) * 0.42f * fade;
+        float crestA = clamp01(spec + rimGlow);
+        float4 crest = float4(float3(0.45f, 0.98f, 1.0f) * crestA, crestA);
+        return overPremul(crest, revealedSurf);
+    }
+
+    // 12: Frost Refraction Thaw (ice-crystal micro-refraction that freezes/thaws across real UI)
+    if (kind == 12) {
+        float dist = length(p * float2(0.82f, 1.0f));
+        float n = fbm(uv * float2(14.0f, 8.0f));
+        float fine = fbm(uv * float2(42.0f, 24.0f));
+        float field = dist * 0.72f + n * 0.42f;
+
+        float frozen = 0.0f;
+        float meltEdge = 0.0f;
+        if (demo) {
+            float freezeAmt = easeOutCubic(clamp01(t / 0.24f));
+            float thawU = clamp01((t - 0.20f) / 0.80f);
+            float thawFront = mix(-0.14f, 1.28f, easeInOutCubic(thawU));
+            float stillFrozen = smoothstep(thawFront - 0.09f, thawFront + 0.07f, field);
+            frozen = freezeAmt * stillFrozen;
+            meltEdge = exp(-pow((field - thawFront) * 16.0f, 2.0f)) * smoothstep(0.16f, 0.28f, t) * (1.0f - smoothstep(0.84f, 1.0f, t));
+        } else {
+            float front = mix(-0.14f, 1.26f, easeInOutCubic(t));
+            frozen = smoothstep(front - 0.09f, front + 0.07f, field);
+            meltEdge = exp(-pow((field - front) * 16.0f, 2.0f)) * (1.0f - smoothstep(0.80f, 1.0f, t));
+        }
+
+        float2 refractOff = (float2(fine, fbm(uv * float2(42.0f, 24.0f) + 7.3f)) - 0.5f) * 0.048f * frozen;
+        float2 scaleUv = mix(uv, (uv - 0.5f) * 0.96f + 0.5f, frozen) + refractOff;
+        float blurPx = frozen * 9.5f + meltEdge * 2.5f;
+
+        float4 surf = sampleChromatic(toTex, s, scaleUv, res, normalize(refractOff + float2(0.0001f)), frozen * 0.009f, blurPx);
+        if (!demo && frozen > 0.001f) {
+            float4 webFrozen = sampleChromatic(fromTex, s, scaleUv, res, normalize(refractOff + float2(0.0001f)), frozen * 0.012f, blurPx);
+            surf = mix(surf, webFrozen, frozen);
+        }
+        float frostA = frozen * 0.54f;
+        float4 frostCol = float4(float3(0.12f, 0.36f, 0.44f) * (0.75f + fine * 0.5f) * frostA, frostA);
+        float4 outC = overPremul(frostCol, float4(surf.rgb * mix(1.0f, 0.78f, frozen), surf.a));
+        float rimA = clamp01(meltEdge * 0.82f);
+        return overPremul(float4(float3(0.50f, 0.99f, 0.99f) * rimA, rimA), outC);
+    }
+
+    // 13: 3D Glass Louvers (8 rotating 3D perspective glass slats)
+    if (kind == 13) {
+        float N = 8.0f;
+        float idx = floor(uv.x * N);
+        float localX = fract(uv.x * N) - 0.5f;
+        float delay = idx * 0.042f;
+        float pStrip = clamp01((t - delay) / 0.64f);
+
+        float angle;
+        float turnAmt;
+        if (demo) {
+            // Smooth 0 deg -> 76 deg -> 0 deg so frame 0 and final frame are exact 1:1 with zero start jank!
+            float swing = sin(pStrip * 3.14159265f);
+            turnAmt = pow(swing, 0.85f);
+            angle = turnAmt * 1.34f;
+        } else {
+            float e = easeOutCubic(pStrip);
+            turnAmt = 1.0f - e;
+            angle = mix(1.42f, 0.0f, e);
+        }
+
+        float ca = max(cos(angle), 0.001f);
+        float sa = sin(angle);
+        float persp = 1.0f + localX * sa * 0.44f;
+        float projX = (localX * persp) / ca;
+        float projY = (uv.y - 0.5f) * (1.0f + abs(localX) * sa * 0.24f) + 0.5f;
+
+        if (abs(projX) > 0.5f || projY < 0.0f || projY > 1.0f) {
+            // Transparent gap between rotating 3D slats lets live Liquid Glass shine straight through
+            return float4(0.0f);
+        }
+        float2 sampleUv = float2((idx + projX + 0.5f) / N, projY);
+        float blurPx = turnAmt * 4.5f;
+        float4 surf = sampleChromatic(toTex, s, sampleUv, res, float2(22.0f / res.x, 0.0f), turnAmt * 0.016f, blurPx);
+        float shade = mix(0.46f, 1.0f, ca);
+        // Subtle tinted glass pane backing on each slat so slats read clearly in 3D over live Liquid Glass
+        float paneA = turnAmt * 0.24f;
+        float4 pane = float4(float3(0.06f, 0.20f, 0.24f) * shade * paneA, paneA);
+        float4 slat = overPremul(float4(surf.rgb * shade, surf.a), pane);
+        float spec = pow(clamp01(1.0f - abs(angle - 0.46f) * 2.0f), 2.5f) * (1.0f - abs(projX) * 1.35f) * turnAmt;
+        float edgeHi = smoothstep(0.41f, 0.50f, abs(projX)) * turnAmt * 0.78f;
+        float gA = clamp01(spec * 0.42f + edgeHi);
+        float4 glow = float4(float3(0.38f, 0.97f, 0.98f) * gA, gA);
+        return overPremul(glow, slat);
+    }
+
+    // 14: Anamorphic Focus Pull (horizontal cinema stretch + 9-tap directional bokeh + RGB split)
+    if (kind == 14) {
+        float defocus;
+        if (demo) {
+            // Smoothly racks out of focus (0 -> 0.22) then cleanly pulls back to crisp 1:1 (0.22 -> 1.0)
+            float rackOut = easeOutCubic(clamp01(t / 0.22f));
+            float rackIn = 1.0f - easeInOutCubic(clamp01((t - 0.20f) / 0.80f));
+            defocus = rackOut * rackIn;
+        } else {
+            defocus = 1.0f - easeOutCubic(clamp01(t / 0.86f));
+        }
+
+        float sx = mix(1.0f, 1.20f, defocus);
+        float sy = mix(1.0f, 0.94f, defocus);
+        float2 su = float2((uv.x - 0.5f) / sx + 0.5f, (uv.y - 0.5f) / sy + 0.5f);
+
+        float4 acc = float4(0.0f);
+        float spread = defocus * 30.0f / res.x;
+        if (defocus < 0.002f) {
+            acc = sampleTex(toTex, s, uv);
+        } else {
+            for (int i = -4; i <= 4; i++) {
+                float fi = float(i) / 4.0f;
+                float w = 1.0f - abs(fi) * 0.55f;
+                float2 off = float2(fi * spread, 0.0f);
+                float4 sr = sampleTex(toTex, s, su + off + float2(defocus * 0.016f, 0.0f));
+                float4 sg = sampleTex(toTex, s, su + off);
+                float4 sb = sampleTex(toTex, s, su + off - float2(defocus * 0.016f, 0.0f));
+                acc += float4(sr.r, sg.g, sb.b, max(sg.a, max(sr.a, sb.a))) * w;
+            }
+            acc /= 6.5f;
+            acc.rgb *= mix(1.0f, 0.76f, defocus);
+        }
+
+        float flareA = exp(-pow((uv.y - 0.48f) * 22.0f, 2.0f)) * defocus * 0.42f;
+        return overPremul(float4(float3(0.36f, 0.96f, 0.99f) * flareA, flareA), acc);
+    }
+
+    // Open-site phase split (handles both smooth demo timing and live WKWebView releaseAt)
+    // When releaseAt == 0 on kind 16 (already-ready instant ripple), skip coverDur completely!
+    float coverDur = (kind == 15) ? 0.42f : ((kind == 16) ? ((u.releaseAt >= 0.0f && u.releaseAt < 0.05f) ? 0.0f : 0.14f) : 0.34f);
+    float releaseDur = (kind == 15) ? 0.52f : ((kind == 16) ? 1.02f : 0.48f);
+    bool releasing = (u.releaseAt >= 0.0f);
+    float relStart = releasing ? max(coverDur, u.releaseAt) : 100.0f;
+    bool inPhase2 = releasing && (u.time >= relStart);
+    float inU = clamp01(u.time / max(coverDur, 0.0001f));
+    float outU = inPhase2 ? clamp01((u.time - relStart) / releaseDur) : 0.0f;
+
+    // 3: Tile Lens (expanding refractive liquid-glass lens from clicked tile -> alive breathing glass veil -> caustic reveal of finished page)
+    if (kind == 3) {
+        float uExp = easeInOutCubic(inU);
+        float2 curC = mix(u.origin.xy, float2(0.5f), uExp);
+        float2 curS = mix(u.origin.zw, float2(1.06f), uExp);
+        float2 boxP = float2((uv.x - curC.x) * aspect, uv.y - curC.y);
+        float2 boxB = float2(curS.x * 0.5f * aspect, curS.y * 0.5f);
+        float sd = sdRoundBox(boxP, boxB, mix(0.03f, 0.0f, uExp));
+
+        float lensMask = (1.0f - smoothstep(-0.008f, 0.008f, sd)) * smoothstep(0.0f, 0.06f, inU);
+        float revealMask = 1.0f;
+        float edgeGlow = 0.0f;
+        float diag = uv.x * 0.65f + uv.y * 0.35f;
+        if (inPhase2) {
+            float wipe = mix(-0.18f, 1.28f, easeInOutCubic(outU));
+            revealMask = smoothstep(wipe - 0.06f, wipe + 0.06f, diag);
+            edgeGlow = exp(-pow((diag - wipe) * 18.0f, 2.0f)) * (1.0f - smoothstep(0.84f, 1.0f, outU));
+        }
+
+        float cover = lensMask * revealMask;
+        float2 magUv = curC + (uv - curC) * mix(1.0f, 0.88f, cover * (1.0f - outU));
+        float4 homeSurf = sampleBlur(fromTex, s, magUv, res, cover * 9.0f);
+        float4 destSurf = inPhase2 ? sampleBlur(toTex, s, uv, res, revealMask * 4.0f) : homeSurf;
+        float4 baseSurf = inPhase2 ? mix(destSurf, homeSurf, revealMask) : homeSurf;
+
+        // Alive breathing glass shimmer while waiting for the site to paint behind the cover
+        float breathe = 0.5f + 0.5f * sin(u.time * 4.2f);
+        float sheenPos = mix(-0.35f, 1.35f, fract(u.time * 0.62f));
+        float sheen = exp(-pow((diag - sheenPos) * 5.2f, 2.0f)) * 0.22f * smoothstep(0.35f, 1.0f, uExp);
+        float3 veilRgb = mix(float3(0.03f, 0.15f, 0.18f), float3(0.06f, 0.28f, 0.32f), diag * 0.65f + 0.12f * breathe);
+        veilRgb = mix(veilRgb, float3(0.75f, 0.99f, 0.99f), sheen);
+
+        // Fully opaque on real opens once expanded so WKWebView renders cleanly behind the glass veil
+        float veilA = demo ? (cover * 0.72f) : clamp01(cover * mix(0.72f, 1.0f, easeOutCubic(inU)));
+        float4 outC = overPremul(float4(veilRgb * veilA, veilA), baseSurf);
+        float rimA = clamp01((smoothstep(-0.016f, 0.0f, sd) * lensMask * (1.0f - uExp) + edgeGlow) * 0.90f);
+        return overPremul(float4(float3(0.54f, 0.99f, 1.0f) * rimA, rimA), outC);
+    }
+
+    // 4: Diagonal Wipe (prismatic diagonal frosted-glass sweep -> alive breathing veil -> crisp reveal of finished page)
+    if (kind == 4) {
+        float diag = uv.x * 0.72f + uv.y * 0.28f;
+        float coverFront = mix(-0.18f, 1.28f, easeInOutCubic(inU));
+        float covered = 1.0f - smoothstep(coverFront - 0.06f, coverFront + 0.06f, diag);
+        float coverEdge = exp(-pow((diag - coverFront) * 18.0f, 2.0f)) * smoothstep(0.0f, 0.06f, inU) * (1.0f - smoothstep(0.84f, 1.0f, inU));
+
+        float cleared = 0.0f;
+        float clearEdge = 0.0f;
+        if (inPhase2) {
+            float clearFront = mix(-0.18f, 1.28f, easeInOutCubic(outU));
+            cleared = 1.0f - smoothstep(clearFront - 0.06f, clearFront + 0.06f, diag);
+            clearEdge = exp(-pow((diag - clearFront) * 18.0f, 2.0f)) * (1.0f - smoothstep(0.84f, 1.0f, outU));
+        }
+
+        float veilMask = clamp01(covered - cleared);
+        float4 bg = (inPhase2 && cleared > 0.01f) ? mix(sampleTex(fromTex, s, uv), sampleTex(toTex, s, uv), cleared) : sampleTex(fromTex, s, uv);
+        float4 refr = sampleBlur(inPhase2 ? toTex : fromTex, s, uv + float2(0.018f / aspect, 0.008f) * veilMask, res, veilMask * 10.0f);
+        float4 base = mix(bg, refr, veilMask);
+
+        float breathe = 0.5f + 0.5f * sin(u.time * 4.2f);
+        float sheenPos = mix(-0.35f, 1.35f, fract(u.time * 0.62f));
+        float sheen = exp(-pow((diag - sheenPos) * 5.2f, 2.0f)) * 0.22f * smoothstep(0.35f, 1.0f, inU);
+        float3 veilRgb = mix(float3(0.03f, 0.15f, 0.18f), float3(0.06f, 0.28f, 0.32f), diag * 0.65f + 0.12f * breathe);
+        veilRgb = mix(veilRgb, float3(0.75f, 0.99f, 0.99f), sheen);
+
+        float veilA = demo ? (veilMask * 0.70f) : clamp01(veilMask * 0.99f);
+        float4 outC = overPremul(float4(veilRgb * veilA, veilA), base);
+        float rimA = clamp01(max(coverEdge, clearEdge) * 0.90f);
+        return overPremul(float4(float3(0.55f, 0.99f, 1.0f) * rimA, rimA), outC);
+    }
+
+    // 15: Optical Portal Warp — dramatic barrel suction + vortex swirl into portal, then reverse-fisheye un-warp!
+    if (kind == 15) {
+        float2 orig = u.origin.xy;
+        if (!inPhase2) {
+            float uIn = easeInOutCubic(inU);
+            float breathe = (u.time > coverDur) ? (0.5f + 0.5f * sin((u.time - coverDur) * 5.0f)) : 0.0f;
+            float2 d = uv - orig;
+            float2 dp = float2(d.x * aspect, d.y);
+            float r = length(dp);
+
+            // Subtle rotational vortex swirl near the portal mouth (strictly 0 at uIn=0)
+            float swirl = uIn * uIn * 0.48f * exp(-r * 2.2f);
+            float cs = cos(swirl), sn = sin(swirl);
+            float2 dRot = float2((dp.x * cs - dp.y * sn) / aspect, dp.x * sn + dp.y * cs);
+
+            // Strong barrel distortion pulling the entire window surface into the portal
+            float warp = 1.0f + uIn * 2.75f * r * r;
+            float2 wuv = orig + dRot * mix(1.0f, 0.36f, uIn) * warp;
+            float2 dir = r > 0.001f ? normalize(d) : float2(1.0f, 0.0f);
+
+            float4 surf = sampleChromatic(fromTex, s, wuv, res, dir, uIn * 0.028f * (0.35f + r), uIn * 9.5f);
+            // Deep portal void (100% opaque dark-teal cover on real Web opens once peaked so WKWebView
+            // can render at opacity 1.0 behind it at 120Hz without leaking any blank loading frame;
+            // translucent in Settings demos so live Liquid Glass stays alive behind the portal).
+            float voidA = demo
+                ? clamp01(uIn * (0.24f + 0.34f * smoothstep(0.15f, 0.95f, r)))
+                : clamp01(smoothstep(0.08f, 0.78f, uIn));
+            float4 voidCol = float4(float3(0.03f, 0.12f, 0.16f) * voidA, voidA);
+            float4 base = overPremul(voidCol, float4(surf.rgb * (1.0f - uIn * 0.38f), surf.a));
+
+            // Luminous cyan outer shockwave ring + breathing inner portal horizon while waiting on TTI
+            float holdT = max(0.0f, u.time - coverDur);
+            float pulseR = fract(holdT * 0.65f);
+            float pulseRing = (holdT > 0.01f)
+                ? exp(-pow((r - mix(0.12f, 0.85f, pulseR)) * 14.0f, 2.0f)) * sin(pulseR * 3.14159265f) * 0.45f
+                : 0.0f;
+            float outerRing = exp(-pow((r - mix(0.04f, 1.18f, uIn)) * 12.0f, 2.0f)) * sin(inU * 3.14159265f) * 0.90f;
+            float coreRing = exp(-pow((r - mix(0.03f, 0.16f + breathe * 0.03f, uIn)) * 20.0f, 2.0f)) * smoothstep(0.06f, 0.55f, uIn) * 0.82f;
+            float ringA = clamp01(outerRing + coreRing + pulseRing);
+            return overPremul(float4(float3(0.34f, 0.97f, 0.99f) * ringA, ringA), base);
+        } else {
+            float uOut = easeOutCubic(outU);
+            float inv = 1.0f - uOut;
+            float2 d = uv - 0.5f;
+            float2 dp = float2(d.x * aspect, d.y);
+            float r = length(dp);
+
+            // Reverse fisheye un-warp + counter-swirl settling smoothly into crisp 1:1 focus
+            float swirl = -inv * inv * 0.34f * exp(-r * 2.0f);
+            float cs = cos(swirl), sn = sin(swirl);
+            float2 dRot = float2((dp.x * cs - dp.y * sn) / aspect, dp.x * sn + dp.y * cs);
+
+            float k = 1.0f - inv * 0.60f * r * r;
+            float2 wuv = 0.5f + dRot * mix(1.30f, 1.0f, uOut) * k;
+            float2 dir = r > 0.001f ? normalize(d) : float2(1.0f, 0.0f);
+
+            float4 surf = sampleChromatic(toTex, s, wuv, res, dir, inv * 0.024f * (0.25f + r), inv * 9.0f);
+            float veilA = inv * inv * 0.36f;
+            float4 base = overPremul(float4(float3(0.04f, 0.16f, 0.20f) * veilA, veilA), float4(surf.rgb * mix(0.68f, 1.0f, uOut), surf.a));
+
+            float ringA = clamp01(exp(-pow((r - mix(0.05f, 1.32f, uOut)) * 11.0f, 2.0f)) * inv * 0.88f);
+            return overPremul(float4(float3(0.38f, 0.98f, 1.0f) * ringA, ringA), base);
+        }
+    }
+
+    // 16: Liquid Ripple Open — pulses softly at the clicked tile while the site finishes painting
+    // behind the opaque Home surface, then bursts a multi-crest liquid shockwave outward from the
+    // clicked tile to reveal the finished destination page!
+    if (kind == 16) {
+        float2 orig = u.origin.xy;
+        float2 d = uv - orig;
+        float2 dp = float2(d.x * aspect, d.y);
+        float dist = length(dp);
+        float2 dir = dist > 0.0001f ? dp / dist : float2(1.0f, 0.0f);
+        float2 radialUv = float2(dir.x / aspect, dir.y);
+
+        if (!inPhase2) {
+            // Tactile pulsing liquid ripple right around the clicked tile while waiting for painted content
+            float intro = smoothstep(0.0f, 0.08f, u.time);
+            float pulse = fract(u.time * 1.10f);
+            float ringR = mix(0.03f, 0.42f, easeOutCubic(pulse));
+            float ringDelta = dist - ringR;
+            float ringEnv = exp(-pow(ringDelta * 16.0f, 2.0f)) * sin(pulse * 3.14159265f) * intro;
+            float localWave = cos(ringDelta * 26.0f) * ringEnv;
+            float2 wuv = uv + radialUv * localWave * 0.040f;
+            float4 surf = sampleChromatic(fromTex, s, wuv, res, radialUv, abs(localWave) * 0.014f, abs(localWave) * 2.5f);
+            // Gentle focus glow around clicked tile origin
+            float coreGlow = exp(-pow(dist * 7.5f, 2.0f)) * (0.18f + 0.14f * sin(u.time * 5.0f)) * intro;
+            float ringA = clamp01(ringEnv * 0.65f + coreGlow);
+            return overPremul(float4(float3(0.36f, 0.97f, 0.99f) * ringA, ringA), surf);
+        } else {
+            // Full multi-crest liquid shockwave erupting from the clicked tile across the entire window!
+            float maxDist = length(float2(aspect, 1.0f)) * 1.18f;
+            float front = mix(-0.04f, maxDist, easeOutCubic(outU));
+            float delta = dist - front;
+            float intro = smoothstep(0.0f, 0.06f, outU);
+            float outro = 1.0f - smoothstep(0.78f, 1.0f, outU);
+            float fade = intro * outro;
+
+            float leadEnv = exp(-pow(max(delta, 0.0f) * 14.0f, 2.0f));
+            float wakeEnv = exp(-pow(max(-delta, 0.0f) * 2.9f, 2.0f));
+            float env = leadEnv * wakeEnv * fade;
+
+            float phase = delta * 24.0f;
+            float waveHeight = sin(phase) * env;
+            float waveSlope = cos(phase) * env;
+
+            float revealed = (outU <= 0.0001f) ? 0.0f : (1.0f - smoothstep(-0.055f, 0.035f, delta));
+            float sc = mix(0.93f, 1.0f, revealed) + waveHeight * 0.085f;
+            float2 wuv = (uv - orig) / sc + orig;
+            wuv += radialUv * (waveSlope * 0.130f + waveHeight * 0.045f);
+
+            float blurPx = (1.0f - revealed) * 4.5f + abs(waveSlope) * 4.5f;
+            float4 destSurf = sampleChromatic(toTex, s, wuv, res, radialUv, abs(waveSlope) * 0.028f, blurPx);
+            float shade = 1.0f + waveSlope * 0.18f;
+            destSurf.rgb = min(destSurf.rgb * max(0.0f, shade), float3(destSurf.a));
+
+            float4 outSurf = destSurf * revealed;
+            float homeRemain = 1.0f - revealed;
+            if (homeRemain > 0.001f) {
+                float2 homeUv = uv + radialUv * (waveSlope * 0.095f);
+                float4 homeSurf = sampleChromatic(fromTex, s, homeUv, res, radialUv, abs(waveSlope) * 0.024f, abs(waveSlope) * 3.5f);
+                float hShade = 1.0f + waveSlope * 0.14f;
+                homeSurf.rgb = min(homeSurf.rgb * max(0.0f, hShade), float3(homeSurf.a));
+                homeSurf *= homeRemain;
+                outSurf = overPremul(outSurf, homeSurf);
+            }
+
+            float spec = pow(clamp01(waveSlope), 2.5f) * 0.36f * revealed + pow(clamp01(-waveSlope), 3.0f) * 0.12f * revealed;
+            float rimGlow = exp(-pow(delta * 16.0f, 2.0f)) * 0.44f * fade;
+            float crestA = clamp01(spec + rimGlow);
+            float4 crest = float4(float3(0.45f, 0.98f, 1.0f) * crestA, crestA);
+            return overPremul(crest, outSurf);
+        }
+    }
+
+    return sampleTex(toTex, s, uv);
+}
+
+fragment float4 surfaceFS(
+    VSOut in [[stage_in]],
+    constant Uniforms& u [[buffer(0)]],
+    texture2d<float> fromTex [[texture(0)]],
+    texture2d<float> toTex [[texture(1)]]
+) {
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float2 uv = in.uv;
+    float2 res = max(u.resolution, float2(1.0f));
+    float4 outCol = evaluateSurfaceEffect(uv, res, u, fromTex, toTex, s);
+
+    if (u.hasWindowMask != 0) {
+        float2 edgePx = min(uv, 1.0f - uv) * res;
+        if (edgePx.x < 68.0f && edgePx.y < 68.0f) {
+            float cornerA = clamp01(fromTex.sample(s, uv).a * 1.18f);
+            outCol *= cornerA;
+        }
+    }
+    return outCol;
+}
+"""
+
+private final class FloatMetalResources: @unchecked Sendable {
+    let device: MTLDevice
+    let queue: MTLCommandQueue
+    let pipeline: MTLRenderPipelineState
+
+    init(device: MTLDevice, queue: MTLCommandQueue, pipeline: MTLRenderPipelineState) {
+        self.device = device
+        self.queue = queue
+        self.pipeline = pipeline
+    }
+}
+
+/// Native macOS Metal surface-displacement transition overlay that captures the real live
+/// WindowServer backing surface (Liquid Glass + cards + icons + video) into MTLTextures
+/// and warps/refracts them at display refresh rate with zero startup jank.
+private final class FloatSurfaceTransitionHost: NSObject {
+    private final class MetalOverlayView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func makeBackingLayer() -> CALayer {
+            let l = CAMetalLayer()
+            l.isOpaque = false
+            l.pixelFormat = .bgra8Unorm
+            l.framebufferOnly = true
+            l.backgroundColor = NSColor.clear.cgColor
+            return l
+        }
+    }
+
+    private static var prewarmStarted = false
+    private static var cachedResources: FloatMetalResources?
+    private static var pendingWaiters: [(FloatMetalResources?) -> Void] = []
+
+    /// Pre-compiles the Metal shader library & pipeline state on a background queue at app startup
+    /// and runs a 2x2 warmup render pass so GPU shader binaries are hot before the first click.
+    static func prewarm() {
+        guard !prewarmStarted else { return }
+        prewarmStarted = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let built = buildResources()
+            DispatchQueue.main.async {
+                cachedResources = built
+                let waiters = pendingWaiters
+                pendingWaiters.removeAll()
+                for cb in waiters { cb(built) }
+            }
+        }
+    }
+
+    private static func buildResources() -> FloatMetalResources? {
+        guard let dev = MTLCreateSystemDefaultDevice(),
+              let q = dev.makeCommandQueue() else { return nil }
+        do {
+            let lib = try dev.makeLibrary(source: floatSurfaceTransitionMSL, options: nil)
+            guard let vs = lib.makeFunction(name: "surfaceVS"),
+                  let fs = lib.makeFunction(name: "surfaceFS") else { return nil }
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = vs
+            desc.fragmentFunction = fs
+            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            desc.colorAttachments[0].isBlendingEnabled = false
+            let pipe = try dev.makeRenderPipelineState(descriptor: desc)
+
+            // Warm GPU pipeline caches with a tiny 2x2 offscreen render pass off the main thread.
+            let tDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 2, height: 2, mipmapped: false)
+            tDesc.usage = [.renderTarget, .shaderRead]
+            if let dummy = dev.makeTexture(descriptor: tDesc),
+               let cmd = q.makeCommandBuffer() {
+                let rpd = MTLRenderPassDescriptor()
+                rpd.colorAttachments[0].texture = dummy
+                rpd.colorAttachments[0].loadAction = .clear
+                rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+                rpd.colorAttachments[0].storeAction = .store
+                if let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) {
+                    enc.setRenderPipelineState(pipe)
+                    var u = FloatSurfaceUniforms(
+                        resolution: SIMD2<Float>(2, 2),
+                        time: 0, duration: 1, effectKind: 15,
+                        releaseAt: -1, isDemo: 1, hasWindowMask: 0,
+                        origin: SIMD4<Float>(0.5, 0.5, 0.2, 0.2)
+                    )
+                    enc.setFragmentBytes(&u, length: MemoryLayout<FloatSurfaceUniforms>.stride, index: 0)
+                    enc.setFragmentTexture(dummy, index: 0)
+                    enc.setFragmentTexture(dummy, index: 1)
+                    enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+                    enc.endEncoding()
+                }
+                cmd.commit()
+                cmd.waitUntilCompleted()
+            }
+            return FloatMetalResources(device: dev, queue: q, pipeline: pipe)
+        } catch {
+            return nil
+        }
+    }
+
+    static func obtain(_ ready: @escaping (FloatSurfaceTransitionHost?) -> Void) {
+        if let res = cachedResources {
+            ready(FloatSurfaceTransitionHost(resources: res))
+            return
+        }
+        prewarm()
+        pendingWaiters.append { res in
+            ready(res.map { FloatSurfaceTransitionHost(resources: $0) })
+        }
+    }
+
+    private let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private let pipeline: MTLRenderPipelineState
+
+    private weak var hostWindow: NSWindow?
+    private var overlayView: MetalOverlayView?
+    private var hiddenContentViews: [NSView] = []
+    private var fromTex: MTLTexture?
+    private var toTex: MTLTexture?
+    private var reusableFromTex: MTLTexture?
+    private var reusableToTex: MTLTexture?
+    private var scratchPixels: [UInt8] = []
+    private var hasWindowMask: Bool = true
+    private var keepBackdropLive: Bool = false
+    private var displayLink: CADisplayLink?
+    private var fallbackTimer: Timer?
+
+    private var effectKind: Int32 = 0
+    private var isDemo: Bool = true
+    private var origin: SIMD4<Float> = SIMD4<Float>(0.5, 0.48, 0.24, 0.24)
+    private var startTime: CFTimeInterval = 0
+    private var duration: Double = 0.95
+    private var releaseAt: Double = -1
+    private var onComplete: (() -> Void)?
+
+    private init(resources: FloatMetalResources) {
+        self.device = resources.device
+        self.queue = resources.queue
+        self.pipeline = resources.pipeline
+        super.init()
+    }
+
+    var isActive: Bool { overlayView != nil }
+
+    func cancel() {
+        displayLink?.invalidate()
+        displayLink = nil
+        fallbackTimer?.invalidate()
+        fallbackTimer = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for v in hiddenContentViews {
+            v.layer?.opacity = 1.0
+        }
+        hiddenContentViews.removeAll()
+        overlayView?.removeFromSuperview()
+        overlayView = nil
+        CATransaction.commit()
+        fromTex = nil
+        toTex = nil
+        let cb = onComplete
+        onComplete = nil
+        cb?()
+    }
+
+    private static func isEmptyCGImage(_ image: CGImage) -> Bool {
+        let side = 4
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let ctx = CGContext(
+                data: bytes.baseAddress,
+                width: side,
+                height: side,
+                bitsPerComponent: 8,
+                bytesPerRow: side * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+            return true
+        }
+        return !drawn || stride(from: 3, to: pixels.count, by: 4).allSatisfy { pixels[$0] == 0 }
+    }
+
+    /// Captures this process's own NSWindow directly from macOS WindowServer (Liquid Glass +
+    /// layer-backed Exact cards + icons + text + WKWebView video), matching ExactKit's
+    /// `WindowServerPicture.ownWindow` with zero Screen Recording permission prompt.
+    private static func ownWindowCGImage(_ windowNumber: Int) -> CGImage? {
+        typealias Create = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return nil }
+        let create = unsafeBitCast(symbol, to: Create.self)
+        // kCGWindowListOptionIncludingWindow (1<<3); kCGWindowImageBoundsIgnoreFraming (1<<0) | kCGWindowImageBestResolution (1<<3)
+        guard let image = create(.null, 1 << 3, UInt32(windowNumber), (1 << 0) | (1 << 3))?.takeRetainedValue(),
+              !isEmptyCGImage(image) else { return nil }
+        return image
+    }
+
+    private func textureForSlot(isFrom: Bool, width: Int, height: Int) -> MTLTexture? {
+        let existing = isFrom ? reusableFromTex : reusableToTex
+        if let tex = existing, tex.width == width, tex.height == height {
+            return tex
+        }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        desc.usage = .shaderRead
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        if isFrom { reusableFromTex = tex } else { reusableToTex = tex }
+        return tex
+    }
+
+    private func uploadTexture(from cgImage: CGImage, isFrom: Bool) -> MTLTexture? {
+        let w = max(1, cgImage.width)
+        let h = max(1, cgImage.height)
+        guard let tex = textureForSlot(isFrom: isFrom, width: w, height: h) else { return nil }
+
+        // Fast zero-draw path: macOS WindowServer images are already 32-bit BGRA premultiplied.
+        let alpha = cgImage.alphaInfo
+        let order = cgImage.bitmapInfo.intersection(.byteOrderMask)
+        if cgImage.bitsPerPixel == 32,
+           cgImage.bitsPerComponent == 8,
+           order == .byteOrder32Little,
+           (alpha == .premultipliedFirst || alpha == .noneSkipFirst),
+           let cfData = cgImage.dataProvider?.data,
+           let ptr = CFDataGetBytePtr(cfData) {
+            let bpr = cgImage.bytesPerRow
+            if CFDataGetLength(cfData) >= bpr * h {
+                tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: ptr, bytesPerRow: bpr)
+                return tex
+            }
+        }
+
+        // Reusable buffer fallback for non-BGRA images.
+        let bytesPerRow = w * 4
+        let needed = bytesPerRow * h
+        if scratchPixels.count < needed {
+            scratchPixels = [UInt8](repeating: 0, count: needed)
+        }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        let ok = scratchPixels.withUnsafeMutableBytes { buf -> Bool in
+            guard let base = buf.baseAddress,
+                  let ctx = CGContext(
+                      data: base,
+                      width: w,
+                      height: h,
+                      bitsPerComponent: 8,
+                      bytesPerRow: bytesPerRow,
+                      space: colorSpace,
+                      bitmapInfo: bitmapInfo
+                  ) else { return false }
+            ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+            tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: base, bytesPerRow: bytesPerRow)
+            return true
+        }
+        return ok ? tex : nil
+    }
+
+    /// Renders ONLY the transparent UI subviews (cards, icons, text, borders — excluding `backdrop`)
+    /// via Core Animation's layer tree so macOS 26 Liquid Glass (`NSGlassEffectView`) can remain
+    /// 100% live and untouched underneath the Metal distortion overlay with zero pop or freeze.
+    private func captureUILayerTree(in window: NSWindow, excluding backdrop: NSView?, isFrom: Bool) -> MTLTexture? {
+        guard let content = window.contentView else { return nil }
+        let uiViews = content.subviews.filter { $0 !== backdrop && $0 !== overlayView && !$0.isHidden }
+        guard !uiViews.isEmpty else { return nil }
+        let scale = window.backingScaleFactor
+        let w = max(1, Int((content.bounds.width * scale).rounded()))
+        let h = max(1, Int((content.bounds.height * scale).rounded()))
+        let bytesPerRow = w * 4
+        let needed = bytesPerRow * h
+        if scratchPixels.count < needed {
+            scratchPixels = [UInt8](repeating: 0, count: needed)
+        }
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let tex = textureForSlot(isFrom: isFrom, width: w, height: h) else { return nil }
+
+        for v in uiViews {
+            v.layoutSubtreeIfNeeded()
+            if v.layer == nil { v.wantsLayer = true }
+            v.displayIfNeeded()
+        }
+
+        let drawnNonEmpty = scratchPixels.withUnsafeMutableBytes { buf -> Bool in
+            guard let base = buf.baseAddress,
+                  let ctx = CGContext(
+                      data: base,
+                      width: w,
+                      height: h,
+                      bitsPerComponent: 8,
+                      bytesPerRow: bytesPerRow,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: bitmapInfo
+                  ) else { return false }
+            ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+            for sub in uiViews {
+                guard let subLayer = sub.layer else { continue }
+                let wasOpacity = subLayer.opacity
+                if wasOpacity == 0 {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    subLayer.opacity = 1.0
+                    CATransaction.commit()
+                }
+                ctx.saveGState()
+                let f = sub.frame
+                let bottomY = content.isFlipped ? (content.bounds.height - f.maxY) : f.minY
+                if sub.isFlipped || subLayer.isGeometryFlipped {
+                    ctx.translateBy(x: f.minX * scale, y: (bottomY + f.height) * scale)
+                    ctx.scaleBy(x: scale, y: -scale)
+                } else {
+                    ctx.translateBy(x: f.minX * scale, y: bottomY * scale)
+                    ctx.scaleBy(x: scale, y: scale)
+                }
+                subLayer.render(in: ctx)
+                ctx.restoreGState()
+                if wasOpacity == 0 {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    subLayer.opacity = wasOpacity
+                    CATransaction.commit()
+                }
+            }
+            // Quick stride check to verify real UI pixels were captured
+            let bytes = buf.bindMemory(to: UInt8.self)
+            var hasInk = false
+            var i = 3
+            while i < needed {
+                if bytes[i] > 4 { hasInk = true; break }
+                i += 256
+            }
+            guard hasInk else { return false }
+            tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: base, bytesPerRow: bytesPerRow)
+            return true
+        }
+        return drawnNonEmpty ? tex : nil
+    }
+
+    /// Captures the live window surface. When a live Liquid Glass `backdrop` is present on Home,
+    /// captures ONLY the transparent UI layer so the Metal shader distorts the UI directly on top
+    /// of the live `NSGlassEffectView` without ever hiding or popping the glass!
+    func captureWindowSurface(in window: NSWindow, backdrop: NSView?, isFrom: Bool = true) -> (texture: MTLTexture, fromWindowServer: Bool, keepBackdropLive: Bool)? {
+        if isFrom, overlayView != nil, hostWindow === window, let clean = fromTex {
+            return (clean, hasWindowMask, keepBackdropLive)
+        }
+        if let backdrop, backdrop.superview === window.contentView, !backdrop.isHidden,
+           let uiTex = captureUILayerTree(in: window, excluding: backdrop, isFrom: isFrom) {
+            return (uiTex, false, true)
+        }
+        if let cg = Self.ownWindowCGImage(window.windowNumber),
+           let tex = uploadTexture(from: cg, isFrom: isFrom) {
+            return (tex, true, false)
+        }
+        if let fb = captureUILayerTree(in: window, excluding: nil, isFrom: isFrom) {
+            return (fb, false, false)
+        }
+        return nil
+    }
+
+    func captureWebSurface(_ web: WKWebView, afterScreenUpdates: Bool = true, completion: @escaping (MTLTexture?) -> Void) {
+        let cfg = WKSnapshotConfiguration()
+        cfg.afterScreenUpdates = afterScreenUpdates
+        web.takeSnapshot(with: cfg) { [weak self] image, _ in
+            guard let self, let image else { completion(nil); return }
+            var rect = CGRect(origin: .zero, size: image.size)
+            guard let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
+                completion(nil)
+                return
+            }
+            completion(self.uploadTexture(from: cg, isFrom: false))
+        }
+    }
+
+    /// Immediately holds the outgoing surface 1:1 on the Metal overlay BEFORE switching views,
+    /// so the underlying view swap or snapshot capture never flashes or pulses.
+    func holdOutgoingSurface(in window: NSWindow, texture: MTLTexture, keepBackdropLive: Bool = true, fromWindowServer: Bool = false) {
+        guard let content = window.contentView else { return }
+        cancel()
+        self.hostWindow = window
+        self.effectKind = 0
+        self.isDemo = false
+        self.fromTex = texture
+        self.toTex = texture
+        self.hasWindowMask = fromWindowServer
+        self.keepBackdropLive = keepBackdropLive
+        self.startTime = 0
+        self.duration = 2.0
+        self.releaseAt = -1
+
+        let overlay = MetalOverlayView(frame: content.bounds)
+        overlay.wantsLayer = true
+        overlay.autoresizingMask = [.width, .height]
+        guard let metalLayer = overlay.layer as? CAMetalLayer else { return }
+        metalLayer.device = device
+        let scale = window.backingScaleFactor
+        metalLayer.contentsScale = scale
+        metalLayer.drawableSize = CGSize(
+            width: max(1, content.bounds.width * scale),
+            height: max(1, content.bounds.height * scale)
+        )
+        if keepBackdropLive {
+            if #available(macOS 26.0, *) {
+                metalLayer.cornerRadius = 24.0
+            } else {
+                metalLayer.cornerRadius = 16.0
+            }
+            metalLayer.masksToBounds = true
+        }
+
+        let targets = content.subviews.filter { $0 !== overlay }
+        for v in targets where v.layer == nil { v.wantsLayer = true }
+        hiddenContentViews = targets
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.presentsWithTransaction = true
+        content.addSubview(overlay, positioned: .above, relativeTo: nil)
+        self.overlayView = overlay
+        renderFrame(elapsed: 0.0, syncWithTransaction: true, metalLayer: metalLayer)
+        for v in hiddenContentViews {
+            v.layer?.opacity = 0.0
+        }
+        CATransaction.commit()
+        metalLayer.presentsWithTransaction = false
+    }
+
+    /// Transitions an active held Web overlay seamlessly into a Home reveal effect (`kind` 11..14)
+    /// once Exact has painted the incoming Home UI behind the overlay.
+    func beginHeldReveal(in window: NSWindow, backdrop: NSView?, kind: Int, toTexture: MTLTexture) {
+        guard let content = window.contentView,
+              let overlay = overlayView,
+              let metalLayer = overlay.layer as? CAMetalLayer,
+              hostWindow === window else {
+            cancel()
+            return
+        }
+        // Keep the newly installed live Liquid Glass backdrop visible (`opacity = 1`) beneath the overlay
+        // while keeping all UI subviews hidden until the reveal finishes.
+        let uiTargets = content.subviews.filter { $0 !== overlay && $0 !== backdrop }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let backdrop {
+            if backdrop.layer == nil { backdrop.wantsLayer = true }
+            backdrop.layer?.opacity = 1.0
+        }
+        for v in uiTargets {
+            if v.layer == nil { v.wantsLayer = true }
+            v.layer?.opacity = 0.0
+        }
+        CATransaction.commit()
+        hiddenContentViews = uiTargets
+
+        self.effectKind = Int32(kind)
+        self.isDemo = false
+        self.toTex = toTexture
+        self.hasWindowMask = false
+        self.keepBackdropLive = true
+        self.startTime = 0
+        self.releaseAt = -1
+        self.duration = (kind == 11) ? 1.08 : ((kind == 12) ? 0.98 : 0.92)
+
+        renderFrame(elapsed: 0.0, syncWithTransaction: false, metalLayer: metalLayer)
+
+        displayLink?.invalidate()
+        displayLink = nil
+        fallbackTimer?.invalidate()
+        fallbackTimer = nil
+        if #available(macOS 14.0, *) {
+            let link = overlay.displayLink(target: self, selector: #selector(stepDisplayLink(_:)))
+            link.add(to: .main, forMode: .common)
+            self.displayLink = link
+        } else {
+            self.fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                self?.stepFallback()
+            }
+        }
+    }
+
+    func start(
+        in window: NSWindow,
+        backdrop: NSView?,
+        kind: Int,
+        fromTexture: MTLTexture,
+        toTexture: MTLTexture?,
+        fromWindowServer: Bool,
+        keepBackdropLive: Bool,
+        origin: SIMD4<Float>,
+        isDemo: Bool,
+        autoReleaseAt: Double? = nil,
+        onComplete: (() -> Void)? = nil
+    ) {
+        guard let content = window.contentView else { onComplete?(); return }
+
+        let reusingOverlay = (overlayView != nil && hostWindow === window && self.keepBackdropLive == keepBackdropLive)
+        if !reusingOverlay {
+            cancel()
+        } else {
+            // Stop previous completion callback cleanly without unmounting overlay
+            self.onComplete = nil
+        }
+
+        self.hostWindow = window
+        self.effectKind = Int32(kind)
+        self.isDemo = isDemo
+        self.origin = origin
+        self.fromTex = fromTexture
+        self.toTex = toTexture ?? fromTexture
+        self.hasWindowMask = fromWindowServer
+        self.keepBackdropLive = keepBackdropLive
+        self.onComplete = onComplete
+        self.startTime = 0
+
+        if kind == 1 || kind == 2 {
+            self.duration = (kind == 1) ? 0.86 : 0.78
+            self.releaseAt = -1
+        } else if kind >= 11 && kind <= 14 {
+            self.duration = (kind == 11) ? 1.08 : ((kind == 12) ? 0.98 : 0.92)
+            self.releaseAt = -1
+        } else if kind == 15 {
+            self.releaseAt = autoReleaseAt ?? -1
+            let rel = max(0.42, autoReleaseAt ?? 0.44)
+            self.duration = rel + 0.54
+        } else if kind == 16 {
+            self.releaseAt = autoReleaseAt ?? -1
+            let rel = (autoReleaseAt != nil && autoReleaseAt! < 0.05) ? 0.0 : (autoReleaseAt ?? 0.16)
+            self.duration = rel + 1.04
+        } else {
+            self.releaseAt = autoReleaseAt ?? -1
+            let rel = max(0.34, autoReleaseAt ?? 0.38)
+            self.duration = rel + 0.50
+        }
+
+        if reusingOverlay, let overlay = overlayView, let metalLayer = overlay.layer as? CAMetalLayer {
+            // Seamless in-place switch to new effect on the existing Metal overlay (0ms blink!)
+            renderFrame(elapsed: 0.0, syncWithTransaction: false, metalLayer: metalLayer)
+            if displayLink == nil && fallbackTimer == nil {
+                if #available(macOS 14.0, *) {
+                    let link = overlay.displayLink(target: self, selector: #selector(stepDisplayLink(_:)))
+                    link.add(to: .main, forMode: .common)
+                    self.displayLink = link
+                } else {
+                    self.fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                        self?.stepFallback()
+                    }
+                }
+            }
+            return
+        }
+
+        let overlay = MetalOverlayView(frame: content.bounds)
+        overlay.wantsLayer = true
+        overlay.autoresizingMask = [.width, .height]
+        guard let metalLayer = overlay.layer as? CAMetalLayer else { onComplete?(); return }
+        metalLayer.device = device
+        let scale = window.backingScaleFactor
+        metalLayer.contentsScale = scale
+        metalLayer.drawableSize = CGSize(
+            width: max(1, content.bounds.width * scale),
+            height: max(1, content.bounds.height * scale)
+        )
+        if keepBackdropLive {
+            // Clip distorted UI pixels cleanly inside the Liquid Glass rounded window corners.
+            if #available(macOS 26.0, *) {
+                metalLayer.cornerRadius = 24.0
+            } else {
+                metalLayer.cornerRadius = 16.0
+            }
+            metalLayer.masksToBounds = true
+        }
+
+        // When keepBackdropLive is true, leave NSGlassEffectView 100% visible & live underneath
+        // and hide ONLY the UI layer so the Metal shader distorts the UI directly over live Liquid Glass!
+        let targets = content.subviews.filter { $0 !== overlay && (!keepBackdropLive || $0 !== backdrop) }
+        for v in targets where v.layer == nil {
+            v.wantsLayer = true
+        }
+        hiddenContentViews = targets
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.presentsWithTransaction = true
+        content.addSubview(overlay, positioned: .above, relativeTo: nil)
+        self.overlayView = overlay
+        // Present pixel-identical frame 0 (t = 0.0) synchronously inside the same transaction
+        // that hides the live subviews -> zero blink, zero brightness jump, zero startup jank!
+        renderFrame(elapsed: 0.0, syncWithTransaction: true, metalLayer: metalLayer)
+        for v in hiddenContentViews {
+            v.layer?.opacity = 0.0
+        }
+        CATransaction.commit()
+        metalLayer.presentsWithTransaction = false
+
+        if #available(macOS 14.0, *) {
+            let link = overlay.displayLink(target: self, selector: #selector(stepDisplayLink(_:)))
+            link.add(to: .main, forMode: .common)
+            self.displayLink = link
+        } else {
+            self.fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                self?.stepFallback()
+            }
+        }
+    }
+
+    /// Restores full opacity on the underlying view hierarchy once the Metal cover is opaque
+    /// so `WKWebView` renders at full 120Hz behind the cover (WebKit throttles rAF & image decode
+    /// when any ancestor layer has opacity 0).
+    func revealUnderlyingViewsBehindCover() {
+        guard overlayView != nil, !hiddenContentViews.isEmpty else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for v in hiddenContentViews {
+            v.layer?.opacity = 1.0
+        }
+        CATransaction.commit()
+    }
+
+    func releaseOpen(with toTexture: MTLTexture?, immediate: Bool = false) {
+        guard overlayView != nil, (effectKind == 3 || effectKind == 4 || effectKind >= 15), releaseAt < 0 else { return }
+        if let tex = toTexture {
+            self.toTex = tex
+        }
+        let now = CACurrentMediaTime()
+        let elapsed = startTime > 0 ? max(0, now - startTime) : 0
+        let minCover: Double
+        if immediate && effectKind == 16 {
+            minCover = 0.0
+        } else {
+            minCover = (effectKind == 15) ? 0.42 : ((effectKind == 16) ? 0.14 : 0.34)
+        }
+        let relDur = (effectKind == 15) ? 0.54 : ((effectKind == 16) ? 1.02 : 0.50)
+        let rel = max(minCover, elapsed)
+        self.releaseAt = rel
+        self.duration = rel + relDur
+    }
+
+    @available(macOS 14.0, *)
+    @objc private func stepDisplayLink(_ link: CADisplayLink) {
+        let now = link.timestamp
+        if startTime == 0 {
+            let dt = max(0.004, min(0.016, link.targetTimestamp - link.timestamp))
+            startTime = now - dt
+        }
+        advanceFrame(now: now)
+    }
+
+    private func stepFallback() {
+        let now = CACurrentMediaTime()
+        if startTime == 0 {
+            startTime = now - (1.0 / 60.0)
+        }
+        advanceFrame(now: now)
+    }
+
+    private func advanceFrame(now: CFTimeInterval) {
+        let elapsed = max(0, now - startTime)
+        let isOpenKind = (effectKind == 3 || effectKind == 4 || effectKind >= 15)
+        if isOpenKind && releaseAt < 0 && elapsed > 7.8 {
+            releaseOpen(with: nil)
+        }
+        if (!isOpenKind || releaseAt >= 0) && elapsed >= duration {
+            cancel()
+            return
+        }
+        guard let metalLayer = overlayView?.layer as? CAMetalLayer else { return }
+        renderFrame(elapsed: elapsed, syncWithTransaction: false, metalLayer: metalLayer)
+    }
+
+    private func renderFrame(elapsed: Double, syncWithTransaction: Bool, metalLayer: CAMetalLayer) {
+        guard let overlay = overlayView,
+              let fromTex, let toTex else { return }
+        let scale = hostWindow?.backingScaleFactor ?? 2.0
+        let targetSize = CGSize(
+            width: max(1, overlay.bounds.width * scale),
+            height: max(1, overlay.bounds.height * scale)
+        )
+        if metalLayer.drawableSize != targetSize {
+            metalLayer.contentsScale = scale
+            metalLayer.drawableSize = targetSize
+        }
+        guard let drawable = metalLayer.nextDrawable(),
+              let cmdBuf = queue.makeCommandBuffer() else { return }
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = drawable.texture
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+        rpd.colorAttachments[0].storeAction = .store
+        guard let enc = cmdBuf.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        enc.setRenderPipelineState(pipeline)
+        var uniforms = FloatSurfaceUniforms(
+            resolution: SIMD2<Float>(Float(targetSize.width), Float(targetSize.height)),
+            time: Float(elapsed),
+            duration: Float(duration),
+            effectKind: effectKind,
+            releaseAt: Float(releaseAt),
+            isDemo: isDemo ? 1 : 0,
+            hasWindowMask: hasWindowMask ? 1 : 0,
+            origin: origin
+        )
+        enc.setFragmentBytes(&uniforms, length: MemoryLayout<FloatSurfaceUniforms>.stride, index: 0)
+        enc.setFragmentTexture(fromTex, index: 0)
+        enc.setFragmentTexture(toTex, index: 1)
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        enc.endEncoding()
+        if syncWithTransaction {
+            cmdBuf.commit()
+            cmdBuf.waitUntilScheduled()
+            drawable.present()
+        } else {
+            cmdBuf.present(drawable)
+            cmdBuf.commit()
+        }
+    }
+}
+
 final class FloatModule: ExactModule {
     override class var views: [String: ExactNativeFactory] {
         [
@@ -1982,6 +3634,8 @@ final class FloatModule: ExactModule {
     fileprivate weak var browser: FloatBrowserInstance?
     private var homeBackdropView: NSView?
     private var lastBackdropIsHome: Bool?
+    private var surfaceFx: FloatSurfaceTransitionHost?
+    private var pendingSurfaceOpenToken = 0
     private var morphPrepared = false
     private var morphWindowShown = false
     private var glassReady = false
@@ -1999,6 +3653,8 @@ final class FloatModule: ExactModule {
     private var agentAspectLocked = false
     private var agentClickThrough = false
     private var agentPendingSeek: Double?
+    private var agentFxDemoSeq = 0
+    private var agentFxDemoKind = 0
 
     var mode: String {
         get { context.agent ? agentMode : FloatHub.shared.mode }
@@ -2032,6 +3688,14 @@ final class FloatModule: ExactModule {
         get { context.agent ? agentPendingSeek : FloatHub.shared.pendingSeek }
         set { if context.agent { agentPendingSeek = newValue } else { FloatHub.shared.pendingSeek = newValue } }
     }
+    var fxDemoSeq: Int {
+        get { context.agent ? agentFxDemoSeq : FloatHub.shared.fxDemoSeq }
+        set { if context.agent { agentFxDemoSeq = newValue } else { FloatHub.shared.fxDemoSeq = newValue } }
+    }
+    var fxDemoKind: Int {
+        get { context.agent ? agentFxDemoKind : FloatHub.shared.fxDemoKind }
+        set { if context.agent { agentFxDemoKind = newValue } else { FloatHub.shared.fxDemoKind = newValue } }
+    }
 
     var fill: Bool {
         get { store.fill }
@@ -2053,13 +3717,36 @@ final class FloatModule: ExactModule {
         get { min(2.0, max(0.5, store.videoContrast)) }
         set { store.videoContrast = min(2.0, max(0.5, newValue)) }
     }
+    private static let validRevealStyles: Set<String> = ["wave", "curtain", "ripple", "frost", "louvers", "anamorphic"]
+    private static let validOpenStyles: Set<String> = ["lens", "diagonal", "portal", "ripple"]
+
+    private static func revealKindCode(_ style: String) -> Int {
+        switch style {
+        case "curtain": return 2
+        case "ripple": return 11
+        case "frost": return 12
+        case "louvers": return 13
+        case "anamorphic": return 14
+        default: return 1
+        }
+    }
+
+    private static func openKindCode(_ style: String) -> Int {
+        switch style {
+        case "diagonal": return 4
+        case "portal": return 15
+        case "ripple": return 16
+        default: return 3
+        }
+    }
+
     var revealStyle: String {
-        get { store.revealStyle == "curtain" ? "curtain" : "wave" }
-        set { store.revealStyle = (newValue == "curtain" ? "curtain" : "wave") }
+        get { Self.validRevealStyles.contains(store.revealStyle) ? store.revealStyle : "ripple" }
+        set { store.revealStyle = Self.validRevealStyles.contains(newValue) ? newValue : "ripple" }
     }
     var openStyle: String {
-        get { store.openStyle == "diagonal" ? "diagonal" : "lens" }
-        set { store.openStyle = (newValue == "diagonal" ? "diagonal" : "lens") }
+        get { Self.validOpenStyles.contains(store.openStyle) ? store.openStyle : "ripple" }
+        set { store.openStyle = Self.validOpenStyles.contains(newValue) ? newValue : "ripple" }
     }
     var preferSdr: Bool {
         get { store.preferSdr }
@@ -2099,10 +3786,17 @@ final class FloatModule: ExactModule {
         super.init(context: context)
         if !context.agent {
             FloatHub.shared.register(self)
+            // Pre-compile Metal surface shaders on a background queue and attach `surfaceFx`
+            // eagerly so the very first Web -> Home reveal can synchronously hold the Web frame.
+            FloatSurfaceTransitionHost.obtain { [weak self] host in
+                guard let self, let host, self.surfaceFx == nil else { return }
+                self.surfaceFx = host
+            }
         }
     }
 
     override func destroy() {
+        surfaceFx?.cancel()
         homeBackdropView?.removeFromSuperview()
         homeBackdropView = nil
         lastBackdropIsHome = nil
@@ -2255,7 +3949,7 @@ final class FloatModule: ExactModule {
         let savedKey = w.frameAutosaveName.isEmpty ? nil : "NSWindow Frame \(w.frameAutosaveName)"
         let hasSavedFrame = savedKey.map { UserDefaults.standard.object(forKey: $0) != nil } ?? false
         if !hasSavedFrame {
-            let targetSize = isPanel ? NSSize(width: 760, height: 340) : NSSize(width: 480, height: 640)
+            let targetSize = isPanel ? NSSize(width: 760, height: 340) : NSSize(width: 500, height: 700)
             w.setContentSize(targetSize)
             if let vis = (FloatHub.shared.primaryWindow?.screen ?? NSScreen.main)?.visibleFrame {
                 let s = w.frame.size
@@ -2455,6 +4149,7 @@ final class FloatModule: ExactModule {
         case "resetVideoFilters": resetVideoFilters()
         case "setRevealStyle": setRevealStyle(arg)
         case "setOpenStyle": setOpenStyle(arg)
+        case "surfaceOpen": surfaceOpen(arg)
         case "preloadSite", "prewarmUrl": preloadSite(arg)
         case "prepareLoad": prepareLoad(arg)
         case "commitLoad": commitLoad(arg)
@@ -2497,6 +4192,28 @@ final class FloatModule: ExactModule {
         }
     }
 
+    private static func fallbackHighResIcon(for host: String, fallbackUrl: String) -> String {
+        let clean = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return "\(fallbackUrl)/favicon.ico" }
+        let encoded = clean.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? clean
+        return "https://www.google.com/s2/favicons?sz=128&domain=\(encoded)"
+    }
+
+    private static func resolveIconUrl(_ stored: String?, host: String, fallbackUrl: String) -> String {
+        guard let stored, !stored.isEmpty else { return fallbackHighResIcon(for: host, fallbackUrl: fallbackUrl) }
+        if stored.hasPrefix("http://") || stored.hasPrefix("https://") || stored.hasPrefix("data:") {
+            if stored.hasSuffix("/favicon.ico") {
+                return fallbackHighResIcon(for: host, fallbackUrl: fallbackUrl)
+            }
+            return stored
+        }
+        // Keep bundled Exact asset paths (e.g. assets/providers/*.png) intact
+        if stored.hasPrefix("assets/") {
+            return stored
+        }
+        return fallbackHighResIcon(for: host, fallbackUrl: fallbackUrl)
+    }
+
     private func snapshotState() -> [String: Any] {
         let sitesList = store.allSites().sorted { $0.last > $1.last }
         let sites: [[String: Any]] = sitesList.map { s in
@@ -2505,7 +4222,7 @@ final class FloatModule: ExactModule {
             return [
                 "host": s.host,
                 "url": s.url,
-                "icon": s.icon ?? "\(s.url)/favicon.ico",
+                "icon": Self.resolveIconUrl(s.icon, host: s.host, fallbackUrl: s.url),
                 "name": name,
                 "initial": String(name.prefix(1)),
                 "last": s.last.timeIntervalSince1970 * 1000,
@@ -2525,8 +4242,8 @@ final class FloatModule: ExactModule {
             resumeHost = host
             resumeTitle = r.title.isEmpty ? floatSiteName(host) : r.title
             let normResume = floatNormalizedHost(host)
-            resumeIcon = sitesList.first(where: { floatNormalizedHost($0.host) == normResume }).flatMap { $0.icon ?? "\($0.url)/favicon.ico" }
-                ?? "https://\(host)/favicon.ico"
+            resumeIcon = sitesList.first(where: { floatNormalizedHost($0.host) == normResume }).map { Self.resolveIconUrl($0.icon, host: $0.host, fallbackUrl: $0.url) }
+                ?? Self.fallbackHighResIcon(for: host, fallbackUrl: "https://\(host)")
             resumeTime = r.time
             resumeDuration = r.duration
         }
@@ -2544,6 +4261,8 @@ final class FloatModule: ExactModule {
             "videoContrast": (videoContrast * 100).rounded() / 100,
             "revealStyle": revealStyle,
             "openStyle": openStyle,
+            "fxDemoSeq": fxDemoSeq,
+            "fxDemoKind": fxDemoKind,
             "preloadedHost": activeBrowser?.preloadedHost ?? "",
             "webContentReady": activeBrowser?.activeContentReady ?? true,
             "preferSdr": preferSdr,
@@ -2681,6 +4400,34 @@ final class FloatModule: ExactModule {
     }
 
     func showHome() {
+        let wasWeb = (mode == "web")
+        pendingSurfaceOpenToken += 1
+        let revealToken = pendingSurfaceOpenToken
+        let kind = Self.revealKindCode(revealStyle)
+        let primary = (mainWindow != nil ? self : FloatHub.shared.primaryModule)
+        let shouldCompositeWebReveal = !context.agent
+            && wasWeb
+            && kind >= 11
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
+        // Capture & hold the live Web view BEFORE suspending WKWebView / switching to Home
+        // so the Web view never disappears before the ripple reveals Home over live Liquid Glass!
+        var heldWebSurface = false
+        if shouldCompositeWebReveal,
+           let primary,
+           let win = primary.mainWindow ?? FloatHub.shared.primaryWindow {
+            if let fx = primary.surfaceFx,
+               let webCap = fx.captureWindowSurface(in: win, backdrop: nil, isFrom: true) {
+                fx.holdOutgoingSurface(in: win, texture: webCap.texture)
+                heldWebSurface = true
+            } else {
+                // Ensure surfaceFx is initialized for next time
+                primary.withSurfaceFx { _ in }
+            }
+        } else {
+            surfaceFx?.cancel()
+        }
+
         mode = "home"
         activeVideoStream = ""
         pendingSeek = nil
@@ -2691,6 +4438,24 @@ final class FloatModule: ExactModule {
             scheduleWarmPoolSweep(initialDelay: 0.45)
         }
         notifyChanged()
+
+        if heldWebSurface, let primary, let win = primary.mainWindow ?? FloatHub.shared.primaryWindow {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.036) { [weak self, weak primary, weak win] in
+                guard let self, let primary, let win,
+                      self.mode == "home",
+                      self.pendingSurfaceOpenToken == revealToken,
+                      let fx = primary.surfaceFx else {
+                    primary?.surfaceFx?.cancel()
+                    return
+                }
+                let backdrop = primary.homeBackdropView
+                guard let homeCap = fx.captureWindowSurface(in: win, backdrop: backdrop, isFrom: false) else {
+                    fx.cancel()
+                    return
+                }
+                fx.beginHeldReveal(in: win, backdrop: backdrop, kind: kind, toTexture: homeCap.texture)
+            }
+        }
     }
 
     func resumeLast() {
@@ -2711,16 +4476,234 @@ final class FloatModule: ExactModule {
         notifyChanged()
     }
 
+    private func withSurfaceFx(_ block: @escaping (FloatSurfaceTransitionHost) -> Void) {
+        if let existing = surfaceFx {
+            block(existing)
+            return
+        }
+        FloatSurfaceTransitionHost.obtain { [weak self] host in
+            guard let self, let host else { return }
+            if self.surfaceFx == nil {
+                self.surfaceFx = host
+            }
+            if let ready = self.surfaceFx {
+                block(ready)
+            }
+        }
+    }
+
     func setRevealStyle(_ style: String) {
-        guard style == "wave" || style == "curtain" else { return }
+        guard Self.validRevealStyles.contains(style) else { return }
         revealStyle = style
+        let kind = Self.revealKindCode(style)
+        // On live macOS, play ALL reveal styles (1..2 and 11..14) via the pre-warmed native Metal host
+        // with zero WGSL mount compile hitch; keep kind 1..2 for agent tests / web fallback.
+        fxDemoKind = context.agent ? kind : (kind + 100)
+        fxDemoSeq += 1
         notifyChanged()
+        if !context.agent {
+            DispatchQueue.main.async {
+                FloatHub.shared.primaryModule?.playNativeSurfaceDemo(kind: kind)
+            }
+        }
     }
 
     func setOpenStyle(_ style: String) {
-        guard style == "lens" || style == "diagonal" else { return }
+        guard Self.validOpenStyles.contains(style) else { return }
         openStyle = style
+        let kind = Self.openKindCode(style)
+        fxDemoKind = context.agent ? kind : (kind + 100)
+        fxDemoSeq += 1
         notifyChanged()
+        if !context.agent {
+            DispatchQueue.main.async {
+                FloatHub.shared.primaryModule?.playNativeSurfaceDemo(kind: kind)
+            }
+        }
+    }
+
+    fileprivate func playNativeSurfaceDemo(kind: Int, isDemo: Bool = true, onFail: (() -> Void)? = nil) {
+        guard !context.agent,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let win = mainWindow ?? FloatHub.shared.primaryWindow else {
+            onFail?()
+            return
+        }
+        pendingSurfaceOpenToken += 1
+        let isOpenKind = (kind == 3 || kind == 4 || kind >= 15)
+        let origin: SIMD4<Float> = (kind == 15)
+            ? SIMD4<Float>(0.50, 0.48, 0.28, 0.24)
+            : SIMD4<Float>(0.24, 0.54, 0.24, 0.25)
+        let release: Double? = isOpenKind ? ((kind == 15) ? 0.44 : ((kind == 16) ? 0.16 : 0.38)) : nil
+        withSurfaceFx { [weak self, weak win] fx in
+            guard let self, let win else { onFail?(); return }
+            let backdrop = (self.mode == "home") ? self.homeBackdropView : nil
+            guard let cap = fx.captureWindowSurface(in: win, backdrop: backdrop, isFrom: true) else {
+                onFail?()
+                return
+            }
+            fx.start(
+                in: win,
+                backdrop: backdrop,
+                kind: kind,
+                fromTexture: cap.texture,
+                toTexture: cap.texture,
+                fromWindowServer: cap.fromWindowServer,
+                keepBackdropLive: cap.keepBackdropLive,
+                origin: origin,
+                isDemo: isDemo,
+                autoReleaseAt: release
+            )
+        }
+    }
+
+    /// Runs a real Home -> WKWebView native Metal surface transition from the clicked tile's UV rect.
+    /// arg format: "<kind>,<cx>,<cy>,<w>,<h>,<resume|site>,<url>"
+    func surfaceOpen(_ arg: String) {
+        let parts = arg.split(separator: ",", maxSplits: 6, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 7,
+              let kind = Int(parts[0]),
+              let cx = Float(parts[1]),
+              let cy = Float(parts[2]),
+              let w = Float(parts[3]),
+              let h = Float(parts[4]) else { return }
+        let isResume = (parts[5] == "resume")
+        let rawUrl = parts[6]
+
+        if context.agent || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            if isResume { resumeLast() } else { load(rawUrl) }
+            return
+        }
+
+        guard let win = mainWindow ?? FloatHub.shared.primaryWindow else {
+            if isResume { resumeLast() } else { load(rawUrl) }
+            return
+        }
+
+        pendingSurfaceOpenToken += 1
+        let token = pendingSurfaceOpenToken
+        let origin = SIMD4<Float>(
+            max(0.05, min(0.95, cx)),
+            max(0.05, min(0.95, cy)),
+            max(0.08, min(0.95, w)),
+            max(0.08, min(0.95, h))
+        )
+
+        let resolvedTargetUrl: URL? = {
+            if isResume, let r = store.loadResume() {
+                let t = URL(string: r.url).map { floatAppleTVResumeURL($0).absoluteString } ?? r.url
+                return resolveWebURL(t)
+            }
+            return resolveWebURL(rawUrl)
+        }()
+        let alreadyReady = resolvedTargetUrl.map {
+            activeBrowser?.isTargetAlreadyReady($0, resumeIfPaused: isResume) ?? false
+        } ?? false
+
+        if isResume { prepareResume() } else { prepareLoad(rawUrl) }
+
+        withSurfaceFx { [weak self, weak win] fx in
+            guard let self, let win, self.pendingSurfaceOpenToken == token else { return }
+            // Capture the full opaque Home window (Liquid Glass + cards baked in via backdrop: nil)
+            // for ALL 4 open-site transitions (Tile Lens, Diagonal Wipe, Portal Warp, Liquid Ripple)
+            // so WKWebView can mount at opacity 1.0 underneath at full 120Hz with zero backdrop flash.
+            guard let cap = fx.captureWindowSurface(in: win, backdrop: nil, isFrom: true) else {
+                if isResume { self.resumeLast() } else { self.load(rawUrl) }
+                return
+            }
+            if alreadyReady {
+                // Subsequent / pre-warmed load: that tab is ALREADY loaded & painted in memory!
+                // Hold the exact Home frame 1:1 while unhiding the live tab behind it and grabbing
+                // its current frame (~16ms), then run ONE uninterrupted transition straight into
+                // that live tab with ZERO reload and ZERO loading pulse!
+                fx.holdOutgoingSurface(in: win, texture: cap.texture, keepBackdropLive: false, fromWindowServer: cap.fromWindowServer)
+                if isResume { self.commitResume() } else { self.commitLoad(rawUrl) }
+                fx.revealUnderlyingViewsBehindCover()
+                let launchDirect: (MTLTexture?) -> Void = { [weak self, weak win] toTex in
+                    guard let self, let win, self.pendingSurfaceOpenToken == token else { return }
+                    fx.start(
+                        in: win,
+                        backdrop: nil,
+                        kind: kind,
+                        fromTexture: cap.texture,
+                        toTexture: toTex,
+                        fromWindowServer: cap.fromWindowServer,
+                        keepBackdropLive: false,
+                        origin: origin,
+                        isDemo: false,
+                        autoReleaseAt: 0.0
+                    )
+                }
+                if let web = self.activeBrowser?.web {
+                    fx.captureWebSurface(web, afterScreenUpdates: true) { toTex in
+                        launchDirect(toTex)
+                    }
+                } else {
+                    launchDirect(nil)
+                }
+                return
+            }
+
+            fx.start(
+                in: win,
+                backdrop: nil,
+                kind: kind,
+                fromTexture: cap.texture,
+                toTexture: nil,
+                fromWindowServer: cap.fromWindowServer,
+                keepBackdropLive: false,
+                origin: origin,
+                isDemo: false,
+                autoReleaseAt: nil
+            )
+
+            // Cold first load: commit & unhide WKWebView behind the opaque Metal cover once cover peaks,
+            // restoring underlying view opacity so WebKit paints at full 120Hz underneath the cover,
+            // then wait for center-viewport visual readiness before snapshotting & releasing Phase 2.
+            let commitDelay: Double = (kind == 15) ? 0.34 : ((kind == 16) ? 0.06 : 0.28)
+            DispatchQueue.main.asyncAfter(deadline: .now() + commitDelay) { [weak self] in
+                guard let self, self.pendingSurfaceOpenToken == token else { return }
+                if isResume { self.commitResume() } else { self.commitLoad(rawUrl) }
+                self.surfaceFx?.revealUnderlyingViewsBehindCover()
+                self.waitForWebAndReleaseSurface(token: token, attemptsLeft: 75)
+            }
+        }
+    }
+
+    private func waitForWebAndReleaseSurface(token: Int, attemptsLeft: Int) {
+        guard pendingSurfaceOpenToken == token else { return }
+        guard let browser = activeBrowser, let fx = surfaceFx else {
+            surfaceFx?.releaseOpen(with: nil)
+            return
+        }
+        let web = browser.web
+        let retry = { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+                self?.waitForWebAndReleaseSurface(token: token, attemptsLeft: attemptsLeft - 1)
+            }
+        }
+        if attemptsLeft <= 1 {
+            fx.captureWebSurface(web) { [weak self] toTex in
+                guard let self, self.pendingSurfaceOpenToken == token else { return }
+                self.surfaceFx?.releaseOpen(with: toTex)
+            }
+            return
+        }
+        guard browser.activeContentReady else {
+            retry()
+            return
+        }
+        browser.confirmActiveVisuallyPainted { [weak self] painted in
+            guard let self, self.pendingSurfaceOpenToken == token else { return }
+            if painted {
+                fx.captureWebSurface(web) { [weak self] toTex in
+                    guard let self, self.pendingSurfaceOpenToken == token else { return }
+                    self.surfaceFx?.releaseOpen(with: toTex)
+                }
+            } else {
+                retry()
+            }
+        }
     }
 
     func reloadPage() {
