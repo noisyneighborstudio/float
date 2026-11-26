@@ -80,6 +80,63 @@ jobs:
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_KEY_ISSUER" \
             --keychain "$keychain"
+      - name: Preflight checks
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
+          SIGN: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          keychain="$RUNNER_TEMP/float.keychain-db"
+          failed=0
+          
+          # Check Rust toolchain availability (Exact builds with Rust)
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error::cargo not found — Exact requires Rust. Install via 'rustup-init' or 'brew install rust'."
+            failed=1
+          else
+            rust_version=$(rustc --version 2>&1 | awk '{print $2}')
+            echo "Found Rust toolchain: $rust_version"
+            # Verify rustc can compile (guards against incomplete/broken installations)
+            if ! rustc --version >/dev/null 2>&1; then
+              echo "::error::rustc is present but not functional. Reinstall the Rust toolchain."
+              failed=1
+            fi
+            # Read the pinned version from Exact's rust-toolchain.toml if available
+            if [[ -f "$EXACT/rust-toolchain.toml" ]]; then
+              required=$(awk -F'"' '/^channel = / {print $2}' "$EXACT/rust-toolchain.toml")
+              if [[ -n $required && $rust_version != "$required" ]]; then
+                echo "::warning::Rust $rust_version found, but Exact pins $required. Run 'rustup install $required && rustup default $required'."
+              fi
+            fi
+          fi
+          
+          # Check build keychain state
+          if [[ ! -f "$keychain" ]]; then
+            echo "::error::Build keychain does not exist at $keychain — certificate import step may have failed."
+            failed=1
+          else
+            # Verify keychain is unlocked (security unlock-keychain exits 0 even if already unlocked)
+            if ! security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null 2>&1; then
+              echo "::error::Build keychain exists but cannot be unlocked. Check KEYCHAIN_PASSWORD secret."
+              failed=1
+            else
+              echo "Build keychain is unlocked."
+              # Verify signing identity is present and valid
+              if ! security find-identity -v -p codesigning "$keychain" 2>/dev/null | grep -qF "$SIGN"; then
+                echo "::error::Signing identity '$SIGN' not found in build keychain. Certificate import may have failed."
+                failed=1
+              else
+                echo "Signing identity '$SIGN' found in keychain."
+              fi
+            fi
+          fi
+          
+          if [[ $failed -eq 1 ]]; then
+            echo "::error::Preflight checks failed. Fix the runner environment before retrying."
+            exit 1
+          fi
+          echo "Preflight checks passed."
       - name: Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -88,12 +145,23 @@ jobs:
           SIGN: ${{ secrets.DEVELOPER_ID_APPLICATION }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           EXACT_NOTARY_PROFILE: exact-notary
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$HOME/.asdf/shims:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          keychain="$RUNNER_TEMP/float.keychain-db"
           for name in SIGN SPARKLE_PRIVATE_KEY; do
             [ -n "${!name}" ] || { echo "::error::secret for $name is not set"; exit 1; }
           done
+          
+          # Re-unlock build keychain before signing to guard against timeout locks
+          # (macOS may lock keychains after inactivity even with extended timeout settings)
+          if [[ -f "$keychain" ]]; then
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+            security set-keychain-settings -lut 21600 "$keychain"
+            echo "Build keychain re-unlocked before release signing."
+          fi
+          
           mkdir -p .exact
           ln -sfn "$EXACT" .exact/checkout
           npm ci --no-audit --no-fund
