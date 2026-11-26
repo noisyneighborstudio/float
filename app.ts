@@ -17,6 +17,8 @@ type Site = FloatState['sites'][number];
 
 const STORE_FILE = 'app:/data/float.json';
 const BRIDGE_FILE = 'app:/data/linux-bridge.txt';
+let fxDemoSeq = 0;
+let fxDemoKind = 0;
 
 async function readBridgeUrl(storage: Storage): Promise<string | null> {
   try {
@@ -138,8 +140,8 @@ const DEFAULT_FALLBACK: PersistedFallback = {
   videoBrightness: 1,
   hdrVideoBrightness: 1,
   videoContrast: 1,
-  revealStyle: 'wave',
-  openStyle: 'lens',
+  revealStyle: 'ripple',
+  openStyle: 'ripple',
   preferSdr: false,
   streamBrightness: false,
   activeVideoStream: '',
@@ -312,8 +314,10 @@ function toFloatState(p: PersistedFallback): FloatState {
     videoBrightness: p.videoBrightness,
     hdrVideoBrightness: p.hdrVideoBrightness,
     videoContrast: p.videoContrast,
-    revealStyle: p.revealStyle || 'wave',
-    openStyle: p.openStyle || 'lens',
+    revealStyle: p.revealStyle || 'ripple',
+    openStyle: p.openStyle || 'ripple',
+    fxDemoSeq,
+    fxDemoKind,
     preloadedHost: '',
     webContentReady: true,
     preferSdr: p.preferSdr,
@@ -528,11 +532,37 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       data.videoContrast = 1;
       break;
     case 'setRevealStyle':
-      if (arg === 'wave' || arg === 'curtain') data.revealStyle = arg;
+      if (['wave', 'curtain', 'ripple', 'frost', 'louvers', 'anamorphic'].includes(arg)) {
+        data.revealStyle = arg;
+        const map: Record<string, number> = { wave: 1, curtain: 2, ripple: 11, frost: 12, louvers: 13, anamorphic: 14 };
+        fxDemoKind = map[arg] ?? 1;
+        fxDemoSeq += 1;
+      }
       break;
     case 'setOpenStyle':
-      if (arg === 'lens' || arg === 'diagonal') data.openStyle = arg;
+      if (['lens', 'diagonal', 'portal', 'ripple'].includes(arg)) {
+        data.openStyle = arg;
+        const map: Record<string, number> = { lens: 3, diagonal: 4, portal: 15, ripple: 16 };
+        fxDemoKind = map[arg] ?? 3;
+        fxDemoSeq += 1;
+      }
       break;
+    case 'surfaceOpen': {
+      const parts = arg.split(',');
+      if (parts.length >= 7) {
+        const isResume = parts[5] === 'resume';
+        const rawUrl = parts.slice(6).join(',');
+        const target = isResume && data.resume ? appleTVResumeUrl(data.resume.url) : rawUrl;
+        const url = parseWebUrl(target);
+        if (url) {
+          data.mode = 'web';
+          data.currentUrl = url;
+          data.history = data.history.slice(0, data.historyIndex + 1).concat([url]);
+          data.historyIndex = data.history.length - 1;
+        }
+      }
+      break;
+    }
     case 'prepareLoad':
     case 'preloadSite':
     case 'prewarmUrl':

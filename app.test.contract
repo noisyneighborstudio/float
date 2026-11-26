@@ -153,8 +153,14 @@ test "settings route renders native Contract controls"
   expect tree has "settings-peek-slider"
   expect tree has "reveal-style-wave"
   expect tree has "reveal-style-curtain"
+  expect tree has "reveal-style-ripple"
+  expect tree has "reveal-style-frost"
+  expect tree has "reveal-style-louvers"
+  expect tree has "reveal-style-anamorphic"
   expect tree has "open-style-lens"
   expect tree has "open-style-diagonal"
+  expect tree has "open-style-portal"
+  expect tree has "open-style-ripple"
 
   tap "brightness-mode-stream"
   clock data
@@ -248,8 +254,8 @@ test "video brightness, HDR preferences, stream-kind brightness, and View menu a
 
 test "glass reveal and open transition styles persist across reload and reverse wipe settles cleanly"
   clock data
-  expect state st.revealStyle == "wave"
-  expect state st.openStyle == "lens"
+  expect state st.revealStyle == "ripple"
+  expect state st.openStyle == "ripple"
 
   tap "cmd-reveal-curtain"
   clock data
@@ -374,3 +380,74 @@ test "providers search empty state can open URL bar with the typed query"
   expect tree missing "providers-view"
   expect tree has "url-bar"
   expect state urlDraft == "example.org"
+
+test "switching reveal and open transition styles plays a live demo in the app window"
+  clock data
+  // Finish initial opening morph before testing style demos
+  clock +1700
+  expect state fxKind == 0
+  expect tree missing "home-transition-fx"
+
+  // Switching Saved Item Reveal to Glass Curtain plays curtain demo (kind 2)
+  tap "cmd-reveal-curtain"
+  clock data
+  clock +5
+  expect state st.revealStyle == "curtain"
+  expect state fxKind == 2
+  expect state fxDemoPlaying == true
+  expect tree has "home-transition-fx"
+  clock +800
+  expect state fxKind == 0
+  expect state fxDemoPlaying == false
+  expect tree missing "home-transition-fx"
+
+  // Switching Saved Item Reveal to Wave + Bevel plays wave demo (kind 1)
+  tap "cmd-reveal-wave"
+  clock data
+  clock +5
+  expect state st.revealStyle == "wave"
+  expect state fxKind == 1
+  expect state fxDemoPlaying == true
+  expect tree has "home-transition-fx"
+  clock +1020
+  expect state fxKind == 0
+  expect state fxDemoPlaying == false
+  expect tree missing "home-transition-fx"
+
+  // Switching Open Site Wipe to Diagonal Wipe plays open demo (kind 4) without navigating
+  tap "cmd-open-diagonal"
+  clock data
+  clock +5
+  expect state st.openStyle == "diagonal"
+  expect state st.mode == "home"
+  expect state fxKind == 4
+  expect state fxDemoPlaying == true
+  expect tree has "home-transition-fx"
+  clock +400
+  expect state fxReleaseAt >= 0
+  clock +400
+  expect state fxKind == 0
+  expect state fxDemoPlaying == false
+  expect state st.mode == "home"
+  expect tree missing "home-transition-fx"
+
+  // Switching Open Site Wipe to Tile Lens plays lens demo (kind 3) without navigating
+  tap "cmd-open-lens"
+  clock data
+  clock +5
+  expect state st.openStyle == "lens"
+  expect state fxKind == 3
+  expect state fxDemoPlaying == true
+  expect tree has "home-transition-fx"
+  clock +800
+  expect state fxKind == 0
+  expect state fxDemoPlaying == false
+  expect state st.mode == "home"
+  expect tree missing "home-transition-fx"
+
+  // Reloading does not spuriously replay the last demo
+  reload
+  clock data
+  clock +5
+  expect state st.fxDemoSeq == 0
+  expect state fxKind == 0
