@@ -54,7 +54,74 @@ interface PersistedFallback {
   peekHold: boolean;
   lastDock: number;
   resume: { url: string; title: string; time: number; duration: number } | null;
-  sites: { host: string; url: string; icon: string; last: number; count: number }[];
+  sites: { host: string; url: string; icon: string; name?: string; last: number; count: number }[];
+}
+
+interface ProviderDef {
+  id: string;
+  name: string;
+  host: string;
+  url: string;
+  category: 'streaming' | 'video' | 'live' | 'anime' | 'free';
+  aliases?: string[];
+}
+
+const STREAMING_PROVIDERS: ProviderDef[] = [
+  // Streaming (Movies & TV)
+  { id: 'netflix', name: 'Netflix', host: 'www.netflix.com', url: 'https://www.netflix.com', category: 'streaming' },
+  { id: 'appletv', name: 'Apple TV+', host: 'tv.apple.com', url: 'https://tv.apple.com', category: 'streaming', aliases: ['apple', 'appletv'] },
+  { id: 'primevideo', name: 'Prime Video', host: 'www.primevideo.com', url: 'https://www.primevideo.com', category: 'streaming', aliases: ['amazon', 'amazon prime'] },
+  { id: 'disneyplus', name: 'Disney+', host: 'www.disneyplus.com', url: 'https://www.disneyplus.com', category: 'streaming', aliases: ['disney', 'disney plus'] },
+  { id: 'hbomax', name: 'HBO Max', host: 'www.hbomax.com', url: 'https://www.hbomax.com', category: 'streaming', aliases: ['hbo', 'max', 'warner'] },
+  { id: 'hulu', name: 'Hulu', host: 'www.hulu.com', url: 'https://www.hulu.com', category: 'streaming' },
+  { id: 'paramountplus', name: 'Paramount+', host: 'www.paramountplus.com', url: 'https://www.paramountplus.com', category: 'streaming', aliases: ['paramount', 'cbs', 'showtime'] },
+  { id: 'peacock', name: 'Peacock', host: 'www.peacocktv.com', url: 'https://www.peacocktv.com', category: 'streaming', aliases: ['nbc'] },
+  { id: 'starz', name: 'STARZ', host: 'www.starz.com', url: 'https://www.starz.com', category: 'streaming' },
+  { id: 'amcplus', name: 'AMC+', host: 'www.amcplus.com', url: 'https://www.amcplus.com', category: 'streaming', aliases: ['amc'] },
+  { id: 'mgmplus', name: 'MGM+', host: 'www.mgmplus.com', url: 'https://www.mgmplus.com', category: 'streaming', aliases: ['mgm', 'epix'] },
+  { id: 'discoveryplus', name: 'discovery+', host: 'www.discoveryplus.com', url: 'https://www.discoveryplus.com', category: 'streaming', aliases: ['discovery'] },
+  { id: 'britbox', name: 'BritBox', host: 'www.britbox.com', url: 'https://www.britbox.com', category: 'streaming', aliases: ['british', 'bbc', 'itv'] },
+
+  // Video & Live (Creators, Streams & Media)
+  { id: 'youtube', name: 'YouTube', host: 'www.youtube.com', url: 'https://www.youtube.com', category: 'video', aliases: ['yt', 'google'] },
+  { id: 'twitch', name: 'Twitch', host: 'www.twitch.tv', url: 'https://www.twitch.tv', category: 'video', aliases: ['gaming', 'streams'] },
+  { id: 'plex', name: 'Plex', host: 'app.plex.tv', url: 'https://app.plex.tv', category: 'video', aliases: ['media server'] },
+  { id: 'vimeo', name: 'Vimeo', host: 'vimeo.com', url: 'https://vimeo.com', category: 'video' },
+  { id: 'kick', name: 'Kick', host: 'kick.com', url: 'https://kick.com', category: 'video', aliases: ['streams', 'live'] },
+  { id: 'nebula', name: 'Nebula', host: 'nebula.tv', url: 'https://nebula.tv', category: 'video', aliases: ['creators', 'curiosity'] },
+  { id: 'dropout', name: 'Dropout', host: 'www.dropout.tv', url: 'https://www.dropout.tv', category: 'video', aliases: ['collegehumor', 'dimension 20'] },
+  { id: 'dailymotion', name: 'Dailymotion', host: 'www.dailymotion.com', url: 'https://www.dailymotion.com', category: 'video' },
+
+  // Live & Sports
+  { id: 'youtubetv', name: 'YouTube TV', host: 'tv.youtube.com', url: 'https://tv.youtube.com', category: 'live', aliases: ['yttv', 'live tv', 'cable'] },
+  { id: 'espn', name: 'ESPN+', host: 'www.espn.com', url: 'https://www.espn.com/watch', category: 'live', aliases: ['espn', 'sports'] },
+  { id: 'fubo', name: 'Fubo', host: 'www.fubo.tv', url: 'https://www.fubo.tv', category: 'live', aliases: ['fubotv', 'sports', 'live tv'] },
+  { id: 'sling', name: 'Sling TV', host: 'watch.sling.com', url: 'https://watch.sling.com', category: 'live', aliases: ['sling', 'live tv'] },
+  { id: 'f1tv', name: 'F1 TV', host: 'f1tv.formula1.com', url: 'https://f1tv.formula1.com', category: 'live', aliases: ['formula 1', 'racing', 'sports'] },
+  { id: 'mlbtv', name: 'MLB.TV', host: 'www.mlb.com', url: 'https://www.mlb.com/tv', category: 'live', aliases: ['baseball', 'sports', 'mlb'] },
+  { id: 'dazn', name: 'DAZN', host: 'www.dazn.com', url: 'https://www.dazn.com', category: 'live', aliases: ['boxing', 'sports'] },
+
+  // Anime & Indie
+  { id: 'crunchyroll', name: 'Crunchyroll', host: 'www.crunchyroll.com', url: 'https://www.crunchyroll.com', category: 'anime', aliases: ['anime', 'funimation'] },
+  { id: 'hidive', name: 'HIDIVE', host: 'www.hidive.com', url: 'https://www.hidive.com', category: 'anime', aliases: ['anime'] },
+  { id: 'mubi', name: 'MUBI', host: 'mubi.com', url: 'https://mubi.com', category: 'anime', aliases: ['indie', 'cinema', 'film'] },
+  { id: 'criterion', name: 'Criterion', host: 'www.criterionchannel.com', url: 'https://www.criterionchannel.com', category: 'anime', aliases: ['criterion channel', 'cinema', 'film'] },
+  { id: 'shudder', name: 'Shudder', host: 'www.shudder.com', url: 'https://www.shudder.com', category: 'anime', aliases: ['horror'] },
+  { id: 'viki', name: 'Rakuten Viki', host: 'www.viki.com', url: 'https://www.viki.com', category: 'anime', aliases: ['kdrama', 'asian drama', 'viki'] },
+  { id: 'curiositystream', name: 'Curiosity', host: 'curiositystream.com', url: 'https://curiositystream.com', category: 'anime', aliases: ['curiosity stream', 'documentary', 'docs'] },
+
+  // Free & Public
+  { id: 'tubi', name: 'Tubi', host: 'tubitv.com', url: 'https://tubitv.com', category: 'free', aliases: ['free movies'] },
+  { id: 'plutotv', name: 'Pluto TV', host: 'pluto.tv', url: 'https://pluto.tv', category: 'free', aliases: ['pluto', 'free live'] },
+  { id: 'rokuchannel', name: 'Roku Channel', host: 'therokuchannel.roku.com', url: 'https://therokuchannel.roku.com', category: 'free', aliases: ['roku'] },
+  { id: 'bbciplayer', name: 'BBC iPlayer', host: 'www.bbc.co.uk', url: 'https://www.bbc.co.uk/iplayer', category: 'free', aliases: ['bbc', 'iplayer', 'uk'] },
+  { id: 'pbs', name: 'PBS', host: 'www.pbs.org', url: 'https://www.pbs.org/video', category: 'free', aliases: ['public', 'documentary'] },
+  { id: 'kanopy', name: 'Kanopy', host: 'www.kanopy.com', url: 'https://www.kanopy.com', category: 'free', aliases: ['library', 'indie'] },
+];
+
+function normHost(host: string): string {
+  const lower = host.toLowerCase();
+  return lower.startsWith('www.') ? lower.slice(4) : lower;
 }
 
 const DEFAULT_FALLBACK: PersistedFallback = {
@@ -195,7 +262,7 @@ function toFloatState(p: PersistedFallback): FloatState {
   const sites: Site[] = [...p.sites]
     .sort((a, b) => b.last - a.last)
     .map((s) => {
-      const name = siteName(s.host);
+      const name = s.name && s.name.trim() ? s.name.trim() : siteName(s.host);
       return {
         host: s.host,
         url: s.url,
@@ -223,7 +290,7 @@ function toFloatState(p: PersistedFallback): FloatState {
         resumeUrl = p.resume.url;
         resumeHost = host;
         resumeTitle = p.resume.title || siteName(host);
-        const matched = sites.find((s) => s.host === host);
+        const matched = sites.find((s) => normHost(s.host) === normHost(host));
         resumeIcon = matched ? matched.icon : `https://${host}/favicon.ico`;
         resumeTime = p.resume.time;
         resumeDuration = p.resume.duration;
@@ -320,8 +387,46 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
         }
       }
       break;
+    case 'addSite': {
+      let urlRaw = arg;
+      let name: string | undefined;
+      let icon: string | undefined;
+      try {
+        const parsed = JSON.parse(arg) as { url?: string; name?: string; icon?: string };
+        if (parsed && typeof parsed === 'object' && typeof parsed.url === 'string') {
+          urlRaw = parsed.url;
+          if (typeof parsed.name === 'string' && parsed.name.trim()) name = parsed.name.trim();
+          if (typeof parsed.icon === 'string' && parsed.icon.trim()) icon = parsed.icon.trim();
+        }
+      } catch {
+        // Plain URL string fallback
+      }
+      const url = parseWebUrl(urlRaw);
+      if (url) {
+        const u = new URL(url);
+        const host = u.host;
+        const stamp = data.sites.reduce((m, s) => Math.max(m, s.last), 0) + 1;
+        const existing = data.sites.find((s) => normHost(s.host) === normHost(host));
+        if (existing) {
+          existing.url = url;
+          existing.last = stamp;
+          if (name) existing.name = name;
+          if (icon) existing.icon = icon;
+        } else {
+          data.sites.push({
+            host,
+            url,
+            icon: icon ?? `${u.protocol}//${host}/favicon.ico`,
+            name,
+            last: stamp,
+            count: 1,
+          });
+        }
+      }
+      break;
+    }
     case 'removeSite':
-      data.sites = data.sites.filter((s) => s.host !== arg);
+      data.sites = data.sites.filter((s) => normHost(s.host) !== normHost(arg));
       break;
     case 'toggleFill':
       data.fill = !data.fill;
@@ -476,12 +581,12 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
       const payload = JSON.parse(arg) as { url: string; title: string; icon?: string; t: number; d: number };
       const u = new URL(payload.url);
       const host = u.host;
-      const existing = data.sites.find((s) => s.host === host);
+      const existing = data.sites.find((s) => normHost(s.host) === normHost(host));
       const stamp = data.sites.reduce((m, s) => Math.max(m, s.last), 0) + 1;
       if (existing) {
         existing.last = stamp;
         existing.count += 1;
-        if (payload.icon) existing.icon = payload.icon;
+        if (payload.icon && !existing.icon.startsWith('assets/providers/')) existing.icon = payload.icon;
       } else {
         data.sites.push({
           host,
@@ -519,6 +624,29 @@ async function runFallbackCommand(op: string, arg: string, storage: Storage): Pr
 }
 
 const sources: Sources = {
+  listStreamingProviders: async ([category, query]) => {
+    const cat = (category || 'all').toLowerCase();
+    const q = (query || '').trim().toLowerCase();
+    const items = STREAMING_PROVIDERS.filter((p) => {
+      if (cat !== 'all' && p.category !== cat) return false;
+      if (!q) return true;
+      return (
+        p.name.toLowerCase().includes(q) ||
+        p.host.toLowerCase().includes(q) ||
+        p.category.includes(q) ||
+        (p.aliases ?? []).some((a) => a.toLowerCase().includes(q))
+      );
+    }).map((p) => ({
+      id: p.id,
+      name: p.name,
+      host: p.host,
+      normHost: normHost(p.host),
+      url: p.url,
+      icon: `assets/providers/${p.id}.png`,
+      category: p.category,
+    }));
+    return { items, total: STREAMING_PROVIDERS.length };
+  },
   loadFloatState: async (_args, _store, storage, native) => {
     if (native?.available) {
       native.watch('float');
