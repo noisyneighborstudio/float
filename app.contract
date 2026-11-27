@@ -1371,7 +1371,7 @@ component Float
                       opacity=(tileConcealed ? 0 : 1)
                       scale=(tileConcealed ? 0.94 : 1)
                       translate=(tileConcealed ? "0px 8px" : "0px 0px")
-                      filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
+                      filter=(tileConcealed ? "blur(6px)" : "none")
                       transition=(tileConcealed or vp.prefersReducedMotion ? "none" : "opacity 340ms ease-out, scale 340ms cubic-bezier(0.22, 1, 0.36, 1), translate 340ms cubic-bezier(0.22, 1, 0.36, 1), filter 340ms ease-out")
                       button appearance="none"
                         class=ResumeCard
@@ -1438,7 +1438,7 @@ component Float
                           opacity=(tileConcealed ? 0 : 1)
                           scale=(tileConcealed ? 0.94 : 1)
                           translate=(tileConcealed ? "0px 8px" : "0px 0px")
-                          filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
+                          filter=(tileConcealed ? "blur(6px)" : "none")
                           transition=(tileConcealed or vp.prefersReducedMotion ? "none" : `opacity 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, scale 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, translate 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms, filter 340ms ease-out ${tileWaveDelayMs(idx, gridCols, st.hasResume)}ms`)
                           button appearance="none"
                             class=TileButton
@@ -1490,7 +1490,7 @@ component Float
                         opacity=(tileConcealed ? 0 : 1)
                         scale=(tileConcealed ? 0.94 : 1)
                         translate=(tileConcealed ? "0px 8px" : "0px 0px")
-                        filter=(tileConcealed ? "blur(6px)" : "blur(0px)")
+                        filter=(tileConcealed ? "blur(6px)" : "none")
                         transition=(tileConcealed or vp.prefersReducedMotion ? "none" : `opacity 340ms ease-out ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms, scale 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms, translate 340ms cubic-bezier(0.22, 1, 0.36, 1) ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms, filter 340ms ease-out ${tileWaveDelayMs(st.sites.length, gridCols, st.hasResume)}ms`)
                         button appearance="none"
                           class=AddTileButton
